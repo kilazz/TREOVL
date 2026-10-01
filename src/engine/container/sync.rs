@@ -67,6 +67,63 @@ fn build_asset_filename(display_name: &str, stem: &str, ext: &str) -> String {
     }
 }
 
+/// Extracts any plain-text Lua source code embedded inside binary containers.
+fn extract_embedded_lua_text(data: &[u8]) -> Option<String> {
+    if let Some(start_pos) = data.windows(2).position(|w| w == b"--") {
+        let mut script_lines = Vec::new();
+        let mut pos = start_pos;
+
+        while pos < data.len() {
+            if pos + 4 <= data.len() {
+                let slen =
+                    u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap_or_default()) as usize;
+                if slen > 0 && slen < 500 && pos + 4 + slen <= data.len() {
+                    let slice = &data[pos + 4..pos + 4 + slen];
+                    if slice.iter().all(|&b| {
+                        (0x20..=0x7E).contains(&b)
+                            || b == b'\n'
+                            || b == b'\r'
+                            || b == b'\t'
+                            || b == 0
+                    }) && let Ok(s) = std::str::from_utf8(slice)
+                    {
+                        let clean = s.trim_matches(char::from(0));
+                        if !clean.is_empty() {
+                            script_lines.push(clean.to_string());
+                        }
+                        pos += 4 + slen;
+                        continue;
+                    }
+                }
+            }
+            pos += 1;
+            if pos - start_pos > 8000 {
+                break;
+            }
+        }
+
+        if !script_lines.is_empty() {
+            return Some(script_lines.join("\n"));
+        }
+    }
+    None
+}
+
+/// Extracts embedded FaceFX (.fxa) binary graph data.
+fn extract_embedded_facefx(data: &[u8]) -> Option<Vec<u8>> {
+    if let Some(pos) = data.windows(4).position(|w| w == b"FACE") {
+        if pos + 8 <= data.len() {
+            let mut cur = Cursor::new(&data[pos + 4..pos + 8]);
+            let len = cur.read_u32::<LittleEndian>().unwrap_or(0) as usize;
+            if len > 0 && pos + 8 + len <= data.len() {
+                return Some(data[pos..pos + 8 + len].to_vec());
+            }
+        }
+        return Some(data[pos..].to_vec());
+    }
+    None
+}
+
 fn build_unknown_chunk_dossier(chunk_data: &[u8], stem: &str) -> serde_json::Value {
     let magic_hex = if chunk_data.len() >= 4 {
         hex::encode_upper(&chunk_data[..4])
@@ -177,6 +234,9 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize, String> {
     let meshes_dir = assets_dir.join("meshes");
     let animations_dir = assets_dir.join("animations");
     let events_dir = assets_dir.join("events");
+    let behavior_dir = assets_dir.join("behavior");
+    let attachments_dir = assets_dir.join("attachments");
+    let facial_dir = assets_dir.join("facial");
     let scripts_dir = assets_dir.join("scripts");
     let shaders_dir = assets_dir.join("shaders");
     let objects_dir = assets_dir.join("objects");
@@ -190,6 +250,9 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize, String> {
     fs::create_dir_all(&meshes_dir).map_err(|e| e.to_string())?;
     fs::create_dir_all(&animations_dir).map_err(|e| e.to_string())?;
     fs::create_dir_all(&events_dir).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&behavior_dir).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&attachments_dir).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&facial_dir).map_err(|e| e.to_string())?;
     fs::create_dir_all(&scripts_dir).map_err(|e| e.to_string())?;
     fs::create_dir_all(&shaders_dir).map_err(|e| e.to_string())?;
     fs::create_dir_all(&objects_dir).map_err(|e| e.to_string())?;
@@ -203,7 +266,6 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize, String> {
         .filter(|p| p.is_file() && p.extension().is_some_and(|ext| ext == "bin"))
         .collect();
 
-    // Process 100% of chunks in parallel using Rayon
     let sync_records: Vec<(String, AssetSyncEntry)> = entries
         .par_iter()
         .filter_map(|chunk_path| {
@@ -322,8 +384,65 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize, String> {
                 }
             }
 
-            // 6. ANIMATION SOUND EVENTS (B0 00 00 04, e.g. Foot1, Foot2, Archie Hit)
-            if (sniffed.kind == AssetKind::Event || chunk_data.starts_with(b"\xB0\x00\x00\x04"))
+            // 6. CHARACTER AI BEHAVIOR, EMBEDDED LUA & FACEFX
+            if sniffed.kind == AssetKind::Behavior {
+                let dossier = build_unknown_chunk_dossier(&chunk_data, &stem);
+                let out_name = build_asset_filename(&sniffed.display_name, &stem, "json");
+                let rel_asset_path = format!("assets/behavior/{}", out_name);
+                let abs_path = behavior_dir.join(&out_name);
+
+                // A. Extract embedded Lua source script
+                if let Some(lua_text) = extract_embedded_lua_text(&chunk_data) {
+                    let script_filename = format!("{}_quest_script.lua", sanitize_filename(&sniffed.display_name));
+                    let script_path = scripts_dir.join(script_filename);
+                    let _ = fs::write(script_path, lua_text);
+                }
+
+                // B. Extract embedded FaceFX (.fxa)
+                if let Some(fxa_bytes) = extract_embedded_facefx(&chunk_data) {
+                    let fxa_filename = format!("{}.fxa", sanitize_filename(&sniffed.display_name));
+                    let fxa_path = facial_dir.join(fxa_filename);
+                    let _ = fs::write(fxa_path, fxa_bytes);
+                }
+
+                // C. Write full behavior structure
+                if let Ok(json_str) = serde_json::to_string_pretty(&dossier)
+                    && fs::write(&abs_path, json_str.as_bytes()).is_ok()
+                {
+                    return Some((
+                        rel_asset_path,
+                        AssetSyncEntry {
+                            chunk_rel_path: rel_chunk_str,
+                            asset_kind: "Behavior".into(),
+                            crc32: calculate_crc32(json_str.as_bytes()),
+                        },
+                    ));
+                }
+            }
+
+            // 7. ITEM ATTACHMENT SLOTS (e.g. chunk_0035 Plate)
+            if sniffed.kind == AssetKind::Attachment {
+                let dossier = build_unknown_chunk_dossier(&chunk_data, &stem);
+                let out_name = build_asset_filename(&sniffed.display_name, &stem, "json");
+                let rel_asset_path = format!("assets/attachments/{}", out_name);
+                let abs_path = attachments_dir.join(&out_name);
+
+                if let Ok(json_str) = serde_json::to_string_pretty(&dossier)
+                    && fs::write(&abs_path, json_str.as_bytes()).is_ok()
+                {
+                    return Some((
+                        rel_asset_path,
+                        AssetSyncEntry {
+                            chunk_rel_path: rel_chunk_str,
+                            asset_kind: "Attachment".into(),
+                            crc32: calculate_crc32(json_str.as_bytes()),
+                        },
+                    ));
+                }
+            }
+
+            // 8. ANIMATION SOUND EVENTS (B0 00 00 04, e.g. Foot1, Foot2, Archie Hit)
+            if (sniffed.kind == AssetKind::Event || chunk_data.starts_with(b"\xB0\x00\x00\x04") || chunk_data.starts_with(b"\x04\x00\x00\xB0"))
                 && let Ok((type_id, elements)) = parse_typed_container(&chunk_data)
             {
                 let mut event_name = String::new();
@@ -399,7 +518,7 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize, String> {
                 }
             }
 
-            // 7. LUA SCRIPTS (.luac + .txt)
+            // 9. LUA STANDALONE SCRIPTS
             if sniffed.kind == AssetKind::Lua
                 && let Ok(bytecode) = extract_lua_bytecode(&chunk_data)
             {
@@ -424,7 +543,7 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize, String> {
                 }
             }
 
-            // 8. OBJECT ENTITY CHUNKS (4B 00 41 00)
+            // 10. OBJECT ENTITY CHUNKS (4B 00 41 00)
             if (sniffed.kind == AssetKind::Object || chunk_data.starts_with(b"\x4B\x00\x41\x00"))
                 && let Ok((type_id, elements)) = parse_typed_container(&chunk_data)
             {
@@ -557,7 +676,7 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize, String> {
                 }
             }
 
-            // 9. SHADERS (HLSL / DXBC)
+            // 11. SHADERS (HLSL / DXBC)
             if let Ok((payload, s_type, name)) = export_shader(&chunk_data) {
                 let ext = match s_type {
                     ShaderType::InternalHLSL => "hlsl",
@@ -579,7 +698,7 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize, String> {
                 }
             }
 
-            // 10. XML DOCUMENTS
+            // 12. XML DOCUMENTS
             if chunk_data.windows(5).any(|w| w == b"<?xml") {
                 let out_name = build_asset_filename(&sniffed.display_name, &stem, "xml");
                 let rel_asset_path = format!("assets/xml/{}", out_name);
@@ -609,7 +728,7 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize, String> {
                 }
             }
 
-            // 11. ADVANCED PARAMETERS & DECODED STRUCTURES
+            // 13. PARAMETERS & SCALARS
             // A. Check for 24-byte NamedAssetContainer slot (e.g. "17039")
             if chunk_data.len() == 24 && chunk_data.starts_with(&[3, 20, 0, 21]) {
                 let slen = u32::from_le_bytes(chunk_data[7..11].try_into().unwrap_or_default()) as usize;
@@ -788,7 +907,7 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize, String> {
                 }
             }
 
-            // 12. 100% CATCH-ALL: UNKNOWN BINARY BLOCKS WITH COMPLETE REVERSE-ENGINEERING DOSSIER
+            // 14. 100% CATCH-ALL: UNKNOWN BINARY BLOCKS WITH DOSSIER
             let out_name = format!("{}.bin", stem);
             let rel_asset_path = format!("assets/raw_chunks/{}", out_name);
             let abs_path = raw_dir.join(&out_name);
@@ -921,7 +1040,7 @@ pub fn sync_assets_to_chunks(project_dir: &Path) -> Result<usize, String> {
                         chunk_bytes
                     }
                 }
-                "Raw" => asset_bytes,
+                "Raw" | "Behavior" | "Attachment" => asset_bytes,
                 _ => continue,
             };
 

@@ -13,7 +13,9 @@ pub enum AssetKind {
     Animation = 7,
     Object = 8,
     Event = 9,
-    Parameter = 10,
+    Behavior = 10,
+    Attachment = 11,
+    Parameter = 12,
 }
 
 pub struct SniffedAsset {
@@ -45,7 +47,9 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
         b"\x35\x00\x41\x00" => (AssetKind::Mesh, "3D Mesh Geometry", "🗿"),
         b"\x05\x00\x41\x00" => (AssetKind::Animation, "Skeletal Animation", "🎬"),
         b"\x4B\x00\x41\x00" => (AssetKind::Object, "Object Entity", "🧊"),
-        b"\xB0\x00\x00\x04" => (AssetKind::Event, "Animation Sound Event", "👣"),
+        b"\xB0\x00\x00\x04" | b"\x04\x00\x00\xB0" => {
+            (AssetKind::Event, "Animation Sound Event", "👣")
+        }
         b"\x1bLua" => (AssetKind::Lua, "Lua 5.0 Bytecode", "📜"),
         b"RIFF" => (AssetKind::Audio, "Raw WAV Audio", "🎵"),
         b"DDS " => (AssetKind::Texture, "Raw DDS Texture", "🎨"),
@@ -55,7 +59,17 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
         | b"\x26\x06\x41\x00" | b"\x28\x06\x41\x00" | b"\x2A\x06\x41\x00" | b"\x32\x06\x41\x00"
         | b"\x36\x06\x41\x00" => (AssetKind::Material, "Shader Material", "🛠️"),
         _ => {
-            if data.windows(5).any(|w| w == b"<?xml") {
+            // Check for Character AI / FaceFX / Behavior Containers (e.g. chunk_0037, chunk_0038)
+            if data.windows(4).any(|w| w == b"FACE")
+                || data.windows(8).any(|w| w == b"Triumph ")
+                || data.windows(6).any(|w| w == b"--Drop")
+            {
+                (AssetKind::Behavior, "Character AI & FaceFX", "🧠")
+            } else if data.windows(5).any(|w| w == b"Plate")
+                || data.windows(11).any(|w| w == b"plate_metal")
+            {
+                (AssetKind::Attachment, "Item Attachment Slot", "🍽️")
+            } else if data.windows(5).any(|w| w == b"<?xml") {
                 (AssetKind::Xml, "XML Document", "📋")
             } else if data.windows(4).any(|w| w == b"\x24\x00\x41\x00") {
                 (AssetKind::Texture, "Texture (MipMap)", "🎨")
