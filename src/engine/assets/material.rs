@@ -5,7 +5,7 @@ use std::io::Cursor;
 
 use super::{build_typed_container, parse_typed_container};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MaterialJson {
     pub type_id_hex: String,
     pub engine_generation: String,
@@ -13,7 +13,7 @@ pub struct MaterialJson {
     pub blocks: Vec<MaterialBlock>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MaterialBlock {
     pub id: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -23,6 +23,8 @@ pub struct MaterialBlock {
     pub value: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub float_value: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uint_value: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ptr: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -37,6 +39,7 @@ fn get_material_role(type_id: u32, chunk_id: u32) -> Option<&'static str> {
         },
         0x0041060A => match chunk_id {
             30 => Some("Diffuse Texture"),
+            40 => Some("Alpha Cutoff Threshold"),
             50 => Some("Normal Map"),
             _ => None,
         },
@@ -47,18 +50,32 @@ fn get_material_role(type_id: u32, chunk_id: u32) -> Option<&'static str> {
             50 => Some("Normal Map"),
             _ => None,
         },
+        0x00410630 => match chunk_id {
+            30 => Some("Lightbeam Texture"),
+            31 => Some("Additive Blending Flag"),
+            40 => Some("Blend Mode"),
+            41 => Some("Ray Brightness / Alpha"),
+            52 => Some("UV Scroll Speed X"),
+            53 => Some("UV Tiling X"),
+            54 => Some("UV Tiling Y"),
+            _ => None,
+        },
         0x00410636 => match chunk_id {
             30 => Some("Diffuse Texture"),
             42 => Some("Normal Map"),
             43 => Some("Reflection Map"),
-            44 => Some("Mask"),
+            44 => Some("Mask (Specular / Metallic)"),
+            46 => Some("Normal Map Strength"),
+            47 => Some("Specular Power / Gloss"),
+            48 => Some("Sampler / Blend Flags"),
+            52 => Some("Reflection Intensity"),
             _ => None,
         },
         0x00410624 => match chunk_id {
             30 => Some("Diffuse / Base Color"),
             42 => Some("Normal Map"),
             43 => Some("Reflection Cubemap"),
-            44 => Some("Mask (Roughness/Metal/AO)"),
+            44 => Some("Mask (Roughness / Metal / AO)"),
             45 => Some("Mask Opacity / Threshold"),
             46 => Some("Normal Strength / Roughness"),
             47 => Some("Specular Power / Shininess"),
@@ -117,6 +134,7 @@ fn get_material_info(type_id: u32) -> (&'static str, &'static str) {
         0x00410626 => ("Overlord 1", "Complex Material (DNMS spec/height)"),
         0x00410628 => ("Overlord 1", "Vegetation D Material"),
         0x0041062A => ("Overlord 1", "Vegetation Normal Material"),
+        0x00410630 => ("Overlord 1", "Animated Light Rays / Godrays Material"),
         0x00410636 => ("Overlord 1", "Armor Material (DNRM)"),
         0x00410624 => ("Overlord 2", "Masked PBR Material (DNRMS)"),
         0x00410632 => ("Overlord 2", "Animated Surface Material"),
@@ -146,20 +164,23 @@ pub fn export_material_to_json(chunk_data: &[u8]) -> Result<String> {
         let mut btype = "raw".to_string();
         let mut value = Some(hex::encode_upper(&chunk));
         let mut float_value = None;
+        let mut uint_value = None;
         let mut ptr = None;
         let mut name = None;
 
+        // Check if block is a length-prefixed ASCII string
         if chunk.len() >= 4 {
             let mut cur = Cursor::new(&chunk[0..4]);
             let str_len = cur.read_u32::<LittleEndian>()? as usize;
-            if str_len == chunk.len() - 4
-                && let Ok(s) = std::str::from_utf8(&chunk[4..])
+            if (str_len == chunk.len() - 4 || str_len == chunk.len() - 5)
+                && let Ok(s) = std::str::from_utf8(&chunk[4..4 + str_len])
             {
                 btype = "string".to_string();
-                value = Some(s.to_string());
+                value = Some(s.trim_matches(char::from(0)).to_string());
             }
         }
 
+        // Check if block is a texture link container
         if btype == "raw" && !chunk.is_empty() {
             let num_offsets = chunk[0] as usize;
             if (num_offsets == 1 || num_offsets == 2) && chunk.len() > 1 + num_offsets * 2 {
@@ -180,7 +201,8 @@ pub fn export_material_to_json(chunk_data: &[u8]) -> Result<String> {
                     if s1_start + 4 + s1_len <= chunk.len() {
                         ptr = Some(
                             String::from_utf8_lossy(&chunk[s1_start + 4..s1_start + 4 + s1_len])
-                                .into_owned(),
+                                .trim_matches(char::from(0))
+                                .to_string(),
                         );
                         btype = "texture_link".to_string();
                         value = None;
@@ -199,7 +221,8 @@ pub fn export_material_to_json(chunk_data: &[u8]) -> Result<String> {
                                 String::from_utf8_lossy(
                                     &chunk[s2_start + 4..s2_start + 4 + s2_len],
                                 )
-                                .into_owned(),
+                                .trim_matches(char::from(0))
+                                .to_string(),
                             );
                         }
                     }
@@ -207,12 +230,19 @@ pub fn export_material_to_json(chunk_data: &[u8]) -> Result<String> {
             }
         }
 
+        // Parse 4-byte scalar parameters (Float vs Integer)
         if btype == "raw" && chunk.len() == 4 && (41..=55).contains(&id) {
             let mut cur = Cursor::new(&chunk);
-            let f = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-            if !f.is_nan() && f.is_finite() {
+            let raw_u32 = cur.read_u32::<LittleEndian>().unwrap_or(0);
+            let f = f32::from_bits(raw_u32);
+
+            if f.is_finite() && !f.is_nan() && f.abs() >= 1e-5 && f.abs() <= 100_000.0 {
                 btype = "float".to_string();
                 float_value = Some(f);
+                value = None;
+            } else if raw_u32 < 10_000 {
+                btype = "uint".to_string();
+                uint_value = Some(raw_u32);
                 value = None;
             }
         }
@@ -225,6 +255,7 @@ pub fn export_material_to_json(chunk_data: &[u8]) -> Result<String> {
             btype,
             value,
             float_value,
+            uint_value,
             ptr,
             name,
         });
@@ -258,6 +289,10 @@ pub fn import_material_from_json(json_str: &str) -> Result<Vec<u8>> {
             "float" => {
                 let f = b.float_value.unwrap_or(0.0);
                 chunk.write_f32::<LittleEndian>(f)?;
+            }
+            "uint" => {
+                let u = b.uint_value.unwrap_or(0);
+                chunk.write_u32::<LittleEndian>(u)?;
             }
             "texture_link" => {
                 let ptr = b.ptr.unwrap_or_default().into_bytes();

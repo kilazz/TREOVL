@@ -41,34 +41,32 @@ pub struct ObjectBone {
 }
 
 pub fn parse_object_bone_container(data: &[u8]) -> Result<Vec<ObjectBone>> {
-    let payload = if let Ok((_, elements)) = parse_chunk_elements(data) {
-        if let Some((_, bone_bytes)) = elements.into_iter().find(|(id, _)| *id == 33) {
-            bone_bytes
-        } else {
-            return Ok(Vec::new());
+    let mut payload = data.to_vec();
+
+    // Блок ID 33 в объектах — это контейнер, где сами кости лежат в блоке ID 22 (DATA_BLOB)
+    if let Ok((_, elements)) = parse_chunk_elements(data) {
+        if let Some((_, bone_bytes)) = elements.iter().find(|(id, _)| *id == 22) {
+            payload = bone_bytes.clone();
+        } else if let Some((_, bone_bytes)) = elements.iter().find(|(id, _)| *id == 33) {
+            payload = bone_bytes.clone();
         }
     } else if let Ok((_, typed_elements)) = super::parse_typed_container(data) {
-        let mut found = None;
         for (id, chunk) in typed_elements {
-            if id == 33 {
-                found = Some(chunk);
+            if id == 33 || id == 22 {
+                payload = chunk;
                 break;
             } else if let Ok((_, sub_elem)) = parse_chunk_elements(&chunk)
-                && let Some((_, sub_bones)) = sub_elem.into_iter().find(|(sid, _)| *sid == 33)
+                && let Some((_, sub_bones)) = sub_elem
+                    .into_iter()
+                    .find(|(sid, _)| *sid == 33 || *sid == 22)
             {
-                found = Some(sub_bones);
+                payload = sub_bones;
                 break;
             }
         }
-        match found {
-            Some(b) => b,
-            None => return Ok(Vec::new()),
-        }
     } else if data.len() > 15 && data[0] == 0x03 && data[1] == 0x14 {
-        data[15..].to_vec()
-    } else {
-        data.to_vec()
-    };
+        payload = data[15..].to_vec();
+    }
 
     if payload.len() < 144 {
         return Ok(Vec::new());

@@ -67,22 +67,10 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
         (AssetKind::Audio, "Raw WAV Audio", "🎵")
     } else if magic_bytes == b"DDS " {
         (AssetKind::Texture, "Raw DDS Texture", "🎨")
-    } else if matches!(
-        magic_bytes,
-        b"\x08\x06\x41\x00"
-            | b"\x0A\x06\x41\x00"
-            | b"\x0F\x06\x41\x00"
-            | b"\x12\x06\x41\x00"
-            | b"\x16\x06\x41\x00"
-            | b"\x1B\x06\x41\x00"
-            | b"\x20\x06\x41\x00"
-            | b"\x24\x06\x41\x00"
-            | b"\x26\x06\x41\x00"
-            | b"\x28\x06\x41\x00"
-            | b"\x2A\x06\x41\x00"
-            | b"\x32\x06\x41\x00"
-            | b"\x36\x06\x41\x00"
-    ) {
+    } else if (data.len() >= 4 && data[2] == 0x41 && data[1] == 0x06)
+        || (data.len() >= 4 && data[3] == 0x00 && data[2] == 0x46)
+    {
+        // Catch all Overlord 1 (0x004106xx) and Overlord 2 (0x0046xxxx) shader materials
         (AssetKind::Material, "Shader Material", "🛠️")
     } else if data.len() >= 4 && data[2] == 0x71 && data[3] == 0x00 {
         // Direct detection of Triumph Engine UI Class: 0x0071xxxx (Menus, HUD, Windows)
