@@ -99,7 +99,7 @@ fn read_lua_string(cur: &mut Cursor<&[u8]>) -> Result<Option<String>> {
 }
 
 // -------------------------------------------------------------
-// HIGH-LEVEL PSEUDOCODE DECOMPILER
+// HIGH-LEVEL PSEUDOCODE DECOMPILER (WITH CONTROL-FLOW HINTS)
 // -------------------------------------------------------------
 
 pub fn decompile_lua_bytecode(bytecode: &[u8]) -> Result<String> {
@@ -109,7 +109,9 @@ pub fn decompile_lua_bytecode(bytecode: &[u8]) -> Result<String> {
     let mut out = String::new();
 
     out.push_str("-- ========================================================\n");
-    out.push_str("-- Decompiled Lua 5.0.2 High-Level Pseudocode\n");
+    out.push_str("-- Decompiled Lua 5.0.2 Sequential Pseudocode\n");
+    out.push_str("-- NOTE: Control-flow (if/loops/jumps) is represented sequentially.\n");
+    out.push_str("-- For precise bytecode targets, inspect the .lua.txt disassembly.\n");
     out.push_str("-- ========================================================\n\n");
 
     decompile_scope(&mut cur, &mut out, 0)?;
@@ -174,13 +176,14 @@ fn decompile_scope(cur: &mut Cursor<&[u8]>, out: &mut String, level: usize) -> R
     };
 
     let num_code = cur.read_u32::<LittleEndian>()? as usize;
-    for _ in 0..num_code {
+    for pc in 0..num_code {
         let inst = cur.read_u32::<LittleEndian>()?;
         let opcode = (inst & 0x3F) as usize;
         let a = ((inst >> 6) & 0xFF) as usize;
         let b = ((inst >> 14) & 0x1FF) as usize;
         let c = ((inst >> 23) & 0x1FF) as usize;
         let bx = ((inst >> 14) & 0x3FFFF) as usize;
+        let sbx = (bx as i32) - 131071;
 
         let op_name = OP_NAMES.get(opcode).copied().unwrap_or("UNKNOWN");
 
@@ -298,6 +301,27 @@ fn decompile_scope(cur: &mut Cursor<&[u8]>, out: &mut String, level: usize) -> R
                     let ret_val = registers.get(&a).cloned().unwrap_or_else(|| "nil".into());
                     out.push_str(&format!("{indent}    return {}\n", ret_val));
                 }
+            }
+            "JMP" => {
+                let target = (pc as i32) + sbx + 2;
+                out.push_str(&format!("{indent}    -- [Branch] goto line {}\n", target));
+            }
+            "EQ" => {
+                let k1 = get_rk(b, &constants, &registers);
+                let k2 = get_rk(c, &constants, &registers);
+                out.push_str(&format!(
+                    "{indent}    -- [Branch] if ({} == {}) != {} then skip next\n",
+                    k1, k2, a
+                ));
+            }
+            "TEST" => {
+                out.push_str(&format!(
+                    "{indent}    -- [Branch] if r{} != {} then skip next\n",
+                    a, c
+                ));
+            }
+            "FORLOOP" => {
+                out.push_str(&format!("{indent}    -- [Branch] for-loop next / jump\n"));
             }
             _ => {}
         }

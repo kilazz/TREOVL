@@ -1,5 +1,4 @@
 use super::node::PrpNode;
-use crate::utils::zlib::{compress, decompress, is_zlib_compressed};
 use anyhow::{Context, Result, bail};
 use byteorder::{LittleEndian, WriteBytesExt};
 use std::fs;
@@ -13,17 +12,10 @@ pub fn build_node(node: &PrpNode, project_dir: &Path) -> Result<Vec<u8>> {
         };
 
         let full_path = project_dir.join(rel_path);
-        let mut raw_data = fs::read(&full_path)
+        // Leaf chunks in chunks/ are already pre-synchronized and verified.
+        // We pack directly from disk without redundant CPU-heavy recompression.
+        let raw_data = fs::read(&full_path)
             .with_context(|| format!("Failed to read chunk file {:?}", full_path))?;
-
-        // Smart Level 9 compression if chunk payload was compressed
-        if is_zlib_compressed(&raw_data)
-            && let Ok(decompressed) = decompress(&raw_data)
-            && let Ok(optimized) = compress(&decompressed, 9)
-            && optimized.len() < raw_data.len()
-        {
-            raw_data = optimized;
-        }
 
         return Ok(raw_data);
     }

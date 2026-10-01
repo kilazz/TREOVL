@@ -21,6 +21,13 @@ pub fn register(ui: &AppWindow, tx: Sender<WorkerCommand>, logger: UiLogger) {
         });
     });
 
+    let tx_clean = tx.clone();
+    ui.on_clean_rebuild(move |proj_str| {
+        let _ = tx_clean.send(WorkerCommand::CleanRebuild {
+            proj_dir: PathBuf::from(proj_str.as_str()),
+        });
+    });
+
     let tx_pack = tx.clone();
     ui.on_pack_prp(move |proj_str| {
         let _ = tx_pack.send(WorkerCommand::PackArchive {

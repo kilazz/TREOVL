@@ -9,6 +9,7 @@ export struct AssetItem {
     file_path: string,
     size_str: string,
     kind_id: int, // 0: Texture, 1: Audio, 2: Material, 3: Mesh, 4: Lua, 5: Generic
+    is_modified: bool,
 }
 
 export component AppWindow inherits Window {
@@ -24,12 +25,14 @@ export component AppWindow inherits Window {
     in-out property <length> sidebar_width: 440px;
 
     // Workspace Data
+    in-out property <string> active_project_dir: "";
     in-out property <[AssetItem]> asset_list: [];
     in-out property <string> filter_text: "";
     in-out property <int> selected_index: -1;
     in-out property <int> active_kind_id: 5;
     in-out property <string> active_file_path: "";
     in-out property <string> status_msg: "Ready.";
+    in-out property <bool> status_is_error: false;
     in-out property <string> log_text: "System Ready.\n";
 
     // Active Asset Inspector States
@@ -48,10 +51,13 @@ export component AppWindow inherits Window {
     callback unpack_prp(string, string);
     callback pack_prp(string);
     callback load_project(string);
+    callback clean_rebuild(string);
+    callback revert_asset(string);
     callback open_assets_folder(string);
     callback create_patch(string, string, string);
     callback apply_patch(string, string);
     callback select_asset(int);
+    callback filter_changed(string);
 
     // Contextual Operations Callbacks
     callback export_dds(string, string);
@@ -72,7 +78,7 @@ export component AppWindow inherits Window {
         // TOP NAVIGATION TAB BAR
         HorizontalLayout {
             spacing: 6px;
-            height: 32px;
+            height: 30px;
 
             TabButton {
                 text: "Studio Workspace";
@@ -92,8 +98,18 @@ export component AppWindow inherits Window {
                 horizontal-stretch: 1;
             }
 
+            if root.active_project_dir != "": Text {
+                text: "Project: " + root.active_project_dir;
+                font-family: "Consolas";
+                font-size: 11px;
+                color: #f0b132;
+                vertical-alignment: center;
+                overflow: elide;
+                max-width: 400px;
+            }
+
             Text {
-                text: "Discovered Items: " + root.asset_list.length;
+                text: "Items: " + root.asset_list.length;
                 font-family: "Consolas";
                 font-size: 11px;
                 color: #cfcfcf;
@@ -101,93 +117,139 @@ export component AppWindow inherits Window {
             }
         }
 
-        // TAB 0: UNIFIED WORKSPACE (EXPLORER + SPLITTER + DYNAMIC INSPECTOR)
+        // TAB 0: UNIFIED WORKSPACE
         if root.active_tab == 0: VerticalLayout {
             spacing: 10px;
 
-            // QUICK ACTIONS TOOLBAR
+            // QUICK ACTIONS TOOLBAR WITH VERTICAL CENTERING
             Rectangle {
-                height: 44px;
+                height: 46px;
                 background: #2b2d31;
                 border-color: #1f2023;
                 border-width: 1px;
                 border-radius: 4px;
 
-                HorizontalLayout {
-                    padding-left: 10px;
-                    padding-right: 10px;
-                    spacing: 8px;
-                    alignment: start;
+                VerticalLayout {
+                    alignment: center;
 
-                    CustomButton {
-                        text: "📦 Unpack PRP...";
-                        primary-color: #3e6a90;
-                        clicked => {
-                            let src = root.browse_file();
-                            if (src != "") {
-                                let dst = root.browse_folder();
-                                if (dst != "") { root.unpack_prp(src, dst); }
-                            }
-                        }
-                    }
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        spacing: 8px;
+                        alignment: start;
 
-                    CustomButton {
-                        text: "📂 Open Project...";
-                        primary-color: #4e5058;
-                        clicked => {
-                            let path = root.browse_file();
-                            if (path != "") { root.load_project(path); }
-                        }
-                    }
-
-                    CustomButton {
-                        text: "📁 Assets Folder...";
-                        primary-color: #d28e1b;
-                        clicked => {
-                            let proj = root.browse_folder();
-                            if (proj != "") { root.open_assets_folder(proj); }
-                        }
-                    }
-
-                    CustomButton {
-                        text: "💾 Pack to PRP...";
-                        primary-color: #23a55a;
-                        clicked => {
-                            let proj = root.browse_folder();
-                            if (proj != "") { root.pack_prp(proj); }
-                        }
-                    }
-
-                    Rectangle {
-                        width: 1px;
-                        background: #353535;
-                        height: 20px;
-                        y: 12px;
-                    }
-
-                    CustomButton {
-                        text: "🩹 Create Patch...";
-                        primary-color: #4e5058;
-                        clicked => {
-                            let base = root.browse_folder();
-                            if (base != "") {
-                                let mod_dir = root.browse_folder();
-                                if (mod_dir != "") {
-                                    let out = root.save_file();
-                                    if (out != "") { root.create_patch(base, mod_dir, out); }
+                        CustomButton {
+                            icon: "📦";
+                            text: "Unpack PRP...";
+                            primary-color: #3e6a90;
+                            min-w: 125px;
+                            clicked => {
+                                let src = root.browse_file();
+                                if (src != "") {
+                                    let dst = root.browse_folder();
+                                    if (dst != "") { root.unpack_prp(src, dst); }
                                 }
                             }
                         }
-                    }
 
-                    CustomButton {
-                        text: "✨ Apply Patch...";
-                        primary-color: #3e6a90;
-                        clicked => {
-                            let patch = root.browse_file();
-                            if (patch != "") {
-                                let target = root.browse_folder();
-                                if (target != "") { root.apply_patch(target, patch); }
+                        CustomButton {
+                            icon: "📂";
+                            text: "Open Project...";
+                            primary-color: #4e5058;
+                            min-w: 130px;
+                            clicked => {
+                                let path = root.browse_folder();
+                                if (path != "") {
+                                    root.load_project(path);
+                                } else {
+                                    let f = root.browse_file();
+                                    if (f != "") { root.load_project(f); }
+                                }
+                            }
+                        }
+
+                        CustomButton {
+                            icon: "📁";
+                            text: "Assets Folder";
+                            primary-color: #d28e1b;
+                            min-w: 125px;
+                            clicked => {
+                                if (root.active_project_dir != "") {
+                                    root.open_assets_folder(root.active_project_dir);
+                                } else {
+                                    let proj = root.browse_folder();
+                                    if (proj != "") { root.open_assets_folder(proj); }
+                                }
+                            }
+                        }
+
+                        CustomButton {
+                            icon: "🧹";
+                            text: "Clean Rebuild";
+                            primary-color: #636773;
+                            min-w: 125px;
+                            clicked => {
+                                if (root.active_project_dir != "") {
+                                    root.clean_rebuild(root.active_project_dir);
+                                } else {
+                                    let proj = root.browse_folder();
+                                    if (proj != "") { root.clean_rebuild(proj); }
+                                }
+                            }
+                        }
+
+                        CustomButton {
+                            icon: "💾";
+                            text: "Pack to PRP";
+                            primary-color: #23a55a;
+                            min-w: 120px;
+                            clicked => {
+                                if (root.active_project_dir != "") {
+                                    root.pack_prp(root.active_project_dir);
+                                } else {
+                                    let proj = root.browse_folder();
+                                    if (proj != "") { root.pack_prp(proj); }
+                                }
+                            }
+                        }
+
+                        VerticalLayout {
+                            alignment: center;
+                            Rectangle {
+                                width: 1px;
+                                background: #3f4248;
+                                height: 20px;
+                            }
+                        }
+
+                        CustomButton {
+                            icon: "🩹";
+                            text: "Create Patch...";
+                            primary-color: #4e5058;
+                            min-w: 125px;
+                            clicked => {
+                                let base = root.browse_folder();
+                                if (base != "") {
+                                    let mod_dir = root.browse_folder();
+                                    if (mod_dir != "") {
+                                        let out = root.save_file();
+                                        if (out != "") { root.create_patch(base, mod_dir, out); }
+                                    }
+                                }
+                            }
+                        }
+
+                        CustomButton {
+                            icon: "✨";
+                            text: "Apply Patch...";
+                            primary-color: #3e6a90;
+                            min-w: 120px;
+                            clicked => {
+                                let patch = root.browse_file();
+                                if (patch != "") {
+                                    let target = root.browse_folder();
+                                    if (target != "") { root.apply_patch(target, patch); }
+                                }
                             }
                         }
                     }
@@ -215,6 +277,7 @@ export component AppWindow inherits Window {
                             placeholder-text: "🔍 Filter resources by name, ID or type...";
                             font-family: "Consolas";
                             font-size: 11px;
+                            edited(text) => { root.filter_changed(text); }
                         }
 
                         Rectangle {
@@ -244,13 +307,25 @@ export component AppWindow inherits Window {
                                             spacing: 1px;
                                             horizontal-stretch: 1;
 
-                                            Text {
-                                                text: item.display_name;
-                                                color: #ffffff;
-                                                font-family: "Consolas";
-                                                font-size: 11px;
-                                                font-weight: 700;
-                                                overflow: elide;
+                                            HorizontalLayout {
+                                                spacing: 4px;
+                                                Text {
+                                                    text: item.display_name;
+                                                    color: #ffffff;
+                                                    font-family: "Consolas";
+                                                    font-size: 11px;
+                                                    font-weight: 700;
+                                                    overflow: elide;
+                                                }
+
+                                                if item.is_modified: Text {
+                                                    text: "[MOD]";
+                                                    color: #f0b132;
+                                                    font-family: "Consolas";
+                                                    font-size: 10px;
+                                                    font-weight: 700;
+                                                    vertical-alignment: center;
+                                                }
                                             }
 
                                             Text {
@@ -271,7 +346,6 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                // DRAGGABLE SPLITTER BAR
                 SplitterBar {
                     target-width <=> root.sidebar_width;
                 }
@@ -288,13 +362,13 @@ export component AppWindow inherits Window {
                         padding: 14px;
                         spacing: 10px;
 
-                        // Header Information
+                        // Header Information with Revert button
                         HorizontalLayout {
                             alignment: space-between;
                             VerticalLayout {
                                 spacing: 2px;
                                 Text {
-                                    text: root.selected_index >= 0 ? root.asset_list[root.selected_index].display_name : "No Resource Selected";
+                                    text: root.selected_index >= 0 && root.selected_index < root.asset_list.length ? root.asset_list[root.selected_index].display_name : "No Resource Selected";
                                     font-size: 15px;
                                     font-weight: 700;
                                     color: #f0b132;
@@ -307,6 +381,14 @@ export component AppWindow inherits Window {
                                     color: #949ba4;
                                 }
                             }
+
+                            if root.active_file_path != "": CustomButton {
+                                icon: "🔄";
+                                text: "Reset to Vanilla";
+                                primary-color: #8b3a3a;
+                                min-w: 135px;
+                                clicked => { root.revert_asset(root.active_file_path); }
+                            }
                         }
 
                         Rectangle {
@@ -314,7 +396,7 @@ export component AppWindow inherits Window {
                             background: #353535;
                         }
 
-                        // CONTEXT 0: TEXTURES (DDS / TGA / CUBEMAP)
+                        // CONTEXT 0: TEXTURES
                         if root.active_kind_id == 0: VerticalLayout {
                             spacing: 10px;
                             vertical-stretch: 1;
@@ -322,8 +404,10 @@ export component AppWindow inherits Window {
                             HorizontalLayout {
                                 spacing: 8px;
                                 CustomButton {
-                                    text: "📥 Export to Image";
+                                    icon: "📥";
+                                    text: "Export to Image";
                                     primary-color: #3e6a90;
+                                    min-w: 130px;
                                     clicked => {
                                         let out = root.save_file();
                                         if (out != "") { root.export_dds(root.active_file_path, out); }
@@ -331,8 +415,10 @@ export component AppWindow inherits Window {
                                 }
 
                                 CustomButton {
-                                    text: "📤 Replace from Image";
+                                    icon: "📤";
+                                    text: "Replace from Image";
                                     primary-color: #23a55a;
+                                    min-w: 140px;
                                     clicked => {
                                         let inp = root.browse_file();
                                         if (inp != "") { root.import_dds(root.active_file_path, inp); }
@@ -369,7 +455,7 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        // CONTEXT 1: AUDIO (WAV)
+                        // CONTEXT 1: AUDIO
                         if root.active_kind_id == 1: VerticalLayout {
                             spacing: 12px;
                             alignment: start;
@@ -382,8 +468,10 @@ export component AppWindow inherits Window {
                             HorizontalLayout {
                                 spacing: 8px;
                                 CustomButton {
-                                    text: "📥 Export to .WAV";
+                                    icon: "📥";
+                                    text: "Export to .WAV";
                                     primary-color: #3e6a90;
+                                    min-w: 125px;
                                     clicked => {
                                         let out = root.save_file();
                                         if (out != "") { root.export_wav(root.active_file_path, out); }
@@ -391,8 +479,10 @@ export component AppWindow inherits Window {
                                 }
 
                                 CustomButton {
-                                    text: "📤 Replace from .WAV";
+                                    icon: "📤";
+                                    text: "Replace from .WAV";
                                     primary-color: #23a55a;
+                                    min-w: 135px;
                                     clicked => {
                                         let inp = root.browse_file();
                                         if (inp != "") { root.import_wav(root.active_file_path, inp); }
@@ -401,7 +491,7 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        // CONTEXT 2: MATERIALS (JSON)
+                        // CONTEXT 2: MATERIALS
                         if root.active_kind_id == 2: VerticalLayout {
                             spacing: 8px;
                             vertical-stretch: 1;
@@ -409,8 +499,10 @@ export component AppWindow inherits Window {
                             HorizontalLayout {
                                 spacing: 8px;
                                 CustomButton {
-                                    text: "💾 Save Changes to Material";
+                                    icon: "💾";
+                                    text: "Save Changes to Material";
                                     primary-color: #23a55a;
+                                    min-w: 175px;
                                     clicked => { root.save_material(root.active_file_path, root.mat_json_text); }
                                 }
                             }
@@ -430,7 +522,7 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        // CONTEXT 3: 3D MESH & TERRAIN (OBJ)
+                        // CONTEXT 3: 3D MESH & TERRAIN
                         if root.active_kind_id == 3: VerticalLayout {
                             spacing: 12px;
                             alignment: start;
@@ -443,8 +535,10 @@ export component AppWindow inherits Window {
                             HorizontalLayout {
                                 spacing: 8px;
                                 CustomButton {
-                                    text: "🗿 Export to .OBJ (Blender)";
+                                    icon: "🗿";
+                                    text: "Export to .OBJ / .GLB";
                                     primary-color: #3e6a90;
+                                    min-w: 145px;
                                     clicked => {
                                         let out = root.save_file();
                                         if (out != "") { root.export_mesh_obj(root.active_file_path, out); }
@@ -452,8 +546,10 @@ export component AppWindow inherits Window {
                                 }
 
                                 CustomButton {
-                                    text: "📤 Replace from .OBJ (Blender)";
+                                    icon: "📤";
+                                    text: "Replace from .OBJ / .GLB";
                                     primary-color: #23a55a;
+                                    min-w: 155px;
                                     clicked => {
                                         let inp = root.browse_file();
                                         if (inp != "") { root.import_mesh_obj(root.active_file_path, inp); }
@@ -461,8 +557,10 @@ export component AppWindow inherits Window {
                                 }
 
                                 CustomButton {
-                                    text: "⛰️ Export Terrain to .OBJ";
+                                    icon: "⛰️";
+                                    text: "Export Terrain to 3D";
                                     primary-color: #4e5058;
+                                    min-w: 145px;
                                     clicked => {
                                         let out = root.save_file();
                                         if (out != "") { root.export_terrain_obj(root.active_file_path, out); }
@@ -491,8 +589,10 @@ export component AppWindow inherits Window {
                             HorizontalLayout {
                                 spacing: 8px;
                                 CustomButton {
-                                    text: "📥 Export to .luac";
+                                    icon: "📥";
+                                    text: "Export to .luac";
                                     primary-color: #3e6a90;
+                                    min-w: 125px;
                                     clicked => {
                                         let out = root.save_file();
                                         if (out != "") { root.export_lua(root.active_file_path, out); }
@@ -500,8 +600,10 @@ export component AppWindow inherits Window {
                                 }
 
                                 CustomButton {
-                                    text: "📤 Replace from .luac";
+                                    icon: "📤";
+                                    text: "Replace from .luac";
                                     primary-color: #23a55a;
+                                    min-w: 135px;
                                     clicked => {
                                         let inp = root.browse_file();
                                         if (inp != "") { root.import_lua(root.active_file_path, inp); }
@@ -525,7 +627,7 @@ export component AppWindow inherits Window {
             }
         }
 
-        // TAB 1: SYSTEM LOGS (TERMINAL STREAM)
+        // TAB 1: SYSTEM LOGS
         if root.active_tab == 1: Rectangle {
             background: #2b2d31;
             border-color: #1f2023;
@@ -555,7 +657,7 @@ export component AppWindow inherits Window {
 
                 Text {
                     text: root.status_msg;
-                    color: #4CAF50;
+                    color: root.status_is_error ? #ff5555 : #4CAF50;
                     font-size: 12px;
                     font-weight: 700;
                     vertical-alignment: center;

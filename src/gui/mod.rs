@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use crate::engine::assets::sniffer::{AssetKind, sniff_asset};
+use crate::engine::container::sync::{AssetSyncCache, calculate_crc32};
 use crate::utils::logger::UiLogger;
 use crate::{AppWindow, AssetItem};
 use commands::WorkerCommand;
@@ -21,10 +22,41 @@ pub struct CachedAsset {
     pub kind: AssetKind,
 }
 
+#[derive(Default)]
+pub struct AppState {
+    pub all_ui_items: Vec<AssetItem>,
+    pub all_cached_assets: Vec<CachedAsset>,
+    pub visible_indices: Vec<usize>,
+    pub current_proj_dir: Option<PathBuf>,
+}
+
 pub fn scan_project_folder(project_dir: &Path) -> (Vec<AssetItem>, Vec<CachedAsset>) {
-    let chunks_dir = project_dir.join("chunks");
+    // If chunks/ does not exist yet, check chunks_vanilla/ as baseline fallback
+    let chunks_dir = if project_dir.join("chunks").exists() {
+        project_dir.join("chunks")
+    } else {
+        project_dir.join("chunks_vanilla")
+    };
+
     let mut ui_items = Vec::new();
     let mut cached = Vec::new();
+
+    let cache_map: std::collections::HashMap<String, bool> = {
+        let cache_file = project_dir.join(".asset_cache.json");
+        if let Ok(content) = fs::read_to_string(cache_file)
+            && let Ok(cache) = serde_json::from_str::<AssetSyncCache>(&content)
+        {
+            cache
+                .entries
+                .values()
+                .map(|e| (e.chunk_rel_path.clone(), e.is_modified))
+                .collect()
+        } else {
+            Default::default()
+        }
+    };
+
+    let vanilla_dir = project_dir.join("chunks_vanilla");
 
     if let Ok(entries) = fs::read_dir(chunks_dir) {
         let mut sorted_entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
@@ -32,7 +64,7 @@ pub fn scan_project_folder(project_dir: &Path) -> (Vec<AssetItem>, Vec<CachedAss
 
         for entry in sorted_entries {
             let path = entry.path();
-            if path.is_file() {
+            if path.is_file() && path.extension().is_some_and(|e| e == "bin") {
                 let filename = path
                     .file_name()
                     .unwrap_or_default()
@@ -51,6 +83,18 @@ pub fn scan_project_folder(project_dir: &Path) -> (Vec<AssetItem>, Vec<CachedAss
                     _ => 5,
                 };
 
+                let rel_key = format!("chunks/{}", filename);
+                let is_modified = cache_map.get(&rel_key).copied().unwrap_or_else(|| {
+                    let vanilla_file = vanilla_dir.join(&filename);
+                    if vanilla_file.exists()
+                        && let Ok(v_bytes) = fs::read(vanilla_file)
+                    {
+                        calculate_crc32(&v_bytes) != calculate_crc32(&bytes)
+                    } else {
+                        false
+                    }
+                });
+
                 ui_items.push(AssetItem {
                     display_name: sniffed.display_name.into(),
                     kind_name: sniffed.kind_name.into(),
@@ -58,6 +102,7 @@ pub fn scan_project_folder(project_dir: &Path) -> (Vec<AssetItem>, Vec<CachedAss
                     file_path: path.to_string_lossy().to_string().into(),
                     size_str: size_str.into(),
                     kind_id,
+                    is_modified,
                 });
 
                 cached.push(CachedAsset {
@@ -73,7 +118,7 @@ pub fn scan_project_folder(project_dir: &Path) -> (Vec<AssetItem>, Vec<CachedAss
 pub fn run_gui() -> Result<(), slint::PlatformError> {
     let ui = AppWindow::new()?;
     let ui_weak = ui.as_weak();
-    let cached_assets: Arc<Mutex<Vec<CachedAsset>>> = Arc::new(Mutex::new(Vec::new()));
+    let app_state = Arc::new(Mutex::new(AppState::default()));
 
     // 1. Setup Logger Channel
     let (log_tx, log_rx) = mpsc::channel::<String>();
@@ -106,7 +151,7 @@ pub fn run_gui() -> Result<(), slint::PlatformError> {
 
     let worker_ui_handle = ui_weak.clone();
     let worker_logger = logger.clone();
-    let worker_cache = cached_assets.clone();
+    let worker_state = app_state.clone();
 
     thread::spawn(move || {
         while let Ok(cmd) = worker_rx.recv() {
@@ -119,58 +164,248 @@ pub fn run_gui() -> Result<(), slint::PlatformError> {
                             worker_logger
                                 .log(&format!("[+] Unpack complete: {} chunks extracted.", count));
                             let (items, cached) = scan_project_folder(&dst);
-                            *worker_cache.lock().unwrap() = cached;
+                            {
+                                let mut st = worker_state.lock().unwrap();
+                                st.visible_indices = (0..items.len()).collect();
+                                st.all_cached_assets = cached;
+                                st.all_ui_items = items.clone();
+                                st.current_proj_dir = Some(dst.clone());
+                            }
 
                             let ui_h = worker_ui_handle.clone();
+                            let dst_str = dst.to_string_lossy().to_string();
                             let _ = slint::invoke_from_event_loop(move || {
                                 if let Some(ui) = ui_h.upgrade() {
+                                    ui.set_active_project_dir(dst_str.into());
                                     ui.set_asset_list(ModelRc::from(std::rc::Rc::new(
                                         VecModel::from(items),
                                     )));
+                                    ui.set_status_is_error(false);
                                     ui.set_status_msg(
                                         format!("Extracted {} items into workspace.", count).into(),
                                     );
                                 }
                             });
                         }
-                        Err(e) => worker_logger.log(&format!("[!] Unpack error: {}", e)),
+                        Err(e) => {
+                            worker_logger.log(&format!("[!] Unpack error: {}", e));
+                            let ui_h = worker_ui_handle.clone();
+                            let err_msg = format!("Unpack Error: {}", e);
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(ui) = ui_h.upgrade() {
+                                    ui.set_status_is_error(true);
+                                    ui.set_status_msg(err_msg.into());
+                                }
+                            });
+                        }
                     }
                 }
                 WorkerCommand::LoadProject { proj_dir } => {
-                    let (items, cached) = scan_project_folder(&proj_dir);
+                    // Resolve project folder if project.json or a sub-file was selected
+                    let actual_dir = if proj_dir.is_file() {
+                        proj_dir
+                            .parent()
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or(proj_dir)
+                    } else {
+                        proj_dir
+                    };
+
+                    worker_logger.log(&format!("[*] Loading project from: {:?}", actual_dir));
+
+                    if !actual_dir.exists()
+                        || (!actual_dir.join("chunks").exists()
+                            && !actual_dir.join("chunks_vanilla").exists()
+                            && !actual_dir.join("project.json").exists())
+                    {
+                        worker_logger.log(&format!(
+                            "[!] Error: {:?} is not a valid project folder (missing project.json or chunks/)",
+                            actual_dir
+                        ));
+                        let ui_h = worker_ui_handle.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_h.upgrade() {
+                                ui.set_status_is_error(true);
+                                ui.set_status_msg(
+                                    "Error: Not a valid Overlord project folder!".into(),
+                                );
+                            }
+                        });
+                        continue;
+                    }
+
+                    let (items, cached) = scan_project_folder(&actual_dir);
                     let total = items.len();
-                    *worker_cache.lock().unwrap() = cached;
+                    {
+                        let mut st = worker_state.lock().unwrap();
+                        st.visible_indices = (0..items.len()).collect();
+                        st.all_cached_assets = cached;
+                        st.all_ui_items = items.clone();
+                        st.current_proj_dir = Some(actual_dir.clone());
+                    }
 
                     worker_logger.log(&format!("[+] Project loaded: {} items found.", total));
                     let ui_h = worker_ui_handle.clone();
+                    let actual_dir_str = actual_dir.to_string_lossy().to_string();
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(ui) = ui_h.upgrade() {
+                            ui.set_active_project_dir(actual_dir_str.into());
+                            ui.set_selected_index(-1);
+                            ui.set_active_file_path("".into());
                             ui.set_asset_list(ModelRc::from(std::rc::Rc::new(VecModel::from(
                                 items,
                             ))));
+                            ui.set_status_is_error(false);
                             ui.set_status_msg(
                                 format!("Loaded {} resources into workspace.", total).into(),
                             );
                         }
                     });
                 }
+                WorkerCommand::CleanRebuild { proj_dir } => {
+                    let actual_dir = if proj_dir.is_file() {
+                        proj_dir
+                            .parent()
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or(proj_dir)
+                    } else {
+                        proj_dir
+                    };
+
+                    worker_logger.log(&format!(
+                        "[*] Performing clean rebuild from vanilla: {:?}",
+                        actual_dir
+                    ));
+                    match crate::engine::container::sync::clean_rebuild_project(&actual_dir) {
+                        Ok(synced) => {
+                            worker_logger.log(&format!(
+                                "[+] Clean rebuild completed: {} assets re-synced.",
+                                synced
+                            ));
+                            let (items, cached) = scan_project_folder(&actual_dir);
+                            {
+                                let mut st = worker_state.lock().unwrap();
+                                st.visible_indices = (0..items.len()).collect();
+                                st.all_cached_assets = cached;
+                                st.all_ui_items = items.clone();
+                            }
+                            let ui_h = worker_ui_handle.clone();
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(ui) = ui_h.upgrade() {
+                                    ui.set_asset_list(ModelRc::from(std::rc::Rc::new(
+                                        VecModel::from(items),
+                                    )));
+                                    ui.set_status_is_error(false);
+                                    ui.set_status_msg("Clean rebuild successful!".into());
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            worker_logger.log(&format!("[!] Clean rebuild error: {}", e));
+                            let ui_h = worker_ui_handle.clone();
+                            let err_msg = format!("Rebuild Error: {}", e);
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(ui) = ui_h.upgrade() {
+                                    ui.set_status_is_error(true);
+                                    ui.set_status_msg(err_msg.into());
+                                }
+                            });
+                        }
+                    }
+                }
+                WorkerCommand::RevertAsset {
+                    proj_dir,
+                    chunk_path,
+                } => {
+                    let actual_dir = if proj_dir.is_file() {
+                        proj_dir
+                            .parent()
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or(proj_dir)
+                    } else {
+                        proj_dir
+                    };
+
+                    worker_logger.log(&format!("[*] Reverting asset to vanilla: {:?}", chunk_path));
+                    match crate::engine::container::sync::revert_single_asset(
+                        &actual_dir,
+                        &chunk_path,
+                    ) {
+                        Ok(_) => {
+                            worker_logger.log(&format!(
+                                "[+] Reverted {:?} to pristine vanilla state.",
+                                chunk_path
+                            ));
+                            let (items, cached) = scan_project_folder(&actual_dir);
+                            {
+                                let mut st = worker_state.lock().unwrap();
+                                st.visible_indices = (0..items.len()).collect();
+                                st.all_cached_assets = cached;
+                                st.all_ui_items = items.clone();
+                            }
+                            let ui_h = worker_ui_handle.clone();
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(ui) = ui_h.upgrade() {
+                                    ui.set_asset_list(ModelRc::from(std::rc::Rc::new(
+                                        VecModel::from(items),
+                                    )));
+                                    ui.set_status_is_error(false);
+                                    ui.set_status_msg(
+                                        "Asset restored from vanilla baseline.".into(),
+                                    );
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            worker_logger.log(&format!("[!] Revert error: {}", e));
+                            let ui_h = worker_ui_handle.clone();
+                            let err_msg = format!("Revert Error: {}", e);
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(ui) = ui_h.upgrade() {
+                                    ui.set_status_is_error(true);
+                                    ui.set_status_msg(err_msg.into());
+                                }
+                            });
+                        }
+                    }
+                }
                 WorkerCommand::PackArchive { proj_dir } => {
-                    worker_logger.log(&format!("[*] Packing project: {:?}", proj_dir));
-                    let out = proj_dir.join("rebuilt.prp");
-                    match crate::engine::container::project::pack_archive(&proj_dir, &out) {
+                    let actual_dir = if proj_dir.is_file() {
+                        proj_dir
+                            .parent()
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or(proj_dir)
+                    } else {
+                        proj_dir
+                    };
+
+                    worker_logger.log(&format!("[*] Packing project: {:?}", actual_dir));
+                    let out = actual_dir.join("rebuilt.prp");
+                    match crate::engine::container::project::pack_archive(&actual_dir, &out) {
                         Ok(size) => {
                             worker_logger
                                 .log(&format!("[+] Pack complete: {:?} ({} bytes)", out, size));
                             let ui_h = worker_ui_handle.clone();
                             let _ = slint::invoke_from_event_loop(move || {
                                 if let Some(ui) = ui_h.upgrade() {
+                                    ui.set_status_is_error(false);
                                     ui.set_status_msg(
                                         "Archive successfully packed to rebuilt.prp!".into(),
                                     );
                                 }
                             });
                         }
-                        Err(e) => worker_logger.log(&format!("[!] Pack error: {}", e)),
+                        Err(e) => {
+                            worker_logger.log(&format!("[!] Pack error: {}", e));
+                            let ui_h = worker_ui_handle.clone();
+                            let err_msg = format!("Pack Error: {}", e);
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(ui) = ui_h.upgrade() {
+                                    ui.set_status_is_error(true);
+                                    ui.set_status_msg(err_msg.into());
+                                }
+                            });
+                        }
                     }
                 }
                 WorkerCommand::CreatePatch {
@@ -263,8 +498,11 @@ pub fn run_gui() -> Result<(), slint::PlatformError> {
                             Ok((glb, stats)) => {
                                 let _ = fs::write(&out_path, glb);
                                 worker_logger.log(&format!(
-                                    "[+] glTF exported to: {:?} ({} vertices, {} triangles)",
-                                    out_path, stats.vertex_count, stats.triangle_count
+                                    "[+] glTF exported: {:?} ({} verts, {} tris, skinned: {})",
+                                    out_path,
+                                    stats.vertex_count,
+                                    stats.triangle_count,
+                                    stats.is_skinned
                                 ));
                             }
                             Err(e) => worker_logger.log(&format!("[!] glTF export error: {}", e)),
@@ -274,7 +512,7 @@ pub fn run_gui() -> Result<(), slint::PlatformError> {
                             Ok((obj, stats)) => {
                                 let _ = fs::write(&out_path, obj);
                                 worker_logger.log(&format!(
-                                    "[+] OBJ exported to: {:?} ({} vertices)",
+                                    "[+] OBJ exported: {:?} ({} vertices)",
                                     out_path, stats.vertex_count
                                 ));
                             }
@@ -297,7 +535,7 @@ pub fn run_gui() -> Result<(), slint::PlatformError> {
                             Ok(bin) => {
                                 let _ = fs::write(&chunk_path, bin);
                                 worker_logger.log(&format!(
-                                    "[+] Mesh chunk {:?} rebuilt from .glb",
+                                    "[+] Mesh chunk {:?} rebuilt from .glb (Skinning preserved)",
                                     chunk_path
                                 ));
                             }
@@ -395,6 +633,37 @@ pub fn run_gui() -> Result<(), slint::PlatformError> {
         }
     });
 
+    // Real-time asset filter handler
+    let filter_ui_handle = ui_weak.clone();
+    let filter_state = app_state.clone();
+    ui.on_filter_changed(move |query| {
+        let q = query.trim().to_lowercase();
+        let mut st = filter_state.lock().unwrap();
+        let mut new_visible = Vec::new();
+        let mut filtered_ui = Vec::new();
+
+        for (i, item) in st.all_ui_items.iter().enumerate() {
+            if q.is_empty()
+                || item.display_name.to_lowercase().contains(&q)
+                || item.kind_name.to_lowercase().contains(&q)
+                || item.file_path.to_lowercase().contains(&q)
+            {
+                new_visible.push(i);
+                filtered_ui.push(item.clone());
+            }
+        }
+
+        st.visible_indices = new_visible;
+
+        let ui_h = filter_ui_handle.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = ui_h.upgrade() {
+                ui.set_asset_list(ModelRc::from(std::rc::Rc::new(VecModel::from(filtered_ui))));
+                ui.set_selected_index(-1);
+            }
+        });
+    });
+
     ui.on_browse_file(|| {
         rfd::FileDialog::new()
             .pick_file()
@@ -416,7 +685,7 @@ pub fn run_gui() -> Result<(), slint::PlatformError> {
 
     archive::register(&ui, worker_tx.clone(), logger.clone());
     textures::register(&ui, worker_tx.clone(), logger.clone());
-    assets::register(&ui, worker_tx, logger, cached_assets);
+    assets::register(&ui, worker_tx, logger, app_state);
 
     ui.run()
 }

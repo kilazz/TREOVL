@@ -1,11 +1,11 @@
 use slint::{ComponentHandle, Image, Rgba8Pixel, SharedPixelBuffer};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc::Sender};
 
 use crate::AppWindow;
 use crate::engine::assets::sniffer::AssetKind;
-use crate::gui::CachedAsset;
+use crate::gui::AppState;
 use crate::gui::commands::WorkerCommand;
 use crate::utils::dds_decoder;
 use crate::utils::logger::UiLogger;
@@ -14,14 +14,16 @@ pub fn register(
     ui: &AppWindow,
     tx: Sender<WorkerCommand>,
     _logger: UiLogger,
-    cache: Arc<Mutex<Vec<CachedAsset>>>,
+    state: Arc<Mutex<AppState>>,
 ) {
     let ui_weak = ui.as_weak();
-    let cache_w = cache;
+    let state_w = state.clone();
 
-    ui.on_select_asset(move |index| {
-        let cache_guard = cache_w.lock().unwrap();
-        if let Some(target) = cache_guard.get(index as usize) {
+    ui.on_select_asset(move |filtered_index| {
+        let st = state_w.lock().unwrap();
+        if let Some(&real_index) = st.visible_indices.get(filtered_index as usize)
+            && let Some(target) = st.all_cached_assets.get(real_index)
+        {
             let path = target.path.clone();
             let kind = target.kind;
             let ui_handle = ui_weak.clone();
@@ -31,7 +33,7 @@ pub fn register(
 
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(ui) = ui_handle.upgrade() {
-                    ui.set_selected_index(index);
+                    ui.set_selected_index(filtered_index);
                     ui.set_active_file_path(path_str.into());
 
                     match kind {
@@ -80,8 +82,8 @@ pub fn register(
                             {
                                 ui.set_mesh_info(
                                     format!(
-                                        "Vertices: {} | Triangles: {} | Stride: {}b",
-                                        stats.vertex_count, stats.triangle_count, stats.stride
+                                        "Vertices: {} | Triangles: {} | Skinned: {}",
+                                        stats.vertex_count, stats.triangle_count, stats.is_skinned
                                     )
                                     .into(),
                                 );
@@ -98,6 +100,26 @@ pub fn register(
                         _ => ui.set_active_kind_id(5),
                     }
                 }
+            });
+        }
+    });
+
+    let tx_revert = tx.clone();
+    let state_revert = state;
+    ui.on_revert_asset(move |chunk_str| {
+        let st = state_revert.lock().unwrap();
+        // Fallback: derive project directory directly from chunk file path if needed
+        let resolved_proj_dir = st.current_proj_dir.clone().or_else(|| {
+            Path::new(chunk_str.as_str())
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|p| p.to_path_buf())
+        });
+
+        if let Some(proj_dir) = resolved_proj_dir {
+            let _ = tx_revert.send(WorkerCommand::RevertAsset {
+                proj_dir,
+                chunk_path: chunk_str.to_string(),
             });
         }
     });

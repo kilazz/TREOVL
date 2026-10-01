@@ -15,7 +15,9 @@ use crate::engine::assets::shader::{ShaderType, export_shader};
 use crate::engine::assets::terrain::export_terrain_to_glb;
 use crate::engine::assets::texture::{export_to_dds, replace_texture_in_chunk};
 use crate::engine::container::project::{pack_archive, unpack_archive};
-use crate::engine::container::sync::{export_smart_assets, sync_assets_to_chunks};
+use crate::engine::container::sync::{
+    clean_rebuild_project, export_smart_assets, revert_single_asset, sync_assets_to_chunks,
+};
 use crate::utils::diff::{apply_patch, create_diff};
 
 #[derive(Parser)]
@@ -46,10 +48,22 @@ pub enum Commands {
         /// Output .prp archive file
         out_archive: PathBuf,
     },
-    /// Sync modified files from 'assets/' into 'chunks/'
+    /// Sync modified files from 'assets/' into 'chunks/' using vanilla baseline
     Sync {
         /// Project directory containing project.json
         project_dir: PathBuf,
+    },
+    /// Clean rebuild all chunks from chunks_vanilla and freshly apply edits
+    CleanRebuild {
+        /// Project directory containing project.json
+        project_dir: PathBuf,
+    },
+    /// Revert a specific chunk and its smart asset back to vanilla baseline
+    Revert {
+        /// Project directory containing project.json
+        project_dir: PathBuf,
+        /// Relative path or filename of the chunk (e.g. chunk_0001_id0x0.bin)
+        chunk: String,
     },
     /// Re-export all smart editable assets into 'assets/' from raw chunks
     ExportAssets {
@@ -189,7 +203,10 @@ pub fn handle_cli() -> Result<()> {
         Commands::Unpack { archive, out_dir } => {
             let (count, log) = unpack_archive(&archive, &out_dir)?;
             print!("{}", log);
-            println!("[+] Extracted {} chunks.", count);
+            println!(
+                "[+] Extracted {} chunks (vanilla baseline preserved).",
+                count
+            );
         }
         Commands::Pack {
             project_dir,
@@ -200,7 +217,18 @@ pub fn handle_cli() -> Result<()> {
         }
         Commands::Sync { project_dir } => {
             let count = sync_assets_to_chunks(&project_dir)?;
-            println!("[+] Synced {} modified assets into chunks.", count);
+            println!(
+                "[+] Synced {} modified assets into chunks using vanilla baseline.",
+                count
+            );
+        }
+        Commands::CleanRebuild { project_dir } => {
+            let count = clean_rebuild_project(&project_dir)?;
+            println!("[+] Clean rebuild completed: {} assets re-synced.", count);
+        }
+        Commands::Revert { project_dir, chunk } => {
+            revert_single_asset(&project_dir, &chunk)?;
+            println!("[+] Reverted {:?} to pristine vanilla baseline.", chunk);
         }
         Commands::ExportAssets { project_dir } => {
             let count = export_smart_assets(&project_dir)?;
@@ -211,8 +239,8 @@ pub fn handle_cli() -> Result<()> {
             let (glb, stats) = export_mesh_to_glb(&data)?;
             fs::write(&output, glb)?;
             println!(
-                "[+] glTF 2.0 Binary (.glb) exported ({} vertices, {} triangles, stride: {} bytes).",
-                stats.vertex_count, stats.triangle_count, stats.stride
+                "[+] glTF 2.0 Binary (.glb) exported ({} vertices, {} triangles, skinned: {}).",
+                stats.vertex_count, stats.triangle_count, stats.is_skinned
             );
         }
         Commands::ImportGlb { mesh, input } => {
@@ -220,7 +248,7 @@ pub fn handle_cli() -> Result<()> {
             let glb = fs::read(&input)?;
             let new_bin = import_glb_to_mesh(&chunk, &glb)?;
             fs::write(&mesh, new_bin)?;
-            println!("[+] Mesh chunk successfully updated from .glb.");
+            println!("[+] Mesh chunk successfully updated from .glb (skinning preserved).");
         }
         Commands::ExportObj { mesh, output } => {
             let data = fs::read(&mesh)?;

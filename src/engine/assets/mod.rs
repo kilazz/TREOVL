@@ -1,8 +1,7 @@
 use anyhow::{Result, bail};
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use std::io::Cursor;
+use byteorder::{LittleEndian, WriteBytesExt};
 
-use crate::engine::common::magic;
+use crate::engine::common::{magic, parse_raw_container_table};
 
 pub mod animation;
 pub mod audio;
@@ -18,78 +17,23 @@ pub mod texture;
 pub type ChunkElement = (u32, Vec<u8>);
 
 pub fn parse_chunk_elements(data: &[u8]) -> Result<(bool, Vec<ChunkElement>)> {
-    let mut pos = 0;
-    let mut has_magic = false;
+    let table = parse_raw_container_table(data, 0, true)?;
+    let mut elements = Vec::with_capacity(table.entries.len());
 
-    // ACTIVELY USES magic::CONTAINER_MAGIC
-    if data.len() > 3 && &data[0..3] == magic::CONTAINER_MAGIC {
-        has_magic = true;
-        pos = 3;
-    }
-
-    if pos >= data.len() {
-        bail!("Not a valid Asset Container block.");
-    }
-
-    let control_byte = data[pos];
-    let has_large = (control_byte & 0x80) != 0;
-    let small_count = (control_byte & 0x7F) as usize;
-    pos += 1;
-
-    let mut large_count = 0;
-    if has_large {
-        if pos + 4 > data.len() {
-            bail!("Corrupted container header.");
-        }
-        let mut cur = Cursor::new(&data[pos..pos + 4]);
-        large_count = cur.read_u32::<LittleEndian>()? as usize;
-        pos += 4;
-    }
-
-    let total_entries = small_count + large_count;
-    if total_entries == 0 || total_entries > 4096 {
-        bail!("Invalid entry count in container.");
-    }
-
-    let table_size = (small_count * 2) + (large_count * 8);
-    let data_start = pos + table_size;
-    if data_start > data.len() {
-        bail!("Table offsets exceed chunk boundaries.");
-    }
-
-    let mut cur = Cursor::new(&data[pos..pos + table_size]);
-    let mut offsets = Vec::new();
-    for _ in 0..small_count {
-        offsets.push((cur.read_u8()? as u32, cur.read_u8()? as usize));
-    }
-    for _ in 0..large_count {
-        offsets.push((
-            cur.read_u32::<LittleEndian>()?,
-            cur.read_u32::<LittleEndian>()? as usize,
-        ));
-    }
-    offsets.sort_by_key(|&(_, off)| off);
-
-    if offsets.is_empty() || offsets[0].1 != 0 {
-        bail!("First table offset is not zero.");
-    }
-
-    let mut elements = Vec::new();
-    for i in 0..offsets.len() {
-        let (id, offset) = offsets[i];
-        let start = data_start + offset;
-        let end = if i + 1 < offsets.len() {
-            data_start + offsets[i + 1].1
+    for i in 0..table.entries.len() {
+        let start = table.data_start + table.entries[i].offset;
+        let end = if i + 1 < table.entries.len() {
+            table.data_start + table.entries[i + 1].offset
         } else {
             data.len()
         };
 
         if start <= data.len() && end <= data.len() && start <= end {
-            elements.push((id, data[start..end].to_vec()));
+            elements.push((table.entries[i].id, data[start..end].to_vec()));
         }
     }
 
-    Ok((has_magic, elements))
+    Ok((table.has_magic, elements))
 }
 
 pub fn build_chunk_from_elements(has_magic: bool, elements: &[ChunkElement]) -> Vec<u8> {
@@ -143,66 +87,20 @@ pub fn parse_typed_container(data: &[u8]) -> Result<(u32, Vec<ChunkElement>)> {
         bail!("Data is too short to be a typed container.");
     }
 
-    let mut cur = Cursor::new(&data[0..4]);
-    let type_id = cur.read_u32::<LittleEndian>()?;
+    let type_id = u32::from_le_bytes(data[0..4].try_into()?);
+    let table = parse_raw_container_table(data, 4, false)?;
+    let mut elements = Vec::with_capacity(table.entries.len());
 
-    let payload = &data[4..];
-    let control_byte = payload[0];
-    let has_large = (control_byte & 0x80) != 0;
-    let small_count = (control_byte & 0x7F) as usize;
-    let mut pos = 1;
-
-    let mut large_count = 0;
-    if has_large {
-        if pos + 4 > payload.len() {
-            bail!("Corrupted container table.");
-        }
-        let mut c = Cursor::new(&payload[pos..pos + 4]);
-        large_count = c.read_u32::<LittleEndian>()? as usize;
-        pos += 4;
-    }
-
-    let total_entries = small_count + large_count;
-    if total_entries == 0 || total_entries > 4096 {
-        bail!("Invalid entry count in typed container.");
-    }
-
-    let table_size = (small_count * 2) + (large_count * 8);
-    if pos + table_size > payload.len() {
-        bail!("Table offsets exceed chunk boundaries.");
-    }
-
-    let data_start = pos + table_size;
-    let mut c = Cursor::new(&payload[pos..pos + table_size]);
-
-    let mut offsets = Vec::new();
-    for _ in 0..small_count {
-        offsets.push((c.read_u8()? as u32, c.read_u8()? as usize));
-    }
-    for _ in 0..large_count {
-        offsets.push((
-            c.read_u32::<LittleEndian>()?,
-            c.read_u32::<LittleEndian>()? as usize,
-        ));
-    }
-    offsets.sort_by_key(|&(_, off)| off);
-
-    if offsets.is_empty() || offsets[0].1 != 0 {
-        bail!("First table offset is not zero.");
-    }
-
-    let mut elements = Vec::new();
-    for i in 0..offsets.len() {
-        let (id, offset) = offsets[i];
-        let start = data_start + offset;
-        let end = if i + 1 < offsets.len() {
-            data_start + offsets[i + 1].1
+    for i in 0..table.entries.len() {
+        let start = table.data_start + table.entries[i].offset;
+        let end = if i + 1 < table.entries.len() {
+            table.data_start + table.entries[i + 1].offset
         } else {
-            payload.len()
+            data.len()
         };
 
-        if start <= payload.len() && end <= payload.len() && start <= end {
-            elements.push((id, payload[start..end].to_vec()));
+        if start <= data.len() && end <= data.len() && start <= end {
+            elements.push((table.entries[i].id, data[start..end].to_vec()));
         }
     }
 

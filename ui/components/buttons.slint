@@ -5,7 +5,7 @@ export component TabButton {
     callback clicked;
 
     width: 145px;
-    height: 32px;
+    height: 30px;
 
     rect := Rectangle {
         background: root.active ? #2b2d31 : (ta.has-hover ? #242629 : #18191b);
@@ -42,12 +42,15 @@ export component TabButton {
 }
 
 export component CustomButton {
-    in property <string> text;
+    in property <string> text: "";
+    in property <string> icon: "";
     in property <bool> enabled: true;
     in property <color> primary-color: #3e6a90;
+    in property <length> min-w: 110px;
     callback clicked;
 
     height: 30px;
+    min-width: root.min-w;
 
     Rectangle {
         background: !root.enabled ? #202124 : (ta.has-hover ? root.primary-color.brighter(14%) : root.primary-color);
@@ -55,13 +58,25 @@ export component CustomButton {
         border-width: 1px;
         border-color: !root.enabled ? #2b2d31 : root.primary-color.darker(12%);
 
-        Text {
-            text: root.text;
-            color: !root.enabled ? #808080 : #ffffff;
-            font-size: 12px;
-            font-weight: 700;
-            horizontal-alignment: center;
-            vertical-alignment: center;
+        HorizontalLayout {
+            padding-left: 15px;
+            padding-right: 15px;
+            spacing: 7px;
+            alignment: center;
+
+            if root.icon != "": Text {
+                text: root.icon;
+                font-size: 13px;
+                vertical-alignment: center;
+            }
+
+            Text {
+                text: root.text;
+                color: !root.enabled ? #808080 : #ffffff;
+                font-size: 12px;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
         }
     }
 

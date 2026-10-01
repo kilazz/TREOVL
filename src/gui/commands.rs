@@ -12,6 +12,13 @@ pub enum WorkerCommand {
     LoadProject {
         proj_dir: PathBuf,
     },
+    CleanRebuild {
+        proj_dir: PathBuf,
+    },
+    RevertAsset {
+        proj_dir: PathBuf,
+        chunk_path: String,
+    },
     CreatePatch {
         base_dir: PathBuf,
         mod_dir: PathBuf,

@@ -18,7 +18,9 @@ use crate::engine::common::magic;
 pub struct AssetSyncEntry {
     pub chunk_rel_path: String,
     pub asset_kind: String,
-    pub crc32: u32,
+    pub vanilla_crc32: u32,
+    #[serde(default)]
+    pub is_modified: bool,
 }
 
 #[derive(Serialize, Deserialize, Default, Debug)]
@@ -26,7 +28,7 @@ pub struct AssetSyncCache {
     pub entries: HashMap<String, AssetSyncEntry>,
 }
 
-fn calculate_crc32(data: &[u8]) -> u32 {
+pub fn calculate_crc32(data: &[u8]) -> u32 {
     let mut hasher = Hasher::new();
     hasher.update(data);
     hasher.finalize()
@@ -61,6 +63,7 @@ fn build_asset_filename(display_name: &str, stem: &str, ext: &str) -> String {
 pub struct ProjectWorkspace<'a> {
     pub base_dir: &'a Path,
     pub chunks_dir: PathBuf,
+    pub vanilla_chunks_dir: PathBuf,
     pub assets_dir: PathBuf,
 }
 
@@ -69,6 +72,7 @@ impl<'a> ProjectWorkspace<'a> {
         Self {
             base_dir,
             chunks_dir: base_dir.join("chunks"),
+            vanilla_chunks_dir: base_dir.join("chunks_vanilla"),
             assets_dir: base_dir.join("assets"),
         }
     }
@@ -84,9 +88,6 @@ pub trait AssetProcessor: Sync + Send {
     ) -> Result<Option<(String, AssetSyncEntry)>>;
 }
 
-// -------------------------------------------------------------
-// TEXTURE PROCESSOR
-// -------------------------------------------------------------
 pub struct TextureProcessor;
 impl AssetProcessor for TextureProcessor {
     fn process(
@@ -116,15 +117,13 @@ impl AssetProcessor for TextureProcessor {
             AssetSyncEntry {
                 chunk_rel_path: format!("chunks/{}.bin", stem),
                 asset_kind: "Texture".into(),
-                crc32: calculate_crc32(&dds_or_tga),
+                vanilla_crc32: calculate_crc32(&dds_or_tga),
+                is_modified: false,
             },
         )))
     }
 }
 
-// -------------------------------------------------------------
-// AUDIO PROCESSOR
-// -------------------------------------------------------------
 pub struct AudioProcessor;
 impl AssetProcessor for AudioProcessor {
     fn process(
@@ -149,15 +148,13 @@ impl AssetProcessor for AudioProcessor {
             AssetSyncEntry {
                 chunk_rel_path: format!("chunks/{}.bin", stem),
                 asset_kind: "Audio".into(),
-                crc32: calculate_crc32(&wav_bytes),
+                vanilla_crc32: calculate_crc32(&wav_bytes),
+                is_modified: false,
             },
         )))
     }
 }
 
-// -------------------------------------------------------------
-// LUA PROCESSOR (DISASSEMBLER + HIGH-LEVEL DECOMPILER)
-// -------------------------------------------------------------
 pub struct LuaProcessor;
 impl AssetProcessor for LuaProcessor {
     fn process(
@@ -178,26 +175,24 @@ impl AssetProcessor for LuaProcessor {
             &bytecode,
         )?;
 
-        // 1. Output Bytecode Disassembly
         if let Ok(disasm) = crate::engine::assets::lua::disassemble_lua_bytecode(&bytecode) {
-            fs::write(
+            let _ = fs::write(
                 workspace
                     .assets_dir
                     .join("scripts")
                     .join(format!("{}.lua.txt", out_name)),
                 disasm,
-            )?;
+            );
         }
 
-        // 2. Output High-Level Pseudocode Decompilation
         if let Ok(decompiled) = crate::engine::assets::lua::decompile_lua_bytecode(&bytecode) {
-            fs::write(
+            let _ = fs::write(
                 workspace
                     .assets_dir
                     .join("scripts")
                     .join(format!("{}.decompiled.lua", out_name)),
                 decompiled,
-            )?;
+            );
         }
 
         Ok(Some((
@@ -205,15 +200,13 @@ impl AssetProcessor for LuaProcessor {
             AssetSyncEntry {
                 chunk_rel_path: format!("chunks/{}.bin", stem),
                 asset_kind: "Lua".into(),
-                crc32: calculate_crc32(&bytecode),
+                vanilla_crc32: calculate_crc32(&bytecode),
+                is_modified: false,
             },
         )))
     }
 }
 
-// -------------------------------------------------------------
-// MATERIAL PROCESSOR
-// -------------------------------------------------------------
 pub struct MaterialProcessor;
 impl AssetProcessor for MaterialProcessor {
     fn process(
@@ -238,15 +231,13 @@ impl AssetProcessor for MaterialProcessor {
             AssetSyncEntry {
                 chunk_rel_path: format!("chunks/{}.bin", stem),
                 asset_kind: "Material".into(),
-                crc32: calculate_crc32(json_str.as_bytes()),
+                vanilla_crc32: calculate_crc32(json_str.as_bytes()),
+                is_modified: false,
             },
         )))
     }
 }
 
-// -------------------------------------------------------------
-// MESH PROCESSOR (WITH AUTO-RIG ARMATURE EXTRACTION)
-// -------------------------------------------------------------
 pub struct MeshProcessor;
 impl AssetProcessor for MeshProcessor {
     fn process(
@@ -267,7 +258,6 @@ impl AssetProcessor for MeshProcessor {
             &glb_bytes,
         )?;
 
-        // Automatically export armature rig for Blender if bone data is present
         if let Ok(bones) = parse_object_bone_container(data)
             && !bones.is_empty()
             && let Ok(rig_glb) = export_skeleton_to_glb(&bones, &sniffed.display_name)
@@ -281,15 +271,13 @@ impl AssetProcessor for MeshProcessor {
             AssetSyncEntry {
                 chunk_rel_path: format!("chunks/{}.bin", stem),
                 asset_kind: "Mesh".into(),
-                crc32: calculate_crc32(&glb_bytes),
+                vanilla_crc32: calculate_crc32(&glb_bytes),
+                is_modified: false,
             },
         )))
     }
 }
 
-// -------------------------------------------------------------
-// XML PROCESSOR
-// -------------------------------------------------------------
 pub struct XmlProcessor;
 impl AssetProcessor for XmlProcessor {
     fn process(
@@ -325,15 +313,13 @@ impl AssetProcessor for XmlProcessor {
             AssetSyncEntry {
                 chunk_rel_path: format!("chunks/{}.bin", stem),
                 asset_kind: "Xml".into(),
-                crc32: calculate_crc32(xml_payload),
+                vanilla_crc32: calculate_crc32(xml_payload),
+                is_modified: false,
             },
         )))
     }
 }
 
-// -------------------------------------------------------------
-// PARAMETER / SCALAR PROCESSOR
-// -------------------------------------------------------------
 pub struct ParameterProcessor;
 impl AssetProcessor for ParameterProcessor {
     fn process(
@@ -423,15 +409,13 @@ impl AssetProcessor for ParameterProcessor {
             AssetSyncEntry {
                 chunk_rel_path: format!("chunks/{}.bin", stem),
                 asset_kind: "Parameter".into(),
-                crc32: calculate_crc32(json_str.as_bytes()),
+                vanilla_crc32: calculate_crc32(json_str.as_bytes()),
+                is_modified: false,
             },
         )))
     }
 }
 
-// -------------------------------------------------------------
-// REVERSE ENGINEERING DOSSIER GENERATOR FOR RAW CHUNKS
-// -------------------------------------------------------------
 fn build_unknown_chunk_dossier(chunk_data: &[u8], stem: &str) -> serde_json::Value {
     let magic_hex = if chunk_data.len() >= 4 {
         hex::encode_upper(&chunk_data[..4])
@@ -439,7 +423,6 @@ fn build_unknown_chunk_dossier(chunk_data: &[u8], stem: &str) -> serde_json::Val
         String::from("TOO_SHORT")
     };
 
-    // 1. Rainbow Dictionary: Reverse 32-bit hashes to known game engine terms
     let reversed_term = if chunk_data.len() >= 4 {
         let val = u32::from_le_bytes(chunk_data[0..4].try_into().unwrap_or_default());
         crate::engine::analysis::dictionary::DICTIONARY.lookup(val)
@@ -447,7 +430,6 @@ fn build_unknown_chunk_dossier(chunk_data: &[u8], stem: &str) -> serde_json::Val
         None
     };
 
-    // 2. Pattern & Stride Hunter: Detect memory stride alignment, matrices, or bounding boxes
     let stride_analysis = crate::engine::analysis::pattern::analyze_stride_and_pattern(chunk_data)
         .map(|s| {
             json!({
@@ -528,19 +510,6 @@ fn build_unknown_chunk_dossier(chunk_data: &[u8], stem: &str) -> serde_json::Val
         });
     }
 
-    let scalar_guesses = if chunk_data.len() == 4 {
-        let u = u32::from_le_bytes(chunk_data[0..4].try_into().unwrap_or_default());
-        let i = i32::from_le_bytes(chunk_data[0..4].try_into().unwrap_or_default());
-        let f = f32::from_le_bytes(chunk_data[0..4].try_into().unwrap_or_default());
-        json!({
-            "as_u32": u,
-            "as_i32": i,
-            "as_f32": if f.is_finite() { f } else { 0.0 }
-        })
-    } else {
-        json!(null)
-    };
-
     json!({
         "chunk": stem,
         "structure_type": "Raw Leaf Data",
@@ -548,15 +517,11 @@ fn build_unknown_chunk_dossier(chunk_data: &[u8], stem: &str) -> serde_json::Val
         "magic_header_hex": magic_hex,
         "reversed_term_guess": reversed_term,
         "stride_detector": stride_analysis,
-        "scalar_guesses": scalar_guesses,
         "embedded_strings": extracted_strings,
         "full_hex": hex::encode_upper(chunk_data)
     })
 }
 
-// -------------------------------------------------------------
-// RAW / FALLBACK PROCESSOR (CREATES .BIN + .META.JSON DOSSIER)
-// -------------------------------------------------------------
 pub struct RawProcessor;
 impl AssetProcessor for RawProcessor {
     fn process(
@@ -570,33 +535,38 @@ impl AssetProcessor for RawProcessor {
         let bin_path = workspace.assets_dir.join("raw_chunks").join(&out_name);
         fs::write(&bin_path, data)?;
 
-        // Generates the comprehensive reverse-engineering dossier alongside each binary chunk
         let dossier = build_unknown_chunk_dossier(data, stem);
         let meta_path = workspace
             .assets_dir
             .join("raw_chunks")
             .join(format!("{}.meta.json", stem));
-        let meta_json_str = serde_json::to_string_pretty(&dossier)?;
-        fs::write(meta_path, meta_json_str)?;
+        if let Ok(meta_json_str) = serde_json::to_string_pretty(&dossier) {
+            let _ = fs::write(meta_path, meta_json_str);
+        }
 
         Ok(Some((
             format!("assets/raw_chunks/{}", out_name),
             AssetSyncEntry {
                 chunk_rel_path: format!("chunks/{}.bin", stem),
                 asset_kind: "Raw".into(),
-                crc32: calculate_crc32(data),
+                vanilla_crc32: calculate_crc32(data),
+                is_modified: false,
             },
         )))
     }
 }
 
-// -------------------------------------------------------------
-// PIPELINE ORCHESTRATOR
-// -------------------------------------------------------------
 pub fn export_smart_assets(project_dir: &Path) -> Result<usize> {
     let workspace = ProjectWorkspace::new(project_dir);
 
-    if !workspace.base_dir.exists() || !workspace.chunks_dir.exists() {
+    // Prefer exporting smart assets from pristine vanilla chunks
+    let source_chunks_dir = if workspace.vanilla_chunks_dir.exists() {
+        &workspace.vanilla_chunks_dir
+    } else {
+        &workspace.chunks_dir
+    };
+
+    if !workspace.base_dir.exists() || !source_chunks_dir.exists() {
         bail!(
             "Project directory or chunks folder does not exist: {:?}",
             workspace.base_dir
@@ -618,7 +588,6 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize> {
         fs::create_dir_all(workspace.assets_dir.join(dir))?;
     }
 
-    // Pipeline of strategies
     let processors: Vec<Box<dyn AssetProcessor>> = vec![
         Box::new(TextureProcessor),
         Box::new(AudioProcessor),
@@ -627,10 +596,10 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize> {
         Box::new(LuaProcessor),
         Box::new(XmlProcessor),
         Box::new(ParameterProcessor),
-        Box::new(RawProcessor), // Fallback: writes .bin + .meta.json
+        Box::new(RawProcessor),
     ];
 
-    let entries: Vec<PathBuf> = fs::read_dir(&workspace.chunks_dir)?
+    let entries: Vec<PathBuf> = fs::read_dir(source_chunks_dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.is_file() && p.extension().is_some_and(|ext| ext == "bin"))
         .collect();
@@ -646,10 +615,7 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize> {
                 match processor.process(&data, &stem, &sniffed, &workspace) {
                     Ok(Some(entry)) => return Some(entry),
                     Ok(None) => continue,
-                    Err(e) => {
-                        eprintln!("[!] Failed to process chunk {}: {}", stem, e);
-                        break;
-                    }
+                    Err(_) => break,
                 }
             }
             None
@@ -665,14 +631,13 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize> {
     let serialized = serde_json::to_string_pretty(&cache)?;
     fs::write(cache_file, serialized)?;
 
-    // Automatically build the cross-reference dependency graph (assets/dependency_graph.json)
     let _ = crate::engine::analysis::graph::build_dependency_graph(&workspace.assets_dir);
 
     Ok(cache.entries.len())
 }
 
 // -------------------------------------------------------------
-// TWO-WAY MOD SYNC BACK TO GAME CHUNKS
+// NON-DESTRUCTIVE TWO-WAY SYNC (VANILLA BASELINE -> CHUNKS)
 // -------------------------------------------------------------
 pub fn sync_assets_to_chunks(project_dir: &Path) -> Result<usize> {
     let cache_file = project_dir.join(".asset_cache.json");
@@ -684,11 +649,29 @@ pub fn sync_assets_to_chunks(project_dir: &Path) -> Result<usize> {
     let mut cache: AssetSyncCache = serde_json::from_str(&cache_data)?;
     let mut synced_count = 0;
 
-    for (rel_asset_path, entry) in cache.entries.iter_mut() {
-        let abs_asset_path = project_dir.join(rel_asset_path);
-        let abs_chunk_path = project_dir.join(&entry.chunk_rel_path);
+    let vanilla_dir = project_dir.join("chunks_vanilla");
+    let working_dir = project_dir.join("chunks");
 
-        if !abs_asset_path.exists() || !abs_chunk_path.exists() {
+    for (rel_asset_path, entry) in cache.entries.iter_mut() {
+        let chunk_file_name = Path::new(&entry.chunk_rel_path)
+            .file_name()
+            .context("Invalid chunk relative path")?;
+
+        let vanilla_chunk_path = if vanilla_dir.exists() {
+            vanilla_dir.join(chunk_file_name)
+        } else {
+            working_dir.join(chunk_file_name)
+        };
+        let working_chunk_path = working_dir.join(chunk_file_name);
+        let abs_asset_path = project_dir.join(rel_asset_path);
+
+        // CASE 1: The modder deleted the asset file in assets/ -> Auto-revert from vanilla
+        if !abs_asset_path.exists() {
+            if entry.is_modified && vanilla_chunk_path.exists() {
+                let _ = fs::copy(&vanilla_chunk_path, &working_chunk_path);
+                entry.is_modified = false;
+                synced_count += 1;
+            }
             continue;
         }
 
@@ -699,14 +682,23 @@ pub fn sync_assets_to_chunks(project_dir: &Path) -> Result<usize> {
 
         let current_crc = calculate_crc32(&asset_bytes);
 
-        if current_crc != entry.crc32 {
-            let chunk_bytes = fs::read(&abs_chunk_path)?;
+        // CASE 2: The asset was modified in assets/
+        if current_crc != entry.vanilla_crc32 {
+            // Always inject into the pristine vanilla baseline chunk
+            let baseline_chunk = if vanilla_chunk_path.exists() {
+                fs::read(&vanilla_chunk_path)?
+            } else {
+                fs::read(&working_chunk_path)?
+            };
+
             let updated_chunk = match entry.asset_kind.as_str() {
                 "Texture" => crate::engine::assets::texture::replace_texture_in_chunk(
-                    &chunk_bytes,
+                    &baseline_chunk,
                     &asset_bytes,
                 )?,
-                "Audio" => crate::engine::assets::audio::replace_wav(&chunk_bytes, &asset_bytes)?,
+                "Audio" => {
+                    crate::engine::assets::audio::replace_wav(&baseline_chunk, &asset_bytes)?
+                }
                 "Material" => {
                     let json_str = String::from_utf8(asset_bytes)
                         .context("Material JSON is not valid UTF-8")?;
@@ -714,15 +706,18 @@ pub fn sync_assets_to_chunks(project_dir: &Path) -> Result<usize> {
                 }
                 "Mesh" => {
                     if rel_asset_path.ends_with(".glb") {
-                        crate::engine::assets::mesh::import_glb_to_mesh(&chunk_bytes, &asset_bytes)?
+                        crate::engine::assets::mesh::import_glb_to_mesh(
+                            &baseline_chunk,
+                            &asset_bytes,
+                        )?
                     } else {
                         let obj_str = String::from_utf8(asset_bytes)
                             .context("OBJ file is not valid UTF-8")?;
-                        crate::engine::assets::mesh::import_obj_to_mesh(&chunk_bytes, &obj_str)?
+                        crate::engine::assets::mesh::import_obj_to_mesh(&baseline_chunk, &obj_str)?
                     }
                 }
                 "Lua" => {
-                    crate::engine::assets::lua::replace_lua_bytecode(&chunk_bytes, &asset_bytes)?
+                    crate::engine::assets::lua::replace_lua_bytecode(&baseline_chunk, &asset_bytes)?
                 }
                 "Parameter" => {
                     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&asset_bytes) {
@@ -751,18 +746,18 @@ pub fn sync_assets_to_chunks(project_dir: &Path) -> Result<usize> {
                         } else if v["type"] == "scalar_32bit"
                             && let Some(hex_str) = v["hex"].as_str()
                         {
-                            hex::decode(hex_str).unwrap_or(chunk_bytes)
+                            hex::decode(hex_str).unwrap_or(baseline_chunk)
                         } else if let Some(hex_str) = v["hex"].as_str() {
-                            hex::decode(hex_str).unwrap_or(chunk_bytes)
+                            hex::decode(hex_str).unwrap_or(baseline_chunk)
                         } else {
-                            chunk_bytes
+                            baseline_chunk
                         }
                     } else {
-                        chunk_bytes
+                        baseline_chunk
                     }
                 }
                 "Xml" => {
-                    if chunk_bytes.len() > 4 {
+                    if baseline_chunk.len() > 4 {
                         let mut buf = Vec::new();
                         buf.extend_from_slice(&(asset_bytes.len() as u32).to_le_bytes());
                         buf.extend_from_slice(&asset_bytes);
@@ -775,8 +770,13 @@ pub fn sync_assets_to_chunks(project_dir: &Path) -> Result<usize> {
                 _ => continue,
             };
 
-            fs::write(&abs_chunk_path, updated_chunk)?;
-            entry.crc32 = current_crc;
+            fs::write(&working_chunk_path, updated_chunk)?;
+            entry.is_modified = true;
+            synced_count += 1;
+        } else if entry.is_modified && vanilla_chunk_path.exists() {
+            // CASE 3: User reverted the asset file back to baseline bytes
+            let _ = fs::copy(&vanilla_chunk_path, &working_chunk_path);
+            entry.is_modified = false;
             synced_count += 1;
         }
     }
@@ -785,4 +785,75 @@ pub fn sync_assets_to_chunks(project_dir: &Path) -> Result<usize> {
         fs::write(cache_file, serde_json::to_string_pretty(&cache)?)?;
     }
     Ok(synced_count)
+}
+
+/// Restores a single chunk and its corresponding smart asset back to pristine vanilla state.
+pub fn revert_single_asset(project_dir: &Path, chunk_path_str: &str) -> Result<()> {
+    let chunk_path = Path::new(chunk_path_str);
+    let chunk_file_name = chunk_path.file_name().context("Invalid chunk filename")?;
+
+    let vanilla_path = project_dir.join("chunks_vanilla").join(chunk_file_name);
+    let working_path = project_dir.join("chunks").join(chunk_file_name);
+
+    if !vanilla_path.exists() {
+        bail!("Vanilla baseline does not exist for {:?}", chunk_file_name);
+    }
+
+    fs::copy(&vanilla_path, &working_path)?;
+
+    // Re-export the smart asset to overwrite any modified version in assets/
+    let data = fs::read(&vanilla_path)?;
+    let stem = Path::new(chunk_file_name)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let sniffed = sniff_asset(&data, &stem);
+    let workspace = ProjectWorkspace::new(project_dir);
+
+    let processors: Vec<Box<dyn AssetProcessor>> = vec![
+        Box::new(TextureProcessor),
+        Box::new(AudioProcessor),
+        Box::new(MaterialProcessor),
+        Box::new(MeshProcessor),
+        Box::new(LuaProcessor),
+        Box::new(XmlProcessor),
+        Box::new(ParameterProcessor),
+        Box::new(RawProcessor),
+    ];
+
+    for processor in &processors {
+        if let Ok(Some((rel_path, mut sync_entry))) =
+            processor.process(&data, &stem, &sniffed, &workspace)
+        {
+            sync_entry.is_modified = false;
+            let cache_file = project_dir.join(".asset_cache.json");
+            if cache_file.exists()
+                && let Ok(content) = fs::read_to_string(&cache_file)
+                && let Ok(mut cache) = serde_json::from_str::<AssetSyncCache>(&content)
+            {
+                cache.entries.insert(rel_path, sync_entry);
+                let _ = fs::write(cache_file, serde_json::to_string_pretty(&cache)?);
+            }
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+/// Resets all working chunks to chunks_vanilla and freshly applies all edits.
+pub fn clean_rebuild_project(project_dir: &Path) -> Result<usize> {
+    let vanilla_dir = project_dir.join("chunks_vanilla");
+    let working_dir = project_dir.join("chunks");
+
+    if !vanilla_dir.exists() {
+        bail!("No chunks_vanilla/ baseline folder found in project!");
+    }
+
+    for entry in fs::read_dir(&vanilla_dir)?.flatten() {
+        let dest = working_dir.join(entry.file_name());
+        fs::copy(entry.path(), dest)?;
+    }
+
+    sync_assets_to_chunks(project_dir)
 }

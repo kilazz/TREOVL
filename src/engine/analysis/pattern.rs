@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use byteorder::{LittleEndian, ReadBytesExt};
 use serde_json::{Value, json};
 use std::io::Cursor;

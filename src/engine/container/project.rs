@@ -44,7 +44,9 @@ pub fn unpack_archive(archive_path: &Path, output_dir: &Path) -> Result<(usize, 
         ));
     }
 
+    // Create both working chunks directory and read-only vanilla baseline directory
     fs::create_dir_all(output_dir.join("chunks"))?;
+    fs::create_dir_all(output_dir.join("chunks_vanilla"))?;
 
     let payload_end = if has_footer {
         data.len() - FOOTER_SIZE
@@ -94,11 +96,12 @@ pub fn pack_archive(project_dir: &Path, output_archive: &Path) -> Result<usize> 
         );
     }
 
+    // Always inject modifications from assets/ into pure vanilla baseline chunks
     if let Ok(synced) = sync_assets_to_chunks(project_dir)
         && synced > 0
     {
         println!(
-            "[*] Auto-synced {} modified files from 'assets/' into 'chunks/'.",
+            "[*] Synced {} modified assets from 'assets/' into 'chunks/' using vanilla baseline.",
             synced
         );
     }
