@@ -18,10 +18,16 @@ impl TextureFormat {
     }
 }
 
-/// Software decoder for raw Overlord DXT-compressed data into a 32-bit RGBA pixel buffer.
+/// Software decoder for raw Overlord DXT and uncompressed textures into a 32-bit RGBA pixel buffer.
 pub fn decode_to_rgba(width: u32, height: u32, format: TextureFormat, data: &[u8]) -> Vec<u8> {
     if format == TextureFormat::UncompressedRGBA {
-        return data.to_vec();
+        // Direct3D 9 and TGA store 32-bit uncompressed pixels in BGRA order.
+        // Slint's Rgba8Pixel expects RGBA order. Swap Blue and Red.
+        let mut rgba = Vec::with_capacity(data.len());
+        for &[b, g, r, a] in data.as_chunks::<4>().0 {
+            rgba.extend_from_slice(&[r, g, b, a]);
+        }
+        return rgba;
     }
 
     let mut rgba = vec![0u8; (width * height * 4) as usize];
