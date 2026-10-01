@@ -107,7 +107,7 @@ pub fn pack_archive(project_dir: &Path, output_archive: &Path) -> Result<usize, 
     let manifest: ProjectManifest =
         serde_json::from_str(&manifest_str).map_err(|e| e.to_string())?;
 
-    let payload = build_node(&manifest.root, project_dir, 9)?;
+    let payload = build_node(&manifest.root, project_dir)?;
 
     let mut header_bytes = vec![0u8; HEADER_SIZE];
     let mut cur = Cursor::new(&mut header_bytes);

@@ -1,11 +1,9 @@
 use super::node::PrpNode;
-use crate::utils::zlib;
 use byteorder::{LittleEndian, WriteBytesExt};
 use std::fs;
 use std::path::Path;
 
-pub fn build_node(node: &PrpNode, project_dir: &Path, comp_level: u32) -> Result<Vec<u8>, String> {
-    // 1. Если это ЛИСТ (Leaf) - читаем файл с диска
+pub fn build_node(node: &PrpNode, project_dir: &Path) -> Result<Vec<u8>, String> {
     if !node.is_container {
         let rel_path = node
             .file_path
@@ -15,17 +13,12 @@ pub fn build_node(node: &PrpNode, project_dir: &Path, comp_level: u32) -> Result
         let raw_data =
             fs::read(&full_path).map_err(|e| format!("Failed to read {:?}: {}", full_path, e))?;
 
-        // Возвращаем сжатие, если оно было в оригинале
-        if node.is_zlib_compressed && comp_level > 0 {
-            return zlib::compress(&raw_data, comp_level).map_err(|e| e.to_string());
-        }
         return Ok(raw_data);
     }
 
-    // 2. Если это КОНТЕЙНЕР (Container) - рекурсивно собираем детей
     let mut child_buffers = Vec::new();
     for child in &node.children {
-        let child_bin = build_node(child, project_dir, comp_level)?;
+        let child_bin = build_node(child, project_dir)?;
         child_buffers.push((child, child_bin));
     }
 
@@ -34,8 +27,6 @@ pub fn build_node(node: &PrpNode, project_dir: &Path, comp_level: u32) -> Result
     let mut data_segment = Vec::new();
     let mut current_offset = 0usize;
 
-    // ВАЖНО: Мы сохраняем правильный порядок байтов данных,
-    // разделяя только записи в оглавлении (TOC)!
     for (child, bin_data) in child_buffers {
         let id = child.id;
         let c_is_large = child.is_large;
@@ -50,7 +41,6 @@ pub fn build_node(node: &PrpNode, project_dir: &Path, comp_level: u32) -> Result
         current_offset += bin_data.len();
     }
 
-    // 3. Формируем таблицу оглавления
     let mut table = Vec::new();
     if node.has_magic {
         table.extend_from_slice(b"\x01\x01\x00");
@@ -79,8 +69,6 @@ pub fn build_node(node: &PrpNode, project_dir: &Path, comp_level: u32) -> Result
         table.write_u32::<LittleEndian>(offset).unwrap();
     }
 
-    // 4. Склеиваем Оглавление + Данные
     table.extend(data_segment);
-
     Ok(table)
 }

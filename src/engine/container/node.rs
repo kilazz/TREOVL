@@ -3,19 +3,15 @@ use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 use std::path::Path;
 
-use crate::utils::zlib;
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PrpNode {
     pub id: u32,
     pub is_large: bool,
     pub is_container: bool,
     pub has_magic: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub file_path: Option<String>,
-    #[serde(default)]
-    pub is_zlib_compressed: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub children: Vec<PrpNode>,
 }
 
@@ -27,7 +23,6 @@ pub fn parse_node(
     chunk_counter: &mut u32,
     output_dir: &Path,
 ) -> PrpNode {
-    // If the block is empty, save it as a leaf node
     if data.is_empty() {
         return save_leaf(data, node_id, is_large, chunk_counter, output_dir);
     }
@@ -35,13 +30,11 @@ pub fn parse_node(
     let mut pos = 0;
     let mut has_magic = false;
 
-    // Check for container signatures if it's not the root node
     if !is_root {
         if data.len() >= 3 && &data[0..3] == b"\x01\x01\x00" {
             has_magic = true;
             pos = 3;
         } else if (data[0] & 0x80) == 0 {
-            // High bit is not set, definitely not a container. Treat as leaf.
             return save_leaf(data, node_id, is_large, chunk_counter, output_dir);
         }
     }
@@ -61,13 +54,11 @@ pub fn parse_node(
             return save_leaf(data, node_id, is_large, chunk_counter, output_dir);
         }
         let mut cur = Cursor::new(&data[pos..pos + 4]);
-        large_count = cur.read_u32::<LittleEndian>().unwrap() as usize;
+        large_count = cur.read_u32::<LittleEndian>().unwrap_or(0) as usize;
         pos += 4;
     }
 
     let total_entries = small_count + large_count;
-
-    // Safety check: a valid container rarely has 0 entries or more than 4096 entries
     if total_entries == 0 || total_entries > 4096 {
         return save_leaf(data, node_id, is_large, chunk_counter, output_dir);
     }
@@ -79,36 +70,32 @@ pub fn parse_node(
         return save_leaf(data, node_id, is_large, chunk_counter, output_dir);
     }
 
-    // Strict Validation: The first offset in the table MUST be 0
     let first_offset = if small_count > 0 {
         data[pos + 1] as usize
     } else {
         let mut cur = Cursor::new(&data[pos + 4..pos + 8]);
-        cur.read_u32::<LittleEndian>().unwrap() as usize
+        cur.read_u32::<LittleEndian>().unwrap_or(1) as usize
     };
 
     if first_offset != 0 {
-        // False positive container. Save as binary leaf.
         return save_leaf(data, node_id, is_large, chunk_counter, output_dir);
     }
 
-    // Table is valid, read the offsets
     let mut entries = Vec::new();
     let mut cur = Cursor::new(&data[pos..pos + table_size]);
 
     for _ in 0..small_count {
-        let id = cur.read_u8().unwrap() as u32;
-        let offset = cur.read_u8().unwrap() as usize;
+        let id = cur.read_u8().unwrap_or(0) as u32;
+        let offset = cur.read_u8().unwrap_or(0) as usize;
         entries.push((id, offset, false));
     }
 
     for _ in 0..large_count {
-        let id = cur.read_u32::<LittleEndian>().unwrap();
-        let offset = cur.read_u32::<LittleEndian>().unwrap() as usize;
+        let id = cur.read_u32::<LittleEndian>().unwrap_or(0);
+        let offset = cur.read_u32::<LittleEndian>().unwrap_or(0) as usize;
         entries.push((id, offset, true));
     }
 
-    // Ensure entries are processed in the correct memory order
     entries.sort_by_key(|&(_, offset, _)| offset);
 
     let mut children = Vec::new();
@@ -121,7 +108,6 @@ pub fn parse_node(
             data.len()
         };
 
-        // If bounds are violated, the table is corrupt or it was a false positive
         if start > data.len() || end > data.len() || end < start {
             return save_leaf(data, node_id, is_large, chunk_counter, output_dir);
         }
@@ -144,7 +130,6 @@ pub fn parse_node(
         is_container: true,
         has_magic,
         file_path: None,
-        is_zlib_compressed: false,
         children,
     }
 }
@@ -154,15 +139,7 @@ fn save_leaf(data: &[u8], node_id: u32, is_large: bool, counter: &mut u32, dir: 
     let filename = format!("chunk_{:04}_id0x{:X}.bin", counter, node_id);
     let filepath = dir.join("chunks").join(&filename);
 
-    // Detect and decompress zlib streams automatically
-    let is_zlib = zlib::is_zlib_compressed(data);
-    let final_data = if is_zlib {
-        zlib::decompress(data).unwrap_or_else(|_| data.to_vec()) // Fallback if decompression fails
-    } else {
-        data.to_vec()
-    };
-
-    std::fs::write(&filepath, final_data).unwrap();
+    let _ = std::fs::write(&filepath, data);
 
     PrpNode {
         id: node_id,
@@ -170,7 +147,6 @@ fn save_leaf(data: &[u8], node_id: u32, is_large: bool, counter: &mut u32, dir: 
         is_container: false,
         has_magic: false,
         file_path: Some(format!("chunks/{}", filename)),
-        is_zlib_compressed: is_zlib, // Tag it so the packer knows to compress it back later
         children: Vec::new(),
     }
 }
