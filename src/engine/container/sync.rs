@@ -1,15 +1,16 @@
 use anyhow::{Context, Result, bail};
-use byteorder::{LittleEndian, ReadBytesExt};
 use crc32fast::Hasher;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
-use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
-use crate::engine::assets::animation::{export_skeleton_to_glb, parse_object_bone_container};
+use crate::engine::assets::animation::{
+    export_animation_to_glb, export_animation_to_json, export_skeleton_to_glb,
+    parse_object_bone_container,
+};
 use crate::engine::assets::sniffer::{AssetKind, SniffedAsset, sniff_asset};
 use crate::engine::assets::{parse_chunk_elements, parse_typed_container};
 use crate::engine::common::magic;
@@ -250,7 +251,7 @@ impl AssetProcessor for MeshProcessor {
         if sniffed.kind != AssetKind::Mesh {
             return Ok(None);
         }
-        let (glb_bytes, _) = crate::engine::assets::mesh::export_mesh_to_glb(data)?;
+        let (glb_bytes, stats) = crate::engine::assets::mesh::export_mesh_to_glb(data)?;
         let out_name = build_asset_filename(&sniffed.display_name, stem, "glb");
 
         fs::write(
@@ -258,7 +259,9 @@ impl AssetProcessor for MeshProcessor {
             &glb_bytes,
         )?;
 
-        if let Ok(bones) = parse_object_bone_container(data)
+        // Only export standalone .rig.glb when legitimate bones are confirmed
+        if stats.is_skinned
+            && let Ok(bones) = parse_object_bone_container(data)
             && !bones.is_empty()
             && let Ok(rig_glb) = export_skeleton_to_glb(&bones, &sniffed.display_name)
         {
@@ -278,6 +281,44 @@ impl AssetProcessor for MeshProcessor {
     }
 }
 
+pub struct AnimationProcessor;
+impl AssetProcessor for AnimationProcessor {
+    fn process(
+        &self,
+        data: &[u8],
+        stem: &str,
+        sniffed: &SniffedAsset,
+        workspace: &ProjectWorkspace,
+    ) -> Result<Option<(String, AssetSyncEntry)>> {
+        if sniffed.kind != AssetKind::Animation {
+            return Ok(None);
+        }
+
+        let glb_bytes = export_animation_to_glb(data)?;
+        let out_name = build_asset_filename(&sniffed.display_name, stem, "glb");
+        let glb_path = workspace.assets_dir.join("animations").join(&out_name);
+        fs::write(&glb_path, &glb_bytes)?;
+
+        if let Ok(json_str) = export_animation_to_json(data) {
+            let json_name = build_asset_filename(&sniffed.display_name, stem, "json");
+            let _ = fs::write(
+                workspace.assets_dir.join("animations").join(json_name),
+                json_str.as_bytes(),
+            );
+        }
+
+        Ok(Some((
+            format!("assets/animations/{}", out_name),
+            AssetSyncEntry {
+                chunk_rel_path: format!("chunks/{}.bin", stem),
+                asset_kind: "Animation".into(),
+                vanilla_crc32: calculate_crc32(&glb_bytes),
+                is_modified: false,
+            },
+        )))
+    }
+}
+
 pub struct XmlProcessor;
 impl AssetProcessor for XmlProcessor {
     fn process(
@@ -287,21 +328,15 @@ impl AssetProcessor for XmlProcessor {
         sniffed: &SniffedAsset,
         workspace: &ProjectWorkspace,
     ) -> Result<Option<(String, AssetSyncEntry)>> {
-        if !data.windows(5).any(|w| w == b"<?xml") {
+        if sniffed.kind != AssetKind::Xml {
             return Ok(None);
         }
 
         let out_name = build_asset_filename(&sniffed.display_name, stem, "xml");
         let abs_path = workspace.assets_dir.join("xml").join(&out_name);
 
-        let xml_payload = if data.len() > 4 {
-            let mut cur = Cursor::new(&data[0..4]);
-            let str_len = cur.read_u32::<LittleEndian>().unwrap_or(0) as usize;
-            if str_len + 4 <= data.len() {
-                &data[4..4 + str_len]
-            } else {
-                data
-            }
+        let xml_payload = if let Some(pos) = data.windows(5).position(|w| w == b"<?xml") {
+            &data[pos..]
         } else {
             data
         };
@@ -416,6 +451,73 @@ impl AssetProcessor for ParameterProcessor {
     }
 }
 
+pub struct UiProcessor;
+impl AssetProcessor for UiProcessor {
+    fn process(
+        &self,
+        data: &[u8],
+        stem: &str,
+        sniffed: &SniffedAsset,
+        workspace: &ProjectWorkspace,
+    ) -> Result<Option<(String, AssetSyncEntry)>> {
+        if sniffed.kind != AssetKind::UI {
+            return Ok(None);
+        }
+
+        let json_str = crate::engine::assets::ui::export_ui_to_json(data)?;
+        let out_name = build_asset_filename(&sniffed.display_name, stem, "json");
+
+        fs::write(
+            workspace.assets_dir.join("ui").join(&out_name),
+            json_str.as_bytes(),
+        )?;
+        Ok(Some((
+            format!("assets/ui/{}", out_name),
+            AssetSyncEntry {
+                chunk_rel_path: format!("chunks/{}.bin", stem),
+                asset_kind: "UI".into(),
+                vanilla_crc32: calculate_crc32(json_str.as_bytes()),
+                is_modified: false,
+            },
+        )))
+    }
+}
+
+pub struct ObjectProcessor;
+impl AssetProcessor for ObjectProcessor {
+    fn process(
+        &self,
+        data: &[u8],
+        stem: &str,
+        sniffed: &SniffedAsset,
+        workspace: &ProjectWorkspace,
+    ) -> Result<Option<(String, AssetSyncEntry)>> {
+        if sniffed.kind != AssetKind::Object {
+            return Ok(None);
+        }
+
+        let json_str = crate::engine::assets::object::export_object_to_json(
+            data,
+            Some(&workspace.assets_dir.join("objects")),
+        )?;
+        let out_name = build_asset_filename(&sniffed.display_name, stem, "json");
+
+        fs::write(
+            workspace.assets_dir.join("objects").join(&out_name),
+            json_str.as_bytes(),
+        )?;
+        Ok(Some((
+            format!("assets/objects/{}", out_name),
+            AssetSyncEntry {
+                chunk_rel_path: format!("chunks/{}.bin", stem),
+                asset_kind: "Object".into(),
+                vanilla_crc32: calculate_crc32(json_str.as_bytes()),
+                is_modified: false,
+            },
+        )))
+    }
+}
+
 fn build_unknown_chunk_dossier(chunk_data: &[u8], stem: &str) -> serde_json::Value {
     let magic_hex = if chunk_data.len() >= 4 {
         hex::encode_upper(&chunk_data[..4])
@@ -449,7 +551,7 @@ fn build_unknown_chunk_dossier(chunk_data: &[u8], stem: &str) -> serde_json::Val
             if (3..=128).contains(&str_len)
                 && i + 4 + str_len <= chunk_data.len()
                 && let slice = &chunk_data[i + 4..i + 4 + str_len]
-                && slice.iter().all(|&b| (0x20..=0x7E).contains(&b) || b == 0)
+                && slice.iter().all(|&b| (0x20..=0x7E).contains(&b))
                 && let Ok(s) = std::str::from_utf8(slice)
             {
                 let clean = s.trim_matches(char::from(0)).trim();
@@ -559,7 +661,6 @@ impl AssetProcessor for RawProcessor {
 pub fn export_smart_assets(project_dir: &Path) -> Result<usize> {
     let workspace = ProjectWorkspace::new(project_dir);
 
-    // Prefer exporting smart assets from pristine vanilla chunks
     let source_chunks_dir = if workspace.vanilla_chunks_dir.exists() {
         &workspace.vanilla_chunks_dir
     } else {
@@ -583,6 +684,8 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize> {
         "raw_chunks",
         "xml",
         "parameters",
+        "ui",
+        "objects",
     ];
     for dir in dirs {
         fs::create_dir_all(workspace.assets_dir.join(dir))?;
@@ -593,11 +696,15 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize> {
         Box::new(AudioProcessor),
         Box::new(MaterialProcessor),
         Box::new(MeshProcessor),
+        Box::new(AnimationProcessor),
         Box::new(LuaProcessor),
         Box::new(XmlProcessor),
         Box::new(ParameterProcessor),
-        Box::new(RawProcessor),
+        Box::new(UiProcessor),
+        Box::new(ObjectProcessor),
     ];
+
+    let raw_processor = RawProcessor;
 
     let entries: Vec<PathBuf> = fs::read_dir(source_chunks_dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -615,10 +722,17 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize> {
                 match processor.process(&data, &stem, &sniffed, &workspace) {
                     Ok(Some(entry)) => return Some(entry),
                     Ok(None) => continue,
-                    Err(_) => break,
+                    Err(e) => {
+                        eprintln!("[!] Processor failed for {}: {}", stem, e);
+                        continue;
+                    }
                 }
             }
-            None
+
+            match raw_processor.process(&data, &stem, &sniffed, &workspace) {
+                Ok(Some(entry)) => Some(entry),
+                _ => None,
+            }
         })
         .collect();
 
@@ -636,9 +750,6 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize> {
     Ok(cache.entries.len())
 }
 
-// -------------------------------------------------------------
-// NON-DESTRUCTIVE TWO-WAY SYNC (VANILLA BASELINE -> CHUNKS)
-// -------------------------------------------------------------
 pub fn sync_assets_to_chunks(project_dir: &Path) -> Result<usize> {
     let cache_file = project_dir.join(".asset_cache.json");
     if !cache_file.exists() {
@@ -665,7 +776,6 @@ pub fn sync_assets_to_chunks(project_dir: &Path) -> Result<usize> {
         let working_chunk_path = working_dir.join(chunk_file_name);
         let abs_asset_path = project_dir.join(rel_asset_path);
 
-        // CASE 1: The modder deleted the asset file in assets/ -> Auto-revert from vanilla
         if !abs_asset_path.exists() {
             if entry.is_modified && vanilla_chunk_path.exists() {
                 let _ = fs::copy(&vanilla_chunk_path, &working_chunk_path);
@@ -682,9 +792,7 @@ pub fn sync_assets_to_chunks(project_dir: &Path) -> Result<usize> {
 
         let current_crc = calculate_crc32(&asset_bytes);
 
-        // CASE 2: The asset was modified in assets/
         if current_crc != entry.vanilla_crc32 {
-            // Always inject into the pristine vanilla baseline chunk
             let baseline_chunk = if vanilla_chunk_path.exists() {
                 fs::read(&vanilla_chunk_path)?
             } else {
@@ -719,6 +827,17 @@ pub fn sync_assets_to_chunks(project_dir: &Path) -> Result<usize> {
                 "Lua" => {
                     crate::engine::assets::lua::replace_lua_bytecode(&baseline_chunk, &asset_bytes)?
                 }
+                "UI" => {
+                    let json_str =
+                        String::from_utf8(asset_bytes).context("UI JSON is not valid UTF-8")?;
+                    crate::engine::assets::ui::import_ui_from_json(&json_str)?
+                }
+                "Object" => {
+                    let json_str =
+                        String::from_utf8(asset_bytes).context("Object JSON is not valid UTF-8")?;
+                    crate::engine::assets::object::import_object_from_json(&json_str)?
+                }
+                "Animation" => baseline_chunk,
                 "Parameter" => {
                     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&asset_bytes) {
                         if v["type"] == "asset_group_slot"
@@ -757,7 +876,11 @@ pub fn sync_assets_to_chunks(project_dir: &Path) -> Result<usize> {
                     }
                 }
                 "Xml" => {
-                    if baseline_chunk.len() > 4 {
+                    if let Some(pos) = baseline_chunk.windows(5).position(|w| w == b"<?xml") {
+                        let mut out = baseline_chunk[..pos].to_vec();
+                        out.extend_from_slice(&asset_bytes);
+                        out
+                    } else if baseline_chunk.len() > 4 {
                         let mut buf = Vec::new();
                         buf.extend_from_slice(&(asset_bytes.len() as u32).to_le_bytes());
                         buf.extend_from_slice(&asset_bytes);
@@ -774,7 +897,6 @@ pub fn sync_assets_to_chunks(project_dir: &Path) -> Result<usize> {
             entry.is_modified = true;
             synced_count += 1;
         } else if entry.is_modified && vanilla_chunk_path.exists() {
-            // CASE 3: User reverted the asset file back to baseline bytes
             let _ = fs::copy(&vanilla_chunk_path, &working_chunk_path);
             entry.is_modified = false;
             synced_count += 1;
@@ -787,7 +909,6 @@ pub fn sync_assets_to_chunks(project_dir: &Path) -> Result<usize> {
     Ok(synced_count)
 }
 
-/// Restores a single chunk and its corresponding smart asset back to pristine vanilla state.
 pub fn revert_single_asset(project_dir: &Path, chunk_path_str: &str) -> Result<()> {
     let chunk_path = Path::new(chunk_path_str);
     let chunk_file_name = chunk_path.file_name().context("Invalid chunk filename")?;
@@ -801,7 +922,6 @@ pub fn revert_single_asset(project_dir: &Path, chunk_path_str: &str) -> Result<(
 
     fs::copy(&vanilla_path, &working_path)?;
 
-    // Re-export the smart asset to overwrite any modified version in assets/
     let data = fs::read(&vanilla_path)?;
     let stem = Path::new(chunk_file_name)
         .file_stem()
@@ -815,9 +935,12 @@ pub fn revert_single_asset(project_dir: &Path, chunk_path_str: &str) -> Result<(
         Box::new(AudioProcessor),
         Box::new(MaterialProcessor),
         Box::new(MeshProcessor),
+        Box::new(AnimationProcessor),
         Box::new(LuaProcessor),
         Box::new(XmlProcessor),
         Box::new(ParameterProcessor),
+        Box::new(UiProcessor),
+        Box::new(ObjectProcessor),
         Box::new(RawProcessor),
     ];
 
@@ -841,7 +964,6 @@ pub fn revert_single_asset(project_dir: &Path, chunk_path_str: &str) -> Result<(
     Ok(())
 }
 
-/// Resets all working chunks to chunks_vanilla and freshly applies all edits.
 pub fn clean_rebuild_project(project_dir: &Path) -> Result<usize> {
     let vanilla_dir = project_dir.join("chunks_vanilla");
     let working_dir = project_dir.join("chunks");

@@ -17,6 +17,7 @@ pub enum AssetKind {
     Behavior = 10,
     Attachment = 11,
     Parameter = 12,
+    UI = 13,
 }
 
 pub struct SniffedAsset {
@@ -53,7 +54,11 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
     } else if magic_bytes == magic::ANIM_CLIP {
         (AssetKind::Animation, "Skeletal Animation", "🎬")
     } else if magic_bytes == magic::OBJECT {
-        (AssetKind::Object, "Object Entity", "🧊")
+        (AssetKind::Object, "3D Object Entity", "🧊")
+    } else if magic_bytes == b"\x76\x00\x41\x00" {
+        (AssetKind::UI, "UI Sprite Slice", "🖼️")
+    } else if magic_bytes == b"\x77\x00\x41\x00" {
+        (AssetKind::UI, "UI Control State", "🔘")
     } else if magic_bytes == magic::EVENT || magic_bytes == b"\x04\x00\x00\xB0" {
         (AssetKind::Event, "Animation Sound Event", "👣")
     } else if magic_bytes == magic::LUA {
@@ -79,6 +84,12 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
             | b"\x36\x06\x41\x00"
     ) {
         (AssetKind::Material, "Shader Material", "🛠️")
+    } else if data.len() >= 4 && data[2] == 0x71 && data[3] == 0x00 {
+        // Direct detection of Triumph Engine UI Class: 0x0071xxxx (Menus, HUD, Windows)
+        (AssetKind::UI, "UI / Menu Layout", "🖥️")
+    } else if data.windows(5).any(|w| w == b"<?xml") {
+        // XML check must strictly precede string keyword heuristics
+        (AssetKind::Xml, "XML Document", "📋")
     } else if data.windows(4).any(|w| w == b"FACE")
         || data.windows(8).any(|w| w == b"Triumph ")
         || data.windows(6).any(|w| w == b"--Drop")
@@ -88,8 +99,6 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
         || data.windows(11).any(|w| w == b"plate_metal")
     {
         (AssetKind::Attachment, "Item Attachment Slot", "🍽️")
-    } else if data.windows(5).any(|w| w == b"<?xml") {
-        (AssetKind::Xml, "XML Document", "📋")
     } else if data.windows(4).any(|w| w == magic::TEX_MIPMAP) {
         (AssetKind::Texture, "Texture (MipMap)", "🎨")
     } else if data.len() <= 64 {

@@ -31,7 +31,6 @@ pub struct AppState {
 }
 
 pub fn scan_project_folder(project_dir: &Path) -> (Vec<AssetItem>, Vec<CachedAsset>) {
-    // If chunks/ does not exist yet, check chunks_vanilla/ as baseline fallback
     let chunks_dir = if project_dir.join("chunks").exists() {
         project_dir.join("chunks")
     } else {
@@ -80,6 +79,9 @@ pub fn scan_project_folder(project_dir: &Path) -> (Vec<AssetItem>, Vec<CachedAss
                     AssetKind::Material => 2,
                     AssetKind::Mesh => 3,
                     AssetKind::Lua => 4,
+                    AssetKind::UI => 6,
+                    AssetKind::Object => 7,
+                    AssetKind::Animation => 8,
                     _ => 5,
                 };
 
@@ -201,7 +203,6 @@ pub fn run_gui() -> Result<(), slint::PlatformError> {
                     }
                 }
                 WorkerCommand::LoadProject { proj_dir } => {
-                    // Resolve project folder if project.json or a sub-file was selected
                     let actual_dir = if proj_dir.is_file() {
                         proj_dir
                             .parent()
@@ -619,6 +620,42 @@ pub fn run_gui() -> Result<(), slint::PlatformError> {
                         Err(e) => worker_logger.log(&format!("[!] Lua import error: {}", e)),
                     }
                 }
+                WorkerCommand::ExportAnimGlb {
+                    chunk_path,
+                    out_path,
+                } => {
+                    let data = fs::read(&chunk_path).unwrap_or_default();
+                    match crate::engine::assets::animation::export_animation_to_glb(&data) {
+                        Ok(glb) => {
+                            let _ = fs::write(&out_path, glb);
+                            worker_logger.log(&format!(
+                                "[+] Animation timeline exported to glTF: {:?}",
+                                out_path
+                            ));
+                        }
+                        Err(e) => {
+                            worker_logger.log(&format!("[!] Animation GLB export error: {}", e))
+                        }
+                    }
+                }
+                WorkerCommand::ExportAnimJson {
+                    chunk_path,
+                    out_path,
+                } => {
+                    let data = fs::read(&chunk_path).unwrap_or_default();
+                    match crate::engine::assets::animation::export_animation_to_json(&data) {
+                        Ok(json_str) => {
+                            let _ = fs::write(&out_path, json_str);
+                            worker_logger.log(&format!(
+                                "[+] Animation keyframes exported to JSON: {:?}",
+                                out_path
+                            ));
+                        }
+                        Err(e) => {
+                            worker_logger.log(&format!("[!] Animation JSON export error: {}", e))
+                        }
+                    }
+                }
                 WorkerCommand::SaveMaterial {
                     chunk_path,
                     json_data,
@@ -629,11 +666,34 @@ pub fn run_gui() -> Result<(), slint::PlatformError> {
                     }
                     Err(e) => worker_logger.log(&format!("[!] Material save error: {}", e)),
                 },
+                WorkerCommand::SaveUI {
+                    chunk_path,
+                    json_data,
+                } => match crate::engine::assets::ui::import_ui_from_json(&json_data) {
+                    Ok(bin) => {
+                        let _ = fs::write(&chunk_path, bin);
+                        worker_logger
+                            .log(&format!("[+] UI layout chunk {:?} updated.", chunk_path));
+                    }
+                    Err(e) => worker_logger.log(&format!("[!] UI save error: {}", e)),
+                },
+                WorkerCommand::SaveObject {
+                    chunk_path,
+                    json_data,
+                } => match crate::engine::assets::object::import_object_from_json(&json_data) {
+                    Ok(bin) => {
+                        let _ = fs::write(&chunk_path, bin);
+                        worker_logger.log(&format!(
+                            "[+] 3D Object entity chunk {:?} updated.",
+                            chunk_path
+                        ));
+                    }
+                    Err(e) => worker_logger.log(&format!("[!] Object save error: {}", e)),
+                },
             }
         }
     });
 
-    // Real-time asset filter handler
     let filter_ui_handle = ui_weak.clone();
     let filter_state = app_state.clone();
     ui.on_filter_changed(move |query| {

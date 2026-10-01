@@ -97,6 +97,43 @@ pub fn register(
                                 ui.set_mat_json_text(disasm.into());
                             }
                         }
+                        AssetKind::UI => {
+                            ui.set_active_kind_id(6);
+                            if let Ok(json) = crate::engine::assets::ui::export_ui_to_json(&bytes) {
+                                ui.set_mat_json_text(json.into());
+                            }
+                        }
+                        AssetKind::Object => {
+                            ui.set_active_kind_id(7);
+                            if let Ok(json) =
+                                crate::engine::assets::object::export_object_to_json(&bytes, None)
+                            {
+                                ui.set_mat_json_text(json.into());
+                            }
+                        }
+                        AssetKind::Animation => {
+                            ui.set_active_kind_id(8);
+                            if let Ok(clip) =
+                                crate::engine::assets::animation::parse_animation_clip(&bytes)
+                            {
+                                ui.set_mesh_info(
+                                    format!(
+                                        "Clip: {} | Rig: {} | {:.1} FPS | Duration: {:.3}s | Tracks: {}",
+                                        clip.name,
+                                        clip.target_rig,
+                                        clip.frame_rate,
+                                        clip.duration_seconds,
+                                        clip.bone_tracks.len()
+                                    )
+                                    .into(),
+                                );
+                            }
+                            if let Ok(json_str) =
+                                crate::engine::assets::animation::export_animation_to_json(&bytes)
+                            {
+                                ui.set_mat_json_text(json_str.into());
+                            }
+                        }
                         _ => ui.set_active_kind_id(5),
                     }
                 }
@@ -108,7 +145,6 @@ pub fn register(
     let state_revert = state;
     ui.on_revert_asset(move |chunk_str| {
         let st = state_revert.lock().unwrap();
-        // Fallback: derive project directory directly from chunk file path if needed
         let resolved_proj_dir = st.current_proj_dir.clone().or_else(|| {
             Path::new(chunk_str.as_str())
                 .parent()
@@ -143,6 +179,22 @@ pub fn register(
     let tx_mat = tx.clone();
     ui.on_save_material(move |chunk_str, json_str| {
         let _ = tx_mat.send(WorkerCommand::SaveMaterial {
+            chunk_path: PathBuf::from(chunk_str.as_str()),
+            json_data: json_str.to_string(),
+        });
+    });
+
+    let tx_ui = tx.clone();
+    ui.on_save_ui(move |chunk_str, json_str| {
+        let _ = tx_ui.send(WorkerCommand::SaveUI {
+            chunk_path: PathBuf::from(chunk_str.as_str()),
+            json_data: json_str.to_string(),
+        });
+    });
+
+    let tx_obj = tx.clone();
+    ui.on_save_object(move |chunk_str, json_str| {
+        let _ = tx_obj.send(WorkerCommand::SaveObject {
             chunk_path: PathBuf::from(chunk_str.as_str()),
             json_data: json_str.to_string(),
         });
@@ -189,11 +241,27 @@ pub fn register(
         });
     });
 
-    let tx_lua_imp = tx;
+    let tx_lua_imp = tx.clone();
     ui.on_import_lua(move |chunk_str, lua_str| {
         let _ = tx_lua_imp.send(WorkerCommand::ImportLua {
             chunk_path: PathBuf::from(chunk_str.as_str()),
             in_path: PathBuf::from(lua_str.as_str()),
+        });
+    });
+
+    let tx_anim_glb = tx.clone();
+    ui.on_export_anim_glb(move |chunk_str, out_str| {
+        let _ = tx_anim_glb.send(WorkerCommand::ExportAnimGlb {
+            chunk_path: PathBuf::from(chunk_str.as_str()),
+            out_path: PathBuf::from(out_str.as_str()),
+        });
+    });
+
+    let tx_anim_json = tx;
+    ui.on_export_anim_json(move |chunk_str, out_str| {
+        let _ = tx_anim_json.send(WorkerCommand::ExportAnimJson {
+            chunk_path: PathBuf::from(chunk_str.as_str()),
+            out_path: PathBuf::from(out_str.as_str()),
         });
     });
 }

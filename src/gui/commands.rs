@@ -52,6 +52,14 @@ pub enum WorkerCommand {
         chunk_path: PathBuf,
         out_path: PathBuf,
     },
+    ExportAnimGlb {
+        chunk_path: PathBuf,
+        out_path: PathBuf,
+    },
+    ExportAnimJson {
+        chunk_path: PathBuf,
+        out_path: PathBuf,
+    },
 
     // Asset Import & Save Operations
     ImportDds {
@@ -72,6 +80,14 @@ pub enum WorkerCommand {
         in_path: PathBuf,
     },
     SaveMaterial {
+        chunk_path: PathBuf,
+        json_data: String,
+    },
+    SaveUI {
+        chunk_path: PathBuf,
+        json_data: String,
+    },
+    SaveObject {
         chunk_path: PathBuf,
         json_data: String,
     },

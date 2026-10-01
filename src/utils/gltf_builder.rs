@@ -10,6 +10,7 @@ pub struct GltfBuilder {
     scenes: Vec<Value>,
     meshes: Vec<Value>,
     animations: Vec<Value>,
+    skins: Vec<Value>,
 }
 
 impl GltfBuilder {
@@ -22,6 +23,7 @@ impl GltfBuilder {
             scenes: Vec::new(),
             meshes: Vec::new(),
             animations: Vec::new(),
+            skins: Vec::new(),
         }
     }
 
@@ -92,6 +94,12 @@ impl GltfBuilder {
         idx
     }
 
+    pub fn add_skin(&mut self, skin: Value) -> usize {
+        let idx = self.skins.len();
+        self.skins.push(skin);
+        idx
+    }
+
     pub fn add_scene(&mut self, root_nodes: Vec<usize>) {
         self.scenes.push(json!({ "nodes": root_nodes }));
     }
@@ -114,6 +122,9 @@ impl GltfBuilder {
         }
         if !self.animations.is_empty() {
             gltf_json["animations"] = json!(self.animations);
+        }
+        if !self.skins.is_empty() {
+            gltf_json["skins"] = json!(self.skins);
         }
 
         let mut json_bytes = serde_json::to_vec(&gltf_json)?;

@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, bail};
-use binrw::BinReaderExt;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use serde_json::json;
 use std::collections::HashMap;
@@ -48,11 +47,11 @@ impl VertexAttribute {
         };
 
         let byte_size = match flags {
-            1 => 8,
-            2 => 12,
-            3 => 16,
-            4 | 7 => 1,
-            15 => 4,
+            1 => 8,     // 2x f32 (UVs)
+            2 => 12,    // 3x f32 (Vec3 Position / Normal)
+            3 => 16,    // 4x f32 (Vec4 TangentQuat)
+            4 | 7 => 1, // 1x u8 (Packed bone index or normalized weight)
+            15 => 4,    // 4x u8 packed
             _ => 12,
         };
 
@@ -85,26 +84,8 @@ struct ParsedMeshData {
 fn extract_mesh_geometry(chunk_data: &[u8]) -> Result<ParsedMeshData> {
     let mut bones = Vec::new();
 
-    if let Ok((_, elements)) = parse_chunk_elements(chunk_data) {
-        for (id, chunk) in elements {
-            if (id == chunk_id::OBJECT_BONES || id == chunk_id::DATA_BLOB)
-                && chunk.len() >= 144
-                && chunk.len().is_multiple_of(144)
-            {
-                if let Ok(parsed_bones) = parse_object_bone_container(&chunk) {
-                    bones = parsed_bones;
-                } else {
-                    let mut c = Cursor::new(chunk.as_slice());
-                    while (c.position() as usize) + 144 <= chunk.len() {
-                        if let Ok(bone) = c.read_le::<ObjectBone>() {
-                            bones.push(bone);
-                        } else {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+    if let Ok(parsed_bones) = parse_object_bone_container(chunk_data) {
+        bones = parsed_bones;
     }
 
     let mesh_data_bytes = if chunk_data.starts_with(magic::MESH) {
@@ -201,13 +182,11 @@ fn extract_mesh_geometry(chunk_data: &[u8]) -> Result<ParsedMeshData> {
         let mut pos = Vector3::default();
         let mut norm = Vector3::default();
         let mut uv = Vector2::default();
-        let mut w_val = Vector4 {
-            x: 1.0,
-            y: 0.0,
-            z: 0.0,
-            w: 0.0,
-        };
+        let mut w_val = Vector4::default();
         let mut j_val = [0u16; 4];
+
+        let mut weight_slot = 0;
+        let mut joint_slot = 0;
 
         for attr in &attributes {
             match attr.semantic {
@@ -236,16 +215,39 @@ fn extract_mesh_geometry(chunk_data: &[u8]) -> Result<ParsedMeshData> {
                         w_val.y = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
                         w_val.z = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
                         w_val.w = (1.0 - (w_val.x + w_val.y + w_val.z)).max(0.0);
+                    } else if attr.byte_size == 1 {
+                        // 1-byte normalized weight (u8 / 255.0)
+                        let w_norm = cur.read_u8().unwrap_or(0) as f32 / 255.0;
+                        match weight_slot {
+                            0 => w_val.x = w_norm,
+                            1 => w_val.y = w_norm,
+                            2 => w_val.z = w_norm,
+                            3 => w_val.w = w_norm,
+                            _ => {}
+                        }
+                        weight_slot += 1;
                     } else {
                         let p = cur.position();
                         cur.set_position(p + attr.byte_size as u64);
                     }
                 }
-                VertexSemantic::BlendIndices if attr.byte_size == 4 => {
-                    j_val[0] = cur.read_u8().unwrap_or(0) as u16;
-                    j_val[1] = cur.read_u8().unwrap_or(0) as u16;
-                    j_val[2] = cur.read_u8().unwrap_or(0) as u16;
-                    j_val[3] = cur.read_u8().unwrap_or(0) as u16;
+                VertexSemantic::BlendIndices => {
+                    if attr.byte_size == 4 {
+                        j_val[0] = cur.read_u8().unwrap_or(0) as u16;
+                        j_val[1] = cur.read_u8().unwrap_or(0) as u16;
+                        j_val[2] = cur.read_u8().unwrap_or(0) as u16;
+                        j_val[3] = cur.read_u8().unwrap_or(0) as u16;
+                    } else if attr.byte_size == 1 {
+                        // 1-byte bone index
+                        let j_byte = cur.read_u8().unwrap_or(0) as u16;
+                        if joint_slot < 4 {
+                            j_val[joint_slot] = j_byte;
+                            joint_slot += 1;
+                        }
+                    } else {
+                        let p = cur.position();
+                        cur.set_position(p + attr.byte_size as u64);
+                    }
                 }
                 _ => {
                     let p = cur.position();
@@ -253,6 +255,18 @@ fn extract_mesh_geometry(chunk_data: &[u8]) -> Result<ParsedMeshData> {
                 }
             }
         }
+
+        // Normalize weights so their sum is exactly 1.0
+        let weight_sum = w_val.x + w_val.y + w_val.z + w_val.w;
+        if weight_sum > 0.001 {
+            w_val.x /= weight_sum;
+            w_val.y /= weight_sum;
+            w_val.z /= weight_sum;
+            w_val.w /= weight_sum;
+        } else {
+            w_val.x = 1.0;
+        }
+
         positions.push(pos);
         normals.push(norm);
         uvs.push(uv);
@@ -345,7 +359,12 @@ pub fn export_mesh_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, MeshStats)> {
         "TEXCOORD_0": uv_acc
     });
 
-    if parsed.is_skinned && !parsed.joints.is_empty() && !parsed.weights.is_empty() {
+    let has_skinning = parsed.is_skinned
+        && !parsed.joints.is_empty()
+        && !parsed.weights.is_empty()
+        && !parsed.bones.is_empty();
+
+    if has_skinning {
         let mut joint_bytes = Vec::with_capacity(vertex_count * 8);
         for j in &parsed.joints {
             joint_bytes.write_u16::<LittleEndian>(j[0])?;
@@ -371,7 +390,7 @@ pub fn export_mesh_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, MeshStats)> {
     }
 
     let mesh_idx = builder.add_mesh(json!({
-        "name": "Mesh_0",
+        "name": "OverlordMesh",
         "primitives": [{
             "attributes": prim_attributes,
             "indices": ind_acc,
@@ -379,30 +398,80 @@ pub fn export_mesh_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, MeshStats)> {
         }]
     }));
 
-    let mut scene_nodes = vec![0];
-    builder.add_node(json!({
-        "name": "OverlordMesh",
-        "mesh": mesh_idx
-    }));
+    if has_skinning {
+        let num_bones = parsed.bones.len();
+        let mut armature_children = Vec::new();
+        let mut bone_nodes = Vec::new();
 
-    for (i, bone) in parsed.bones.iter().enumerate() {
-        let node_idx = scene_nodes.len();
-        scene_nodes.push(node_idx);
+        for (i, bone) in parsed.bones.iter().enumerate() {
+            let bone_node_idx = i + 1;
+
+            let mut children = Vec::new();
+            for (j, b2) in parsed.bones.iter().enumerate() {
+                if b2.parent_index == i as i32 && j != i {
+                    children.push(j + 1);
+                }
+            }
+
+            if bone.parent_index < 0 || bone.parent_index >= num_bones as i32 {
+                armature_children.push(bone_node_idx);
+            }
+
+            let bname = if bone.name.is_empty() {
+                format!("Bone_{:03}", i)
+            } else {
+                bone.name.clone()
+            };
+
+            let mut bnode = json!({
+                "name": bname,
+                "translation": [bone.translation.x, bone.translation.y, bone.translation.z],
+                "rotation": [bone.rotation.x, bone.rotation.y, bone.rotation.z, bone.rotation.w]
+            });
+            if !children.is_empty() {
+                bnode["children"] = json!(children);
+            }
+            bone_nodes.push(bnode);
+        }
+
         builder.add_node(json!({
-            "name": if bone.name.is_empty() { format!("Bone_{}", i) } else { bone.name.clone() },
-            "translation": [bone.translation.x, bone.translation.y, bone.translation.z],
-            "rotation": [bone.rotation.x, bone.rotation.y, bone.rotation.z, bone.rotation.w]
+            "name": "Armature",
+            "children": armature_children
         }));
+
+        for bnode in bone_nodes {
+            builder.add_node(bnode);
+        }
+
+        let joint_indices: Vec<usize> = (1..=num_bones).collect();
+        let skin_idx = builder.add_skin(json!({
+            "name": "Mesh_Skin",
+            "joints": joint_indices
+        }));
+
+        let mesh_node_idx = num_bones + 1;
+        builder.add_node(json!({
+            "name": "SkinnedMesh",
+            "mesh": mesh_idx,
+            "skin": skin_idx
+        }));
+
+        builder.add_scene(vec![0, mesh_node_idx]);
+    } else {
+        builder.add_node(json!({
+            "name": "StaticMesh",
+            "mesh": mesh_idx
+        }));
+        builder.add_scene(vec![0]);
     }
 
-    builder.add_scene(scene_nodes);
     let glb = builder.build("Overlord Modding Studio glTF Exporter")?;
 
     let stats = MeshStats {
         vertex_count,
         triangle_count: parsed.indices.len() / 3,
         stride: parsed.stride,
-        is_skinned: parsed.is_skinned,
+        is_skinned: has_skinning,
     };
 
     Ok((glb, stats))
@@ -652,13 +721,13 @@ pub fn import_glb_to_mesh(original_chunk: &[u8], glb_bytes: &[u8]) -> Result<Vec
 
     let mut attr_table = Vec::new();
     let mut cur_attr = Cursor::new(&mut attr_table);
-    cur_attr.write_u32::<LittleEndian>(0x02010000)?; // Pos
-    cur_attr.write_u32::<LittleEndian>(0x02040000)?; // Norm
-    cur_attr.write_u32::<LittleEndian>(0x01050000)?; // UV
+    cur_attr.write_u32::<LittleEndian>(0x02010000)?; // Position
+    cur_attr.write_u32::<LittleEndian>(0x02040000)?; // Normal
+    cur_attr.write_u32::<LittleEndian>(0x01050000)?; // TexCoord
 
     let attr_count = if target_skinned {
-        cur_attr.write_u32::<LittleEndian>(0x030A0000)?; // BlendWeights (16b)
-        cur_attr.write_u32::<LittleEndian>(0x0F0B0000)?; // BlendIndices (4b)
+        cur_attr.write_u32::<LittleEndian>(0x030A0000)?; // BlendWeights
+        cur_attr.write_u32::<LittleEndian>(0x0F0B0000)?; // BlendIndices
         5u32
     } else {
         3u32
@@ -861,7 +930,6 @@ pub fn import_obj_to_mesh(original_chunk: &[u8], obj_content: &str) -> Result<Ve
                 cur.write_f32::<LittleEndian>(uv.y)?;
 
                 if target_skinned {
-                    // Safe fallback root-bone weights to prevent vertex shader crashes on animated meshes
                     cur.write_f32::<LittleEndian>(1.0)?;
                     cur.write_f32::<LittleEndian>(0.0)?;
                     cur.write_f32::<LittleEndian>(0.0)?;

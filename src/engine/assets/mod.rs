@@ -9,10 +9,12 @@ pub mod lua;
 pub mod map;
 pub mod material;
 pub mod mesh;
+pub mod object;
 pub mod shader;
 pub mod sniffer;
 pub mod terrain;
 pub mod texture;
+pub mod ui;
 
 pub type ChunkElement = (u32, Vec<u8>);
 
