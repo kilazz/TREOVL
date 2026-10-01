@@ -1,0 +1,154 @@
+use byteorder::{LittleEndian, WriteBytesExt};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io::{Cursor, Write};
+use std::path::Path;
+
+use super::builder::build_node;
+use super::footer::{
+    FOOTER_SIZE, MAGIC_FOOTER_1, MAGIC_FOOTER_2, calculate_triumph_crc32, check_footer,
+};
+use super::header::{HEADER_SIZE, PrpHeader};
+use super::node::{PrpNode, parse_node};
+use super::sync::{export_smart_assets, sync_assets_to_chunks};
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ProjectManifest {
+    pub header: PrpHeader,
+    pub has_footer: bool,
+    pub footer_hash2: u32,
+    pub root: PrpNode,
+}
+
+pub fn unpack_archive(archive_path: &Path, output_dir: &Path) -> Result<(usize, String), String> {
+    let data = fs::read(archive_path).map_err(|e| format!("Failed to read archive: {}", e))?;
+
+    let header = PrpHeader::read(&data)?;
+    let footer_opt = check_footer(&data);
+    let has_footer = footer_opt.is_some();
+    let footer_hash2 = footer_opt.as_ref().map(|f| f.hash2).unwrap_or(0x7C809B8B);
+
+    let mut log = format!(
+        "Magic: '{}' | Version: {}.{} | Package: '{}'\n",
+        header.magic, header.major_version, header.minor_version, header.pack_name
+    );
+
+    if let Some(ref footer) = footer_opt {
+        let crc_payload = &data[..data.len() - FOOTER_SIZE];
+        let calc_crc = calculate_triumph_crc32(crc_payload);
+        log.push_str(&format!(
+            "Footer OK: Original CRC = 0x{:08X} | Calculated CRC = 0x{:08X}\n",
+            footer.original_crc, calc_crc
+        ));
+    }
+
+    fs::create_dir_all(output_dir.join("chunks"))
+        .map_err(|e| format!("Failed to create chunks directory: {}", e))?;
+
+    let payload_end = if has_footer {
+        data.len() - FOOTER_SIZE
+    } else {
+        data.len()
+    };
+    let payload = &data[HEADER_SIZE..payload_end];
+
+    let mut chunk_counter = 0;
+    let root_node = parse_node(payload, 0, true, true, &mut chunk_counter, output_dir);
+
+    let manifest = ProjectManifest {
+        header,
+        has_footer,
+        footer_hash2,
+        root: root_node,
+    };
+
+    let manifest_path = output_dir.join("project.json");
+    let file = fs::File::create(&manifest_path).map_err(|e| e.to_string())?;
+    serde_json::to_writer_pretty(file, &manifest).map_err(|e| e.to_string())?;
+
+    // --- SMART ASSET EXPORT ---
+    // Automatically populate the high-level `assets/` workspace for easy Explorer access
+    match export_smart_assets(output_dir) {
+        Ok(count) => {
+            log.push_str(&format!(
+                "[+] Smart workspace created: {} editable assets exported to 'assets/'.\n",
+                count
+            ));
+        }
+        Err(err) => {
+            log.push_str(&format!(
+                "[!] Warning: Smart asset export encountered an issue: {}\n",
+                err
+            ));
+        }
+    }
+
+    Ok((chunk_counter as usize, log))
+}
+
+pub fn pack_archive(project_dir: &Path, output_archive: &Path) -> Result<usize, String> {
+    let manifest_path = project_dir.join("project.json");
+    if !manifest_path.exists() {
+        return Err("Project manifest 'project.json' not found.".into());
+    }
+
+    // --- AUTO-SYNC FROM ASSETS WORKSPACE ---
+    // Detect any modified files in `assets/` and inject them back into `chunks/`
+    if let Ok(synced) = sync_assets_to_chunks(project_dir)
+        && synced > 0
+    {
+        println!(
+            "[*] Auto-synced {} modified files from 'assets/' into 'chunks/'.",
+            synced
+        );
+    }
+
+    let manifest_str = fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?;
+    let manifest: ProjectManifest =
+        serde_json::from_str(&manifest_str).map_err(|e| e.to_string())?;
+
+    let payload = build_node(&manifest.root, project_dir, 9)?;
+
+    let mut header_bytes = vec![0u8; HEADER_SIZE];
+    let mut cur = Cursor::new(&mut header_bytes);
+
+    let mut magic = manifest.header.magic.into_bytes();
+    magic.resize(4, 0);
+    cur.write_all(&magic).map_err(|e| e.to_string())?;
+    cur.write_u16::<LittleEndian>(manifest.header.major_version)
+        .map_err(|e| e.to_string())?;
+    cur.write_u16::<LittleEndian>(manifest.header.minor_version)
+        .map_err(|e| e.to_string())?;
+    cur.write_u32::<LittleEndian>(manifest.header.file_id)
+        .map_err(|e| e.to_string())?;
+    cur.write_u32::<LittleEndian>(payload.len() as u32)
+        .map_err(|e| e.to_string())?;
+
+    let mut pack_name = manifest.header.pack_name.into_bytes();
+    pack_name.resize(160, 0);
+    cur.write_all(&pack_name).map_err(|e| e.to_string())?;
+
+    let mut final_binary = header_bytes;
+    final_binary.extend(payload);
+
+    if manifest.has_footer {
+        let crc = calculate_triumph_crc32(&final_binary);
+        let mut footer = Vec::with_capacity(FOOTER_SIZE);
+        footer
+            .write_u32::<LittleEndian>(MAGIC_FOOTER_1)
+            .map_err(|e| e.to_string())?;
+        footer
+            .write_u32::<LittleEndian>(MAGIC_FOOTER_2)
+            .map_err(|e| e.to_string())?;
+        footer
+            .write_u32::<LittleEndian>(crc)
+            .map_err(|e| e.to_string())?;
+        footer
+            .write_u32::<LittleEndian>(manifest.footer_hash2)
+            .map_err(|e| e.to_string())?;
+        final_binary.extend(footer);
+    }
+
+    fs::write(output_archive, &final_binary).map_err(|e| e.to_string())?;
+    Ok(final_binary.len())
+}

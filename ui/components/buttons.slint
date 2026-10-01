@@ -1,0 +1,73 @@
+export component TabButton {
+    in property <string> text;
+    in property <bool> active: false;
+    in property <color> accent-color: #f0b132;
+    callback clicked;
+
+    width: 145px;
+    height: 32px;
+
+    rect := Rectangle {
+        background: root.active ? #2b2d31 : (ta.has-hover ? #242629 : #18191b);
+        border-color: root.active ? #353535 : (ta.has-hover ? #2e3035 : #1f2023);
+        border-width: 1px;
+        border-radius: 4px;
+
+        HorizontalLayout {
+            alignment: center;
+            spacing: 6px;
+
+            if root.active: Rectangle {
+                width: 5px;
+                height: 5px;
+                border-radius: 2.5px;
+                background: root.accent-color;
+                y: (parent.height - self.height) / 2;
+            }
+
+            Text {
+                text: root.text;
+                color: root.active ? #ffffff : (ta.has-hover ? #dcddde : #808080);
+                font-size: 12px;
+                font-weight: root.active ? 700 : 500;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+export component CustomButton {
+    in property <string> text;
+    in property <bool> enabled: true;
+    in property <color> primary-color: #3e6a90;
+    callback clicked;
+
+    height: 30px;
+
+    Rectangle {
+        background: !root.enabled ? #202124 : (ta.has-hover ? root.primary-color.brighter(14%) : root.primary-color);
+        border-radius: 4px;
+        border-width: 1px;
+        border-color: !root.enabled ? #2b2d31 : root.primary-color.darker(12%);
+
+        Text {
+            text: root.text;
+            color: !root.enabled ? #808080 : #ffffff;
+            font-size: 12px;
+            font-weight: 700;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+}

@@ -1,0 +1,315 @@
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use serde::{Deserialize, Serialize};
+use std::io::Cursor;
+
+use super::{build_typed_container, parse_typed_container};
+
+#[derive(Serialize, Deserialize)]
+pub struct MaterialJson {
+    pub type_id_hex: String,
+    pub engine_generation: String, // "Overlord 1" or "Overlord 2"
+    pub material_name: String,     // Human-readable material type name
+    pub blocks: Vec<MaterialBlock>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct MaterialBlock {
+    pub id: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    pub btype: String, // "string", "texture_link", "float", or "raw"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub float_value: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ptr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// Helper function to identify material role across Overlord 1 and Overlord 2 (MAT_LIBRARY_V1 & V2)
+fn get_material_role(type_id: u32, chunk_id: u32) -> Option<&'static str> {
+    match type_id {
+        // ==================== OVERLORD 1 ====================
+        0x00410608 => match chunk_id {
+            30 => Some("Diffuse Texture"),
+            _ => None,
+        },
+        0x0041060A => match chunk_id {
+            30 => Some("Diffuse Texture"),
+            50 => Some("Normal Map"),
+            _ => None,
+        },
+        0x00410612 => match chunk_id {
+            30 => Some("Diffuse Texture"),
+            42 => Some("Reflection Map"),
+            43 => Some("Specular Color"),
+            50 => Some("Normal Map"),
+            _ => None,
+        },
+        0x00410636 => match chunk_id {
+            30 => Some("Diffuse Texture"),
+            42 => Some("Normal Map"),
+            43 => Some("Reflection Map"),
+            44 => Some("Mask"),
+            _ => None,
+        },
+
+        // ==================== OVERLORD 2 (PBR & V2 SERIES) ====================
+        // Masked PBR Material (0x00410624)
+        0x00410624 => match chunk_id {
+            30 => Some("Diffuse / Base Color"),
+            42 => Some("Normal Map"),
+            43 => Some("Reflection Cubemap"),
+            44 => Some("Mask (Roughness/Metal/AO)"),
+            45 => Some("Mask Opacity / Threshold"),
+            46 => Some("Normal Strength / Roughness"),
+            47 => Some("Specular Power / Shininess"),
+            49 => Some("Detail / Secondary Texture"),
+            50 => Some("UV Tiling X"),
+            51 => Some("UV Tiling Y"),
+            52 => Some("Reflection Intensity"),
+            _ => None,
+        },
+        // Overlord 2 Diffuse (0x00410632)
+        0x00410632 => match chunk_id {
+            30 => Some("Diffuse Texture"),
+            41 => Some("Animation Speed X"),
+            50 => Some("Animation Speed Y"),
+            _ => None,
+        },
+        // Overlord 2 Terrain Blending (0x00460009)
+        0x00460009 => match chunk_id {
+            30 => Some("Base Terrain Texture"),
+            32 => Some("Layer 2 Texture Link"),
+            42 => Some("Normal Map"),
+            50 => Some("UV Scale X"),
+            51 => Some("UV Scale Y"),
+            _ => None,
+        },
+        // Overlord 2 Environmental Fluid / Water (0x00460015 / 0x00460013)
+        0x00460015 | 0x00460013 => match chunk_id {
+            30 => Some("Water Flow Normal Map 1"),
+            42 => Some("Water Flow Normal Map 2"),
+            43 => Some("Sky Reflection Cubemap"),
+            45 => Some("Flow Speed"),
+            46 => Some("Wave Amplitude"),
+            _ => None,
+        },
+        // Overlord 2 Foliage / Flora (0x0046001F)
+        0x0046001F => match chunk_id {
+            30 => Some("Diffuse / Foliage Texture"),
+            40 => Some("Alpha Cutoff Threshold"),
+            42 => Some("Wind Sway Amplitude"),
+            _ => None,
+        },
+        // Overlord 2 Decals (0x00464620)
+        0x00464620 => match chunk_id {
+            30 => Some("Decal Texture"),
+            42 => Some("Decal Normal Map"),
+            45 => Some("Decal Fade Distance"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn get_material_info(type_id: u32) -> (&'static str, &'static str) {
+    match type_id {
+        // Overlord 1 Series (0x0041xxxx)
+        0x00410608 => ("Overlord 1", "Diffuse Material"),
+        0x0041060A => ("Overlord 1", "Standard Material"),
+        0x0041060F => ("Overlord 1", "Diffuse + Specular Material"),
+        0x00410612 => ("Overlord 1", "Standard Material (+Spec)"),
+        0x0041061B => ("Overlord 1", "Vegetation Material"),
+        0x00410620 => ("Overlord 1", "Props Material"),
+        0x00410626 => ("Overlord 1", "Complex Material (DNMS spec/height)"),
+        0x00410628 => ("Overlord 1", "Vegetation D Material"),
+        0x0041062A => ("Overlord 1", "Vegetation Normal Material"),
+        0x00410636 => ("Overlord 1", "Armor Material (DNRM)"),
+
+        // Overlord 2 Series (0x00410624 / 0x0046xxxx)
+        0x00410624 => ("Overlord 2", "Masked PBR Material (DNRMS)"),
+        0x00410632 => ("Overlord 2", "Animated Surface Material"),
+        0x00460009 => ("Overlord 2", "Terrain Blend Material"),
+        0x00460013 => ("Overlord 2", "Water Surface Material"),
+        0x00460015 => ("Overlord 2", "Environmental Fluid Material"),
+        0x0046001F => ("Overlord 2", "Foliage / Flora Material"),
+        0x00464608 => ("Overlord 2", "Atmospheric Skybox Material"),
+        0x00464614 => ("Overlord 2", "Particle / FX Material"),
+        0x00464620 => ("Overlord 2", "Decal Overlay Material"),
+
+        _ => {
+            if (type_id >> 16) == 0x0046 {
+                ("Overlord 2", "Unknown Overlord 2 Material")
+            } else {
+                ("Overlord 1", "Unknown Overlord 1 Material")
+            }
+        }
+    }
+}
+
+/// Converts a binary Overlord material container chunk into an editable JSON string.
+pub fn export_material_to_json(chunk_data: &[u8]) -> Result<String, String> {
+    let (type_id, elements) = parse_typed_container(chunk_data)?;
+    let mut blocks = Vec::new();
+    let (engine_gen, mat_name) = get_material_info(type_id);
+
+    for (id, chunk) in elements {
+        let mut btype = "raw".to_string();
+        let mut value = Some(hex::encode_upper(&chunk));
+        let mut float_value = None;
+        let mut ptr = None;
+        let mut name = None;
+
+        // 1. Check if the element is a standalone UTF-8 string
+        if chunk.len() >= 4 {
+            let mut cur = Cursor::new(&chunk[0..4]);
+            let str_len = cur.read_u32::<LittleEndian>().unwrap() as usize;
+            if str_len == chunk.len() - 4
+                && let Ok(s) = std::str::from_utf8(&chunk[4..])
+            {
+                btype = "string".to_string();
+                value = Some(s.to_string());
+            }
+        }
+
+        // 2. Check if the element is a texture sub-table
+        // Overlord 1 has 2 offsets (pointer + friendly name), Overlord 2 has 1 offset (pointer only)
+        if btype == "raw" && !chunk.is_empty() {
+            let num_offsets = chunk[0] as usize;
+            if (num_offsets == 1 || num_offsets == 2) && chunk.len() > 1 + num_offsets * 2 {
+                let mut p = 1;
+                let mut str_offsets = Vec::new();
+                for _ in 0..num_offsets {
+                    str_offsets.push(chunk[p + 1] as usize);
+                    p += 2;
+                }
+
+                let t_base = p;
+                let s1_start = t_base + str_offsets[0];
+
+                if s1_start + 4 <= chunk.len() {
+                    let s1_len = Cursor::new(&chunk[s1_start..s1_start + 4])
+                        .read_u32::<LittleEndian>()
+                        .unwrap() as usize;
+
+                    if s1_start + 4 + s1_len <= chunk.len() {
+                        ptr = Some(
+                            String::from_utf8_lossy(&chunk[s1_start + 4..s1_start + 4 + s1_len])
+                                .into_owned(),
+                        );
+                        btype = "texture_link".to_string();
+                        value = None;
+                    }
+                }
+
+                // If Overlord 1 format (2 offsets), read friendly name
+                if num_offsets == 2 && btype == "texture_link" {
+                    let s2_start = t_base + str_offsets[1];
+                    if s2_start + 4 <= chunk.len() {
+                        let s2_len = Cursor::new(&chunk[s2_start..s2_start + 4])
+                            .read_u32::<LittleEndian>()
+                            .unwrap() as usize;
+
+                        if s2_start + 4 + s2_len <= chunk.len() {
+                            name = Some(
+                                String::from_utf8_lossy(
+                                    &chunk[s2_start + 4..s2_start + 4 + s2_len],
+                                )
+                                .into_owned(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Check for 4-byte scalar floats (PBR parameters, UV scales, speeds)
+        if btype == "raw" && chunk.len() == 4 && (41..=55).contains(&id) {
+            let mut cur = Cursor::new(&chunk);
+            let f = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+            if !f.is_nan() && f.is_finite() {
+                btype = "float".to_string();
+                float_value = Some(f);
+                value = None;
+            }
+        }
+
+        let role = get_material_role(type_id, id).map(|s| s.to_string());
+
+        blocks.push(MaterialBlock {
+            id,
+            role,
+            btype,
+            value,
+            float_value,
+            ptr,
+            name,
+        });
+    }
+
+    let mat_json = MaterialJson {
+        type_id_hex: format!("{:08X}", type_id),
+        engine_generation: engine_gen.to_string(),
+        material_name: mat_name.to_string(),
+        blocks,
+    };
+
+    serde_json::to_string_pretty(&mat_json).map_err(|e| e.to_string())
+}
+
+/// Rebuilds a binary Overlord material chunk from an edited JSON string.
+pub fn import_material_from_json(json_str: &str) -> Result<Vec<u8>, String> {
+    let mat_json: MaterialJson = serde_json::from_str(json_str).map_err(|e| e.to_string())?;
+    let type_id = u32::from_str_radix(&mat_json.type_id_hex, 16)
+        .map_err(|_| "Invalid hexadecimal Type ID".to_string())?;
+
+    let mut elements = Vec::new();
+
+    for b in mat_json.blocks {
+        let mut chunk = Vec::new();
+        match b.btype.as_str() {
+            "string" => {
+                let s = b.value.unwrap_or_default().into_bytes();
+                chunk.write_u32::<LittleEndian>(s.len() as u32).unwrap();
+                chunk.extend(s);
+            }
+            "float" => {
+                let f = b.float_value.unwrap_or(0.0);
+                chunk.write_f32::<LittleEndian>(f).unwrap();
+            }
+            "texture_link" => {
+                let ptr = b.ptr.unwrap_or_default().into_bytes();
+                let name = b.name.unwrap_or_default().into_bytes();
+
+                // Overlord 1 format (2 offsets) vs Overlord 2 format (1 offset)
+                if !name.is_empty() {
+                    chunk.push(2);
+                    chunk.extend_from_slice(&[20, 0]);
+                    chunk.extend_from_slice(&[21, (4 + ptr.len()) as u8]);
+
+                    chunk.write_u32::<LittleEndian>(ptr.len() as u32).unwrap();
+                    chunk.extend(ptr);
+                    chunk.write_u32::<LittleEndian>(name.len() as u32).unwrap();
+                    chunk.extend(name);
+                } else {
+                    chunk.push(1);
+                    chunk.extend_from_slice(&[20, 0]);
+                    chunk.write_u32::<LittleEndian>(ptr.len() as u32).unwrap();
+                    chunk.extend(ptr);
+                }
+            }
+            _ => {
+                let hex_str = b.value.unwrap_or_default();
+                let bytes = hex::decode(hex_str.trim())
+                    .map_err(|_| format!("Invalid hex sequence in raw block ID {}", b.id))?;
+                chunk.extend(bytes);
+            }
+        }
+        elements.push((b.id, chunk));
+    }
+
+    Ok(build_typed_container(type_id, &elements))
+}

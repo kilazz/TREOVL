@@ -1,0 +1,86 @@
+use super::node::PrpNode;
+use crate::utils::zlib;
+use byteorder::{LittleEndian, WriteBytesExt};
+use std::fs;
+use std::path::Path;
+
+pub fn build_node(node: &PrpNode, project_dir: &Path, comp_level: u32) -> Result<Vec<u8>, String> {
+    // 1. Если это ЛИСТ (Leaf) - читаем файл с диска
+    if !node.is_container {
+        let rel_path = node
+            .file_path
+            .as_ref()
+            .ok_or("Leaf node is missing file_path")?;
+        let full_path = project_dir.join(rel_path);
+        let raw_data =
+            fs::read(&full_path).map_err(|e| format!("Failed to read {:?}: {}", full_path, e))?;
+
+        // Возвращаем сжатие, если оно было в оригинале
+        if node.is_zlib_compressed && comp_level > 0 {
+            return zlib::compress(&raw_data, comp_level).map_err(|e| e.to_string());
+        }
+        return Ok(raw_data);
+    }
+
+    // 2. Если это КОНТЕЙНЕР (Container) - рекурсивно собираем детей
+    let mut child_buffers = Vec::new();
+    for child in &node.children {
+        let child_bin = build_node(child, project_dir, comp_level)?;
+        child_buffers.push((child, child_bin));
+    }
+
+    let mut small_entries = Vec::new();
+    let mut large_entries = Vec::new();
+    let mut data_segment = Vec::new();
+    let mut current_offset = 0usize;
+
+    // ВАЖНО: Мы сохраняем правильный порядок байтов данных,
+    // разделяя только записи в оглавлении (TOC)!
+    for (child, bin_data) in child_buffers {
+        let id = child.id;
+        let c_is_large = child.is_large;
+
+        if !c_is_large && id <= 255 && current_offset <= 255 {
+            small_entries.push((id as u8, current_offset as u8));
+        } else {
+            large_entries.push((id, current_offset as u32));
+        }
+
+        data_segment.extend_from_slice(&bin_data);
+        current_offset += bin_data.len();
+    }
+
+    // 3. Формируем таблицу оглавления
+    let mut table = Vec::new();
+    if node.has_magic {
+        table.extend_from_slice(b"\x01\x01\x00");
+    }
+
+    let has_large = !large_entries.is_empty();
+    let mut control_byte = (small_entries.len() & 0x7F) as u8;
+    if has_large {
+        control_byte |= 0x80;
+    }
+    table.push(control_byte);
+
+    if has_large {
+        table
+            .write_u32::<LittleEndian>(large_entries.len() as u32)
+            .unwrap();
+    }
+
+    for (id, offset) in small_entries {
+        table.write_u8(id).unwrap();
+        table.write_u8(offset).unwrap();
+    }
+
+    for (id, offset) in large_entries {
+        table.write_u32::<LittleEndian>(id).unwrap();
+        table.write_u32::<LittleEndian>(offset).unwrap();
+    }
+
+    // 4. Склеиваем Оглавление + Данные
+    table.extend(data_segment);
+
+    Ok(table)
+}

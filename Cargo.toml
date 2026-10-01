@@ -1,0 +1,20 @@
+[package]
+name = "OVLTool"
+version = "1.0.0"
+edition = "2024"
+build = "build.rs"
+
+[dependencies]
+slint = "1.18.1"
+byteorder = "1.5.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+crc32fast = "1.5.2"
+rayon = "1.12.0"
+rfd = "0.17.2"
+flate2 = "1.1.10"
+hex = "0.4.3"
+walkdir = "2.5.0"
+
+[build-dependencies]
+slint-build = "1.18.1"
