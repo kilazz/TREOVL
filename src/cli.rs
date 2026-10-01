@@ -7,7 +7,7 @@ use crate::engine::assets::animation::{
     export_animation_to_glb, export_animation_to_json, parse_animation_clip,
 };
 use crate::engine::assets::lua::{disassemble_lua_bytecode, inspect_lua_bytecode};
-use crate::engine::assets::map::{export_level_to_glb, parse_omp_map};
+use crate::engine::assets::map::{assemble_level_scene_glb, export_level_to_glb, parse_omp_map};
 use crate::engine::assets::mesh::{
     export_mesh_to_glb, export_mesh_to_obj, import_glb_to_mesh, import_obj_to_mesh,
 };
@@ -95,6 +95,15 @@ pub enum Commands {
     ExportLevelGlb {
         /// Input level map (.omp)
         level: PathBuf,
+        /// Output .glb file
+        output: PathBuf,
+    },
+    /// Assemble level scene into .glb instancing real 3D models from assets/meshes
+    AssembleLevel {
+        /// Input level map (.omp)
+        level: PathBuf,
+        /// Extracted assets directory containing meshes/
+        assets_dir: PathBuf,
         /// Output .glb file
         output: PathBuf,
     },
@@ -199,7 +208,7 @@ pub fn handle_cli() -> Result<()> {
         }
         Commands::ExportGlb { mesh, output } => {
             let data = fs::read(&mesh).with_context(|| format!("Failed to read {:?}", mesh))?;
-            let (glb, stats) = export_mesh_to_glb(&data).map_err(|e| anyhow::anyhow!(e))?;
+            let (glb, stats) = export_mesh_to_glb(&data)?;
             fs::write(&output, glb)?;
             println!(
                 "[+] glTF 2.0 Binary (.glb) exported ({} vertices, {} triangles, stride: {} bytes).",
@@ -209,13 +218,13 @@ pub fn handle_cli() -> Result<()> {
         Commands::ImportGlb { mesh, input } => {
             let chunk = fs::read(&mesh)?;
             let glb = fs::read(&input)?;
-            let new_bin = import_glb_to_mesh(&chunk, &glb).map_err(|e| anyhow::anyhow!(e))?;
+            let new_bin = import_glb_to_mesh(&chunk, &glb)?;
             fs::write(&mesh, new_bin)?;
             println!("[+] Mesh chunk successfully updated from .glb.");
         }
         Commands::ExportObj { mesh, output } => {
             let data = fs::read(&mesh)?;
-            let (obj, stats) = export_mesh_to_obj(&data).map_err(|e| anyhow::anyhow!(e))?;
+            let (obj, stats) = export_mesh_to_obj(&data)?;
             fs::write(&output, obj)?;
             println!(
                 "[+] OBJ exported ({} vertices, {} triangles, stride: {} bytes).",
@@ -225,14 +234,13 @@ pub fn handle_cli() -> Result<()> {
         Commands::ImportObj { mesh, input } => {
             let chunk = fs::read(&mesh)?;
             let obj = fs::read_to_string(&input)?;
-            let new_bin = import_obj_to_mesh(&chunk, &obj).map_err(|e| anyhow::anyhow!(e))?;
+            let new_bin = import_obj_to_mesh(&chunk, &obj)?;
             fs::write(&mesh, new_bin)?;
             println!("[+] Mesh chunk successfully updated from OBJ.");
         }
         Commands::ExportTerrainGlb { terrain, output } => {
             let data = fs::read(&terrain)?;
-            let (glb, v_count, tri_count) =
-                export_terrain_to_glb(&data).map_err(|e| anyhow::anyhow!(e))?;
+            let (glb, v_count, tri_count) = export_terrain_to_glb(&data)?;
             fs::write(&output, glb)?;
             println!(
                 "[+] Terrain exported to .glb with Vertex Colors ({} vertices, {} triangles).",
@@ -241,25 +249,38 @@ pub fn handle_cli() -> Result<()> {
         }
         Commands::ExportLevelGlb { level, output } => {
             let data = fs::read(&level)?;
-            let glb = export_level_to_glb(&data).map_err(|e| anyhow::anyhow!(e))?;
+            let glb = export_level_to_glb(&data)?;
             fs::write(&output, glb)?;
             println!("[+] Complete level scene exported to .glb with terrain and entity locators.");
         }
+        Commands::AssembleLevel {
+            level,
+            assets_dir,
+            output,
+        } => {
+            let data = fs::read(&level).with_context(|| format!("Failed to read {:?}", level))?;
+            let glb = assemble_level_scene_glb(&data, &assets_dir)?;
+            fs::write(&output, glb)?;
+            println!(
+                "[+] Full level scene assembled with real meshes into: {:?}",
+                output
+            );
+        }
         Commands::ExportAnim { anim, output } => {
             let data = fs::read(&anim)?;
-            let glb = export_animation_to_glb(&data).map_err(|e| anyhow::anyhow!(e))?;
+            let glb = export_animation_to_glb(&data)?;
             fs::write(&output, glb)?;
             println!("[+] Animation exported to glTF 2.0 (.glb) with timeline channels.");
         }
         Commands::ExportAnimJson { anim, output } => {
             let data = fs::read(&anim)?;
-            let json_str = export_animation_to_json(&data).map_err(|e| anyhow::anyhow!(e))?;
+            let json_str = export_animation_to_json(&data)?;
             fs::write(&output, json_str)?;
             println!("[+] Animation keyframes exported to JSON.");
         }
         Commands::InspectAnim { anim } => {
             let data = fs::read(&anim)?;
-            let clip = parse_animation_clip(&data).map_err(|e| anyhow::anyhow!(e))?;
+            let clip = parse_animation_clip(&data)?;
             println!("--- ANIMATION CLIP INFO ---");
             println!("Clip Name:    {}", clip.name);
             println!("Target Rig:   {}", clip.target_rig);
@@ -277,7 +298,7 @@ pub fn handle_cli() -> Result<()> {
         }
         Commands::InspectMap { level } => {
             let data = fs::read(&level)?;
-            let info = parse_omp_map(&data).map_err(|e| anyhow::anyhow!(e))?;
+            let info = parse_omp_map(&data)?;
             println!("--- OVERLORD MAP INFO ---");
             println!("Map Title:    {}", info.map_name);
             println!("Entity Count: {} objects placed", info.entity_count);
@@ -290,7 +311,7 @@ pub fn handle_cli() -> Result<()> {
         }
         Commands::InspectLua { script } => {
             let data = fs::read(&script)?;
-            let info = inspect_lua_bytecode(&data).map_err(|e| anyhow::anyhow!(e))?;
+            let info = inspect_lua_bytecode(&data)?;
             println!("--- LUA 5.0.2 BYTECODE INFO ---");
             println!("VM Status:    Valid PUC-Rio 5.0.2 (32-bit LE)");
             println!(
@@ -305,7 +326,7 @@ pub fn handle_cli() -> Result<()> {
         }
         Commands::DisasmLua { script, out } => {
             let data = fs::read(&script)?;
-            let disasm = disassemble_lua_bytecode(&data).map_err(|e| anyhow::anyhow!(e))?;
+            let disasm = disassemble_lua_bytecode(&data)?;
             if let Some(out_path) = out {
                 fs::write(&out_path, &disasm)?;
                 println!("[+] Lua disassembly written to: {:?}", out_path);
@@ -315,20 +336,20 @@ pub fn handle_cli() -> Result<()> {
         }
         Commands::ExportDds { texture, output } => {
             let data = fs::read(&texture)?;
-            let dds = export_to_dds(&data).map_err(|e| anyhow::anyhow!(e))?;
+            let dds = export_to_dds(&data)?;
             fs::write(&output, dds)?;
             println!("[+] Image exported to {:?}", output);
         }
         Commands::ImportDds { texture, input } => {
             let chunk = fs::read(&texture)?;
             let dds = fs::read(&input)?;
-            let new_bin = replace_texture_in_chunk(&chunk, &dds).map_err(|e| anyhow::anyhow!(e))?;
+            let new_bin = replace_texture_in_chunk(&chunk, &dds)?;
             fs::write(&texture, new_bin)?;
             println!("[+] Texture chunk successfully updated from DDS.");
         }
         Commands::ExportShader { shader, out_dir } => {
             let data = fs::read(&shader)?;
-            let (payload, s_type, name) = export_shader(&data).map_err(|e| anyhow::anyhow!(e))?;
+            let (payload, s_type, name) = export_shader(&data)?;
             let ext = match s_type {
                 ShaderType::InternalHLSL => "hlsl",
                 _ => "dxbc",

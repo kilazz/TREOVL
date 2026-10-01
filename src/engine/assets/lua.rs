@@ -2,6 +2,7 @@ use super::{build_chunk_from_elements, parse_chunk_elements};
 use anyhow::{Result, bail};
 use byteorder::{LittleEndian, ReadBytesExt};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::Cursor;
 
 pub const LUA_MAGIC: &[u8; 4] = b"\x1bLua";
@@ -80,21 +81,6 @@ pub fn validate_lua_50_header(bytecode: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub fn disassemble_lua_bytecode(bytecode: &[u8]) -> Result<String> {
-    validate_lua_50_header(bytecode)?;
-
-    let mut cur = Cursor::new(&bytecode[12..]);
-    let mut out = String::new();
-
-    out.push_str("; ========================================================\n");
-    out.push_str("; Disassembled Lua 5.0.2 Bytecode (Overlord Engine)\n");
-
-    disassemble_function_prototype(&mut cur, &mut out, 0)?;
-
-    out.push_str("; ========================================================\n");
-    Ok(out)
-}
-
 fn read_lua_string(cur: &mut Cursor<&[u8]>) -> Result<Option<String>> {
     let len = cur.read_u32::<LittleEndian>()? as usize;
     if len == 0 {
@@ -110,6 +96,240 @@ fn read_lua_string(cur: &mut Cursor<&[u8]>) -> Result<Option<String>> {
         .to_string();
     cur.set_position((pos + len) as u64);
     Ok(Some(s))
+}
+
+// -------------------------------------------------------------
+// HIGH-LEVEL PSEUDOCODE DECOMPILER
+// -------------------------------------------------------------
+
+pub fn decompile_lua_bytecode(bytecode: &[u8]) -> Result<String> {
+    validate_lua_50_header(bytecode)?;
+
+    let mut cur = Cursor::new(&bytecode[12..]);
+    let mut out = String::new();
+
+    out.push_str("-- ========================================================\n");
+    out.push_str("-- Decompiled Lua 5.0.2 High-Level Pseudocode\n");
+    out.push_str("-- ========================================================\n\n");
+
+    decompile_scope(&mut cur, &mut out, 0)?;
+    Ok(out)
+}
+
+fn decompile_scope(cur: &mut Cursor<&[u8]>, out: &mut String, level: usize) -> Result<()> {
+    let indent = "    ".repeat(level);
+
+    let source = read_lua_string(cur)?.unwrap_or_else(|| "anonymous".into());
+    let _line = cur.read_u32::<LittleEndian>()?;
+    let num_params = cur.read_u8()?;
+    let _is_vararg = cur.read_u8()?;
+    let _max_stack = cur.read_u8()?;
+
+    let params: Vec<String> = (0..num_params).map(|i| format!("arg_{}", i)).collect();
+    out.push_str(&format!(
+        "{indent}function {} ({})\n",
+        source,
+        params.join(", ")
+    ));
+
+    let num_lines = cur.read_u32::<LittleEndian>()? as usize;
+    for _ in 0..num_lines {
+        let _ = cur.read_u32::<LittleEndian>()?;
+    }
+
+    let num_constants = cur.read_u32::<LittleEndian>()? as usize;
+    let mut constants = Vec::with_capacity(num_constants);
+    for _ in 0..num_constants {
+        let k_type = cur.read_u8()?;
+        let c = match k_type {
+            0 => LuaConstant::Nil,
+            1 => LuaConstant::Bool(cur.read_u8()? != 0),
+            3 => LuaConstant::Number(cur.read_f64::<LittleEndian>()?),
+            4 => LuaConstant::String(read_lua_string(cur)?.unwrap_or_default()),
+            _ => bail!("Unknown constant tag: {}", k_type),
+        };
+        constants.push(c);
+    }
+
+    let mut registers: HashMap<usize, String> = HashMap::new();
+    for (i, p) in params.iter().enumerate() {
+        registers.insert(i, p.clone());
+    }
+
+    let get_rk = |val: usize, ksts: &[LuaConstant], regs: &HashMap<usize, String>| -> String {
+        if (val & 256) != 0 {
+            let k_idx = val & 255;
+            match ksts.get(k_idx) {
+                Some(LuaConstant::String(s)) => format!("\"{}\"", s),
+                Some(LuaConstant::Number(n)) => format!("{}", n),
+                Some(LuaConstant::Bool(b)) => format!("{}", b),
+                Some(LuaConstant::Nil) => "nil".into(),
+                None => format!("K[{}]", k_idx),
+            }
+        } else {
+            regs.get(&val)
+                .cloned()
+                .unwrap_or_else(|| format!("r{}", val))
+        }
+    };
+
+    let num_code = cur.read_u32::<LittleEndian>()? as usize;
+    for _ in 0..num_code {
+        let inst = cur.read_u32::<LittleEndian>()?;
+        let opcode = (inst & 0x3F) as usize;
+        let a = ((inst >> 6) & 0xFF) as usize;
+        let b = ((inst >> 14) & 0x1FF) as usize;
+        let c = ((inst >> 23) & 0x1FF) as usize;
+        let bx = ((inst >> 14) & 0x3FFFF) as usize;
+
+        let op_name = OP_NAMES.get(opcode).copied().unwrap_or("UNKNOWN");
+
+        match op_name {
+            "MOVE" => {
+                let val = registers
+                    .get(&b)
+                    .cloned()
+                    .unwrap_or_else(|| format!("r{}", b));
+                registers.insert(a, val);
+            }
+            "LOADK" => {
+                let val_str = match constants.get(bx) {
+                    Some(LuaConstant::String(s)) => format!("\"{}\"", s),
+                    Some(LuaConstant::Number(n)) => format!("{}", n),
+                    Some(LuaConstant::Bool(b)) => format!("{}", b),
+                    _ => "nil".into(),
+                };
+                registers.insert(a, val_str);
+            }
+            "LOADBOOL" => {
+                registers.insert(a, (b != 0).to_string());
+            }
+            "LOADNIL" => {
+                for r in a..=b {
+                    registers.insert(r, "nil".into());
+                }
+            }
+            "GETGLOBAL" => {
+                let gname = match constants.get(bx) {
+                    Some(LuaConstant::String(s)) => s.clone(),
+                    _ => format!("G_{}", bx),
+                };
+                registers.insert(a, gname);
+            }
+            "SETGLOBAL" => {
+                let gname = match constants.get(bx) {
+                    Some(LuaConstant::String(s)) => s.clone(),
+                    _ => format!("G_{}", bx),
+                };
+                let val = registers.get(&a).cloned().unwrap_or_else(|| "nil".into());
+                out.push_str(&format!("{indent}    {} = {}\n", gname, val));
+            }
+            "GETTABLE" => {
+                let table = registers
+                    .get(&b)
+                    .cloned()
+                    .unwrap_or_else(|| format!("r{}", b));
+                let key = get_rk(c, &constants, &registers);
+                registers.insert(a, format!("{}[{}]", table, key));
+            }
+            "SETTABLE" => {
+                let table = registers
+                    .get(&a)
+                    .cloned()
+                    .unwrap_or_else(|| format!("r{}", a));
+                let key = get_rk(b, &constants, &registers);
+                let val = get_rk(c, &constants, &registers);
+                out.push_str(&format!("{indent}    {}[{}] = {}\n", table, key, val));
+            }
+            "ADD" => {
+                let op1 = get_rk(b, &constants, &registers);
+                let op2 = get_rk(c, &constants, &registers);
+                registers.insert(a, format!("({} + {})", op1, op2));
+            }
+            "SUB" => {
+                let op1 = get_rk(b, &constants, &registers);
+                let op2 = get_rk(c, &constants, &registers);
+                registers.insert(a, format!("({} - {})", op1, op2));
+            }
+            "MUL" => {
+                let op1 = get_rk(b, &constants, &registers);
+                let op2 = get_rk(c, &constants, &registers);
+                registers.insert(a, format!("({} * {})", op1, op2));
+            }
+            "DIV" => {
+                let op1 = get_rk(b, &constants, &registers);
+                let op2 = get_rk(c, &constants, &registers);
+                registers.insert(a, format!("({} / {})", op1, op2));
+            }
+            "CONCAT" => {
+                let mut parts = Vec::new();
+                for r in b..=c {
+                    parts.push(
+                        registers
+                            .get(&r)
+                            .cloned()
+                            .unwrap_or_else(|| format!("r{}", r)),
+                    );
+                }
+                registers.insert(a, parts.join(" .. "));
+            }
+            "CALL" => {
+                let func = registers
+                    .get(&a)
+                    .cloned()
+                    .unwrap_or_else(|| format!("func_{}", a));
+                let num_args = b.saturating_sub(1);
+                let mut call_args = Vec::new();
+                for arg_i in 1..=num_args {
+                    let reg_idx = a + arg_i;
+                    let arg_val = registers
+                        .get(&reg_idx)
+                        .cloned()
+                        .unwrap_or_else(|| format!("r{}", reg_idx));
+                    call_args.push(arg_val);
+                }
+                out.push_str(&format!("{indent}    {}({})\n", func, call_args.join(", ")));
+            }
+            "RETURN" => {
+                let count = b.saturating_sub(1);
+                if count == 0 {
+                    out.push_str(&format!("{indent}    return\n"));
+                } else {
+                    let ret_val = registers.get(&a).cloned().unwrap_or_else(|| "nil".into());
+                    out.push_str(&format!("{indent}    return {}\n", ret_val));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    out.push_str(&format!("{indent}end\n\n"));
+
+    let num_nested = cur.read_u32::<LittleEndian>()? as usize;
+    for _ in 0..num_nested {
+        decompile_scope(cur, out, level + 1)?;
+    }
+
+    Ok(())
+}
+
+// -------------------------------------------------------------
+// LOW-LEVEL DISASSEMBLER
+// -------------------------------------------------------------
+
+pub fn disassemble_lua_bytecode(bytecode: &[u8]) -> Result<String> {
+    validate_lua_50_header(bytecode)?;
+
+    let mut cur = Cursor::new(&bytecode[12..]);
+    let mut out = String::new();
+
+    out.push_str("; ========================================================\n");
+    out.push_str("; Disassembled Lua 5.0.2 Bytecode (Overlord Engine)\n");
+
+    disassemble_function_prototype(&mut cur, &mut out, 0)?;
+
+    out.push_str("; ========================================================\n");
+    Ok(out)
 }
 
 fn disassemble_function_prototype(

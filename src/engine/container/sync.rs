@@ -156,7 +156,7 @@ impl AssetProcessor for AudioProcessor {
 }
 
 // -------------------------------------------------------------
-// LUA SCRIPT PROCESSOR
+// LUA PROCESSOR (DISASSEMBLER + HIGH-LEVEL DECOMPILER)
 // -------------------------------------------------------------
 pub struct LuaProcessor;
 impl AssetProcessor for LuaProcessor {
@@ -178,6 +178,7 @@ impl AssetProcessor for LuaProcessor {
             &bytecode,
         )?;
 
+        // 1. Output Bytecode Disassembly
         if let Ok(disasm) = crate::engine::assets::lua::disassemble_lua_bytecode(&bytecode) {
             fs::write(
                 workspace
@@ -185,6 +186,17 @@ impl AssetProcessor for LuaProcessor {
                     .join("scripts")
                     .join(format!("{}.lua.txt", out_name)),
                 disasm,
+            )?;
+        }
+
+        // 2. Output High-Level Pseudocode Decompilation
+        if let Ok(decompiled) = crate::engine::assets::lua::decompile_lua_bytecode(&bytecode) {
+            fs::write(
+                workspace
+                    .assets_dir
+                    .join("scripts")
+                    .join(format!("{}.decompiled.lua", out_name)),
+                decompiled,
             )?;
         }
 
@@ -233,7 +245,7 @@ impl AssetProcessor for MaterialProcessor {
 }
 
 // -------------------------------------------------------------
-// MESH PROCESSOR (WITH AUTO-RIG EXTRACTION)
+// MESH PROCESSOR (WITH AUTO-RIG ARMATURE EXTRACTION)
 // -------------------------------------------------------------
 pub struct MeshProcessor;
 impl AssetProcessor for MeshProcessor {
@@ -255,7 +267,7 @@ impl AssetProcessor for MeshProcessor {
             &glb_bytes,
         )?;
 
-        // Automatically exports the armature rig for Blender if bone data is present
+        // Automatically export armature rig for Blender if bone data is present
         if let Ok(bones) = parse_object_bone_container(data)
             && !bones.is_empty()
             && let Ok(rig_glb) = export_skeleton_to_glb(&bones, &sniffed.display_name)
@@ -338,7 +350,6 @@ impl AssetProcessor for ParameterProcessor {
         let out_name = format!("{}.json", stem);
         let abs_path = workspace.assets_dir.join("parameters").join(&out_name);
 
-        // A. Named Asset Container Slot (e.g. "17039")
         let param_json = if data.len() == 24 && data.starts_with(&[3, 20, 0, 21]) {
             let slen = u32::from_le_bytes(data[7..11].try_into().unwrap_or_default()) as usize;
             if slen <= 13
@@ -351,7 +362,6 @@ impl AssetProcessor for ParameterProcessor {
             } else {
                 json!({ "type": "raw_bytes", "hex": hex::encode_upper(data) })
             }
-        // B. Sound Bank Descriptor (57 00 00 04)
         } else if data.starts_with(b"\x57\x00\x00\x04") && data.len() >= 14 {
             let mut sfx_label = String::new();
             if let Ok((_, sub_elem)) = parse_chunk_elements(&data[4..]) {
@@ -371,7 +381,6 @@ impl AssetProcessor for ParameterProcessor {
                 "type": "sound_bank_descriptor",
                 "label": sfx_label
             })
-        // C. String Parameters & 32-bit Scalars (<= 64 bytes)
         } else if data.len() == 4 {
             let val_u32 = u32::from_le_bytes(data[0..4].try_into().unwrap_or_default());
             let val_f32 = f32::from_le_bytes(data[0..4].try_into().unwrap_or_default());
@@ -430,6 +439,25 @@ fn build_unknown_chunk_dossier(chunk_data: &[u8], stem: &str) -> serde_json::Val
         String::from("TOO_SHORT")
     };
 
+    // 1. Rainbow Dictionary: Reverse 32-bit hashes to known game engine terms
+    let reversed_term = if chunk_data.len() >= 4 {
+        let val = u32::from_le_bytes(chunk_data[0..4].try_into().unwrap_or_default());
+        crate::engine::analysis::dictionary::DICTIONARY.lookup(val)
+    } else {
+        None
+    };
+
+    // 2. Pattern & Stride Hunter: Detect memory stride alignment, matrices, or bounding boxes
+    let stride_analysis = crate::engine::analysis::pattern::analyze_stride_and_pattern(chunk_data)
+        .map(|s| {
+            json!({
+                "detected_stride": s.detected_stride,
+                "element_count": s.element_count,
+                "pattern_type": s.pattern_type,
+                "samples": s.samples
+            })
+        });
+
     let mut extracted_strings = Vec::new();
     let mut i = 0;
     while i < chunk_data.len() {
@@ -467,6 +495,8 @@ fn build_unknown_chunk_dossier(chunk_data: &[u8], stem: &str) -> serde_json::Val
                 "structure_type": "Untyped Container Sub-Table",
                 "has_container_magic": has_magic,
                 "total_bytes": chunk_data.len(),
+                "reversed_term_guess": reversed_term,
+                "stride_detector": stride_analysis,
                 "sub_elements_count": sub_elements_info.len(),
                 "sub_elements": sub_elements_info,
                 "embedded_strings": extracted_strings,
@@ -489,6 +519,8 @@ fn build_unknown_chunk_dossier(chunk_data: &[u8], stem: &str) -> serde_json::Val
             "structure_type": "Typed Container",
             "type_id_hex": format!("{:08X}", type_id),
             "total_bytes": chunk_data.len(),
+            "reversed_term_guess": reversed_term,
+            "stride_detector": stride_analysis,
             "sub_elements_count": sub_elements_info.len(),
             "sub_elements": sub_elements_info,
             "embedded_strings": extracted_strings,
@@ -514,6 +546,8 @@ fn build_unknown_chunk_dossier(chunk_data: &[u8], stem: &str) -> serde_json::Val
         "structure_type": "Raw Leaf Data",
         "total_bytes": chunk_data.len(),
         "magic_header_hex": magic_hex,
+        "reversed_term_guess": reversed_term,
+        "stride_detector": stride_analysis,
         "scalar_guesses": scalar_guesses,
         "embedded_strings": extracted_strings,
         "full_hex": hex::encode_upper(chunk_data)
@@ -584,7 +618,7 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize> {
         fs::create_dir_all(workspace.assets_dir.join(dir))?;
     }
 
-    // Strategy Pipeline
+    // Pipeline of strategies
     let processors: Vec<Box<dyn AssetProcessor>> = vec![
         Box::new(TextureProcessor),
         Box::new(AudioProcessor),
@@ -630,6 +664,9 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize> {
     let cache_file = project_dir.join(".asset_cache.json");
     let serialized = serde_json::to_string_pretty(&cache)?;
     fs::write(cache_file, serialized)?;
+
+    // Automatically build the cross-reference dependency graph (assets/dependency_graph.json)
+    let _ = crate::engine::analysis::graph::build_dependency_graph(&workspace.assets_dir);
 
     Ok(cache.entries.len())
 }
