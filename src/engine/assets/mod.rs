@@ -1,5 +1,8 @@
+use anyhow::{Result, bail};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::Cursor;
+
+use crate::engine::common::magic;
 
 pub mod animation;
 pub mod audio;
@@ -13,20 +16,19 @@ pub mod terrain;
 pub mod texture;
 
 pub type ChunkElement = (u32, Vec<u8>);
-pub type ChunkElementsResult = Result<(bool, Vec<ChunkElement>), String>;
-pub type TypedContainerResult = Result<(u32, Vec<ChunkElement>), String>;
 
-/// Parses a standard asset container chunk into raw ID-payload pairs.
-pub fn parse_chunk_elements(data: &[u8]) -> ChunkElementsResult {
+pub fn parse_chunk_elements(data: &[u8]) -> Result<(bool, Vec<ChunkElement>)> {
     let mut pos = 0;
     let mut has_magic = false;
-    if data.len() > 3 && &data[0..3] == b"\x01\x01\x00" {
+
+    // ACTIVELY USES magic::CONTAINER_MAGIC
+    if data.len() > 3 && &data[0..3] == magic::CONTAINER_MAGIC {
         has_magic = true;
         pos = 3;
     }
 
     if pos >= data.len() {
-        return Err("Not a valid Asset Container block.".into());
+        bail!("Not a valid Asset Container block.");
     }
 
     let control_byte = data[pos];
@@ -37,42 +39,39 @@ pub fn parse_chunk_elements(data: &[u8]) -> ChunkElementsResult {
     let mut large_count = 0;
     if has_large {
         if pos + 4 > data.len() {
-            return Err("Corrupted container header.".into());
+            bail!("Corrupted container header.");
         }
         let mut cur = Cursor::new(&data[pos..pos + 4]);
-        large_count = cur.read_u32::<LittleEndian>().unwrap() as usize;
+        large_count = cur.read_u32::<LittleEndian>()? as usize;
         pos += 4;
     }
 
     let total_entries = small_count + large_count;
     if total_entries == 0 || total_entries > 4096 {
-        return Err("Invalid entry count in container.".into());
+        bail!("Invalid entry count in container.");
     }
 
     let table_size = (small_count * 2) + (large_count * 8);
     let data_start = pos + table_size;
     if data_start > data.len() {
-        return Err("Table offsets exceed chunk boundaries.".into());
+        bail!("Table offsets exceed chunk boundaries.");
     }
 
     let mut cur = Cursor::new(&data[pos..pos + table_size]);
     let mut offsets = Vec::new();
     for _ in 0..small_count {
-        offsets.push((
-            cur.read_u8().unwrap() as u32,
-            cur.read_u8().unwrap() as usize,
-        ));
+        offsets.push((cur.read_u8()? as u32, cur.read_u8()? as usize));
     }
     for _ in 0..large_count {
         offsets.push((
-            cur.read_u32::<LittleEndian>().unwrap(),
-            cur.read_u32::<LittleEndian>().unwrap() as usize,
+            cur.read_u32::<LittleEndian>()?,
+            cur.read_u32::<LittleEndian>()? as usize,
         ));
     }
     offsets.sort_by_key(|&(_, off)| off);
 
     if offsets.is_empty() || offsets[0].1 != 0 {
-        return Err("First table offset is not zero.".into());
+        bail!("First table offset is not zero.");
     }
 
     let mut elements = Vec::new();
@@ -93,11 +92,10 @@ pub fn parse_chunk_elements(data: &[u8]) -> ChunkElementsResult {
     Ok((has_magic, elements))
 }
 
-/// Rebuilds a standard asset container chunk from raw ID-payload pairs.
 pub fn build_chunk_from_elements(has_magic: bool, elements: &[ChunkElement]) -> Vec<u8> {
     let mut table = Vec::new();
     if has_magic {
-        table.extend_from_slice(b"\x01\x01\x00");
+        table.extend_from_slice(magic::CONTAINER_MAGIC);
     }
 
     let mut small_entries = Vec::new();
@@ -140,14 +138,13 @@ pub fn build_chunk_from_elements(has_magic: bool, elements: &[ChunkElement]) -> 
     table
 }
 
-/// Parses a typed asset container starting with a 4-byte Type ID.
-pub fn parse_typed_container(data: &[u8]) -> TypedContainerResult {
+pub fn parse_typed_container(data: &[u8]) -> Result<(u32, Vec<ChunkElement>)> {
     if data.len() < 5 {
-        return Err("Data is too short to be a typed container.".into());
+        bail!("Data is too short to be a typed container.");
     }
 
     let mut cur = Cursor::new(&data[0..4]);
-    let type_id = cur.read_u32::<LittleEndian>().unwrap();
+    let type_id = cur.read_u32::<LittleEndian>()?;
 
     let payload = &data[4..];
     let control_byte = payload[0];
@@ -158,21 +155,21 @@ pub fn parse_typed_container(data: &[u8]) -> TypedContainerResult {
     let mut large_count = 0;
     if has_large {
         if pos + 4 > payload.len() {
-            return Err("Corrupted container table.".into());
+            bail!("Corrupted container table.");
         }
         let mut c = Cursor::new(&payload[pos..pos + 4]);
-        large_count = c.read_u32::<LittleEndian>().unwrap() as usize;
+        large_count = c.read_u32::<LittleEndian>()? as usize;
         pos += 4;
     }
 
     let total_entries = small_count + large_count;
     if total_entries == 0 || total_entries > 4096 {
-        return Err("Invalid entry count in typed container.".into());
+        bail!("Invalid entry count in typed container.");
     }
 
     let table_size = (small_count * 2) + (large_count * 8);
     if pos + table_size > payload.len() {
-        return Err("Table offsets exceed chunk boundaries.".into());
+        bail!("Table offsets exceed chunk boundaries.");
     }
 
     let data_start = pos + table_size;
@@ -180,18 +177,18 @@ pub fn parse_typed_container(data: &[u8]) -> TypedContainerResult {
 
     let mut offsets = Vec::new();
     for _ in 0..small_count {
-        offsets.push((c.read_u8().unwrap() as u32, c.read_u8().unwrap() as usize));
+        offsets.push((c.read_u8()? as u32, c.read_u8()? as usize));
     }
     for _ in 0..large_count {
         offsets.push((
-            c.read_u32::<LittleEndian>().unwrap(),
-            c.read_u32::<LittleEndian>().unwrap() as usize,
+            c.read_u32::<LittleEndian>()?,
+            c.read_u32::<LittleEndian>()? as usize,
         ));
     }
     offsets.sort_by_key(|&(_, off)| off);
 
     if offsets.is_empty() || offsets[0].1 != 0 {
-        return Err("First table offset is not zero.".into());
+        bail!("First table offset is not zero.");
     }
 
     let mut elements = Vec::new();
@@ -212,7 +209,6 @@ pub fn parse_typed_container(data: &[u8]) -> TypedContainerResult {
     Ok((type_id, elements))
 }
 
-/// Rebuilds a typed container prepending the original 4-byte Type ID.
 pub fn build_typed_container(type_id: u32, elements: &[ChunkElement]) -> Vec<u8> {
     let mut out = Vec::new();
     out.write_u32::<LittleEndian>(type_id).unwrap();

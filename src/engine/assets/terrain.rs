@@ -1,4 +1,6 @@
 use super::parse_chunk_elements;
+use crate::engine::common::chunk_id;
+use anyhow::{Context, Result, bail};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use serde_json::json;
 use std::io::Cursor;
@@ -36,41 +38,37 @@ impl TerrainPoint {
     }
 }
 
-/// Exports the terrain heightmap to Binary glTF 2.0 (.glb) with Vertex Colors (COLOR_0).
-/// Red = Main Texture, Green = Foliage/Grass, Blue = Cliff/Rock.
-pub fn export_terrain_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, usize, usize), String> {
+pub fn export_terrain_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, usize, usize)> {
     let (_, elements) = parse_chunk_elements(chunk_data)?;
 
     let width_bytes = elements
         .iter()
-        .find(|(id, _)| *id == 30)
+        .find(|(id, _)| *id == chunk_id::WIDTH)
         .map(|(_, d)| d)
-        .ok_or("Missing Width ID 30")?;
+        .context("Missing Width ID 30")?;
     let height_bytes = elements
         .iter()
-        .find(|(id, _)| *id == 31)
+        .find(|(id, _)| *id == chunk_id::HEIGHT)
         .map(|(_, d)| d)
-        .ok_or("Missing Height ID 31")?;
+        .context("Missing Height ID 31")?;
     let raw_points = elements
         .iter()
         .find(|(id, _)| *id == 33)
         .map(|(_, d)| d)
-        .ok_or("Missing TerrainPoints ID 33")?;
+        .context("Missing TerrainPoints ID 33")?;
 
-    let width = Cursor::new(width_bytes).read_u32::<LittleEndian>().unwrap() as usize;
-    let height = Cursor::new(height_bytes)
-        .read_u32::<LittleEndian>()
-        .unwrap() as usize;
+    let width = Cursor::new(width_bytes).read_u32::<LittleEndian>()? as usize;
+    let height = Cursor::new(height_bytes).read_u32::<LittleEndian>()? as usize;
 
     let mut points = Vec::with_capacity(width * height);
     let mut cur = Cursor::new(raw_points);
     while (cur.position() as usize) + 4 <= raw_points.len() {
-        let raw = cur.read_u32::<LittleEndian>().unwrap();
+        let raw = cur.read_u32::<LittleEndian>()?;
         points.push(TerrainPoint::from_u32(raw));
     }
 
     if points.len() < width * height {
-        return Err("Point count does not match grid dimensions.".into());
+        bail!("Point count does not match grid dimensions.");
     }
 
     let vertex_count = width * height;
@@ -81,7 +79,6 @@ pub fn export_terrain_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, usize, usize
 
     let mut bin_data = Vec::new();
 
-    // 1. Indices (COMPONENT_TYPE 5125 = UNSIGNED_INT for high-density grids)
     let indices_offset = bin_data.len();
     let mut index_count = 0;
     for y in 0..(height - 1) {
@@ -91,13 +88,13 @@ pub fn export_terrain_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, usize, usize
             let p3 = ((y + 1) * width + x) as u32;
             let p4 = ((y + 1) * width + (x + 1)) as u32;
 
-            bin_data.write_u32::<LittleEndian>(p1).unwrap();
-            bin_data.write_u32::<LittleEndian>(p3).unwrap();
-            bin_data.write_u32::<LittleEndian>(p2).unwrap();
+            bin_data.write_u32::<LittleEndian>(p1)?;
+            bin_data.write_u32::<LittleEndian>(p3)?;
+            bin_data.write_u32::<LittleEndian>(p2)?;
 
-            bin_data.write_u32::<LittleEndian>(p2).unwrap();
-            bin_data.write_u32::<LittleEndian>(p3).unwrap();
-            bin_data.write_u32::<LittleEndian>(p4).unwrap();
+            bin_data.write_u32::<LittleEndian>(p2)?;
+            bin_data.write_u32::<LittleEndian>(p3)?;
+            bin_data.write_u32::<LittleEndian>(p4)?;
 
             index_count += 6;
         }
@@ -107,7 +104,6 @@ pub fn export_terrain_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, usize, usize
     }
     let indices_length = index_count * 4;
 
-    // 2. Positions (VEC3 FLOAT)
     let pos_offset = bin_data.len();
     for y in 0..height {
         for x in 0..width {
@@ -123,23 +119,22 @@ pub fn export_terrain_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, usize, usize
             max_pos[1] = max_pos[1].max(py);
             max_pos[2] = max_pos[2].max(pz);
 
-            bin_data.write_f32::<LittleEndian>(px).unwrap();
-            bin_data.write_f32::<LittleEndian>(py).unwrap();
-            bin_data.write_f32::<LittleEndian>(pz).unwrap();
+            bin_data.write_f32::<LittleEndian>(px)?;
+            bin_data.write_f32::<LittleEndian>(py)?;
+            bin_data.write_f32::<LittleEndian>(pz)?;
         }
     }
     let pos_length = vertex_count * 12;
 
-    // 3. Vertex Colors COLOR_0 (VEC3 FLOAT: Red=Main, Green=Foliage, Blue=Cliff)
     let col_offset = bin_data.len();
     for pt in &points {
         let r = pt.main_texture_idx as f32 / 15.0;
         let g = pt.foliage_value as f32 / 15.0;
         let b = pt.cliff_texture_idx as f32 / 15.0;
 
-        bin_data.write_f32::<LittleEndian>(r).unwrap();
-        bin_data.write_f32::<LittleEndian>(g).unwrap();
-        bin_data.write_f32::<LittleEndian>(b).unwrap();
+        bin_data.write_f32::<LittleEndian>(r)?;
+        bin_data.write_f32::<LittleEndian>(g)?;
+        bin_data.write_f32::<LittleEndian>(b)?;
     }
     let col_length = vertex_count * 12;
 
@@ -179,7 +174,7 @@ pub fn export_terrain_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, usize, usize
         ]
     });
 
-    let mut json_bytes = serde_json::to_vec(&gltf_json).unwrap();
+    let mut json_bytes = serde_json::to_vec(&gltf_json)?;
     while !json_bytes.len().is_multiple_of(4) {
         json_bytes.push(b' ');
     }
@@ -188,55 +183,51 @@ pub fn export_terrain_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, usize, usize
     let mut glb = Vec::with_capacity(total_length);
 
     glb.extend_from_slice(b"glTF");
-    glb.write_u32::<LittleEndian>(2).unwrap();
-    glb.write_u32::<LittleEndian>(total_length as u32).unwrap();
+    glb.write_u32::<LittleEndian>(2)?;
+    glb.write_u32::<LittleEndian>(total_length as u32)?;
 
-    glb.write_u32::<LittleEndian>(json_bytes.len() as u32)
-        .unwrap();
+    glb.write_u32::<LittleEndian>(json_bytes.len() as u32)?;
     glb.extend_from_slice(b"JSON");
     glb.extend_from_slice(&json_bytes);
 
-    glb.write_u32::<LittleEndian>(bin_data.len() as u32)
-        .unwrap();
+    glb.write_u32::<LittleEndian>(bin_data.len() as u32)?;
     glb.extend_from_slice(b"BIN\0");
     glb.extend_from_slice(&bin_data);
 
     Ok((glb, vertex_count, index_count / 3))
 }
 
-pub fn export_terrain_to_obj(chunk_data: &[u8]) -> Result<String, String> {
+pub fn export_terrain_to_obj(chunk_data: &[u8]) -> Result<String> {
     let (_, elements) = parse_chunk_elements(chunk_data)?;
 
     let width_bytes = elements
         .iter()
-        .find(|(id, _)| *id == 30)
+        .find(|(id, _)| *id == chunk_id::WIDTH)
         .map(|(_, d)| d)
-        .ok_or("Missing Width ID 30")?;
+        .context("Missing Width ID 30")?;
     let height_bytes = elements
         .iter()
-        .find(|(id, _)| *id == 31)
+        .find(|(id, _)| *id == chunk_id::HEIGHT)
         .map(|(_, d)| d)
-        .ok_or("Missing Height ID 31")?;
+        .context("Missing Height ID 31")?;
     let raw_points = elements
         .iter()
         .find(|(id, _)| *id == 33)
         .map(|(_, d)| d)
-        .ok_or("Missing TerrainPoints ID 33")?;
+        .context("Missing TerrainPoints ID 33")?;
 
-    let width = Cursor::new(width_bytes).read_u32::<LittleEndian>().unwrap() as usize;
-    let height = Cursor::new(height_bytes)
-        .read_u32::<LittleEndian>()
-        .unwrap() as usize;
+    let width = Cursor::new(width_bytes).read_u32::<LittleEndian>()? as usize;
+    let height = Cursor::new(height_bytes).read_u32::<LittleEndian>()? as usize;
 
     let mut points = Vec::with_capacity(width * height);
     let mut cur = Cursor::new(raw_points);
     while (cur.position() as usize) + 4 <= raw_points.len() {
-        let raw = cur.read_u32::<LittleEndian>().unwrap();
+        let raw = cur.read_u32::<LittleEndian>()?;
         points.push(TerrainPoint::from_u32(raw));
     }
 
     if points.len() < width * height {
-        return Err("Point count does not match grid dimensions.".into());
+        bail!("Point count does not match grid dimensions.");
     }
 
     let mut obj = String::new();

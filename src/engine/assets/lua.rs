@@ -1,10 +1,11 @@
 use super::{build_chunk_from_elements, parse_chunk_elements};
+use anyhow::{Result, bail};
 use byteorder::{LittleEndian, ReadBytesExt};
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 
 pub const LUA_MAGIC: &[u8; 4] = b"\x1bLua";
-pub const LUA_VERSION_50: u8 = 0x50; // ASCII 'P' = Lua 5.0
+pub const LUA_VERSION_50: u8 = 0x50;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LuaInfo {
@@ -60,30 +61,26 @@ pub enum LuaConstant {
     String(String),
 }
 
-/// Verifies whether the bytecode was compiled specifically for Lua 5.0.2 (PUC-Rio, 32-bit LE).
-pub fn validate_lua_50_header(bytecode: &[u8]) -> Result<(), String> {
+pub fn validate_lua_50_header(bytecode: &[u8]) -> Result<()> {
     if bytecode.len() < 12 {
-        return Err("Bytecode is too short to be valid Lua.".into());
+        bail!("Bytecode is too short to be valid Lua.");
     }
     if &bytecode[0..4] != LUA_MAGIC {
-        return Err("Missing '\\x1bLua' signature. Engine requires compiled bytecode.".into());
+        bail!("Missing '\\x1bLua' signature. Engine requires compiled bytecode.");
     }
     if bytecode[4] != LUA_VERSION_50 {
-        return Err(format!(
+        bail!(
             "Incompatible Lua version (0x{:02X}). Overlord requires Lua 5.0.2 (0x50).",
             bytecode[4]
-        ));
+        );
     }
     if bytecode[6] != 1 || bytecode[7] != 4 || bytecode[8] != 4 || bytecode[11] != 8 {
-        return Err(
-            "Lua VM type sizes mismatch. Must be 32-bit Little-Endian with double Number.".into(),
-        );
+        bail!("Lua VM type sizes mismatch. Must be 32-bit Little-Endian with double Number.");
     }
     Ok(())
 }
 
-/// Disassembles Lua 5.0.2 bytecode into formatted, readable assembly text.
-pub fn disassemble_lua_bytecode(bytecode: &[u8]) -> Result<String, String> {
+pub fn disassemble_lua_bytecode(bytecode: &[u8]) -> Result<String> {
     validate_lua_50_header(bytecode)?;
 
     let mut cur = Cursor::new(&bytecode[12..]);
@@ -98,15 +95,15 @@ pub fn disassemble_lua_bytecode(bytecode: &[u8]) -> Result<String, String> {
     Ok(out)
 }
 
-fn read_lua_string(cur: &mut Cursor<&[u8]>) -> Result<Option<String>, String> {
-    let len = cur.read_u32::<LittleEndian>().map_err(|e| e.to_string())? as usize;
+fn read_lua_string(cur: &mut Cursor<&[u8]>) -> Result<Option<String>> {
+    let len = cur.read_u32::<LittleEndian>()? as usize;
     if len == 0 {
         return Ok(None);
     }
     let pos = cur.position() as usize;
     let data = cur.get_ref();
     if pos + len > data.len() {
-        return Err("Unexpected EOF while reading string".into());
+        bail!("Unexpected EOF while reading string");
     }
     let s = String::from_utf8_lossy(&data[pos..pos + len])
         .trim_matches(char::from(0))
@@ -119,48 +116,46 @@ fn disassemble_function_prototype(
     cur: &mut Cursor<&[u8]>,
     out: &mut String,
     level: usize,
-) -> Result<(), String> {
+) -> Result<()> {
     let indent = "  ".repeat(level);
 
     let source = read_lua_string(cur)?.unwrap_or_else(|| "N/A".into());
-    let line_defined = cur.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
-    let num_params = cur.read_u8().map_err(|e| e.to_string())?;
-    let is_vararg = cur.read_u8().map_err(|e| e.to_string())?;
-    let max_stack = cur.read_u8().map_err(|e| e.to_string())?;
+    let line_defined = cur.read_u32::<LittleEndian>()?;
+    let num_params = cur.read_u8()?;
+    let is_vararg = cur.read_u8()?;
+    let max_stack = cur.read_u8()?;
 
     out.push_str(&format!(
         "\n{indent}; Source: {}\n{indent}; Line: {} | Params: {} | Vararg: {} | MaxStack: {}\n",
         source, line_defined, num_params, is_vararg, max_stack
     ));
 
-    // Lines array
-    let num_lines = cur.read_u32::<LittleEndian>().map_err(|e| e.to_string())? as usize;
+    let num_lines = cur.read_u32::<LittleEndian>()? as usize;
     for _ in 0..num_lines {
-        let _ = cur.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
+        let _ = cur.read_u32::<LittleEndian>()?;
     }
 
-    // Constants
-    let num_constants = cur.read_u32::<LittleEndian>().map_err(|e| e.to_string())? as usize;
+    let num_constants = cur.read_u32::<LittleEndian>()? as usize;
     let mut constants = Vec::with_capacity(num_constants);
 
     out.push_str(&format!("{indent}.constants ({})\n", num_constants));
     for i in 0..num_constants {
-        let k_type = cur.read_u8().map_err(|e| e.to_string())?;
+        let k_type = cur.read_u8()?;
         let c = match k_type {
             0 => LuaConstant::Nil,
             1 => {
-                let b = cur.read_u8().map_err(|e| e.to_string())?;
+                let b = cur.read_u8()?;
                 LuaConstant::Bool(b != 0)
             }
             3 => {
-                let num = cur.read_f64::<LittleEndian>().map_err(|e| e.to_string())?;
+                let num = cur.read_f64::<LittleEndian>()?;
                 LuaConstant::Number(num)
             }
             4 => {
                 let s = read_lua_string(cur)?.unwrap_or_default();
                 LuaConstant::String(s)
             }
-            _ => return Err(format!("Unknown constant type tag: {}", k_type)),
+            _ => bail!("Unknown constant type tag: {}", k_type),
         };
 
         match &c {
@@ -172,8 +167,7 @@ fn disassemble_function_prototype(
         constants.push(c);
     }
 
-    // Code instructions
-    let num_code = cur.read_u32::<LittleEndian>().map_err(|e| e.to_string())? as usize;
+    let num_code = cur.read_u32::<LittleEndian>()? as usize;
     out.push_str(&format!("{indent}.code ({} instructions)\n", num_code));
 
     let fmt_rk = |val: usize, ksts: &[LuaConstant]| -> String {
@@ -195,7 +189,7 @@ fn disassemble_function_prototype(
     };
 
     for pc in 0..num_code {
-        let inst = cur.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
+        let inst = cur.read_u32::<LittleEndian>()?;
 
         let opcode = (inst & 0x3F) as usize;
         let a = ((inst >> 6) & 0xFF) as usize;
@@ -300,8 +294,7 @@ fn disassemble_function_prototype(
         ));
     }
 
-    // Nested function prototypes
-    let num_nested = cur.read_u32::<LittleEndian>().map_err(|e| e.to_string())? as usize;
+    let num_nested = cur.read_u32::<LittleEndian>()? as usize;
     for i in 0..num_nested {
         out.push_str(&format!(
             "{indent}; --- Nested Closure Prototype [{}] ---\n",
@@ -313,15 +306,14 @@ fn disassemble_function_prototype(
     Ok(())
 }
 
-/// Inspects compiled bytecode and pulls out metadata along with embedded string constants.
-pub fn inspect_lua_bytecode(bytecode: &[u8]) -> Result<LuaInfo, String> {
+pub fn inspect_lua_bytecode(bytecode: &[u8]) -> Result<LuaInfo> {
     validate_lua_50_header(bytecode)?;
 
     let mut script_name = None;
     let mut string_constants = Vec::new();
 
     if bytecode.len() >= 16 {
-        let name_len = u32::from_le_bytes(bytecode[12..16].try_into().unwrap()) as usize;
+        let name_len = u32::from_le_bytes(bytecode[12..16].try_into()?) as usize;
         if name_len > 0
             && 16 + name_len <= bytecode.len()
             && let Ok(s) = std::str::from_utf8(&bytecode[16..16 + name_len])
@@ -332,7 +324,7 @@ pub fn inspect_lua_bytecode(bytecode: &[u8]) -> Result<LuaInfo, String> {
 
     let mut i = 12;
     while i + 8 <= bytecode.len() {
-        let len = u32::from_le_bytes(bytecode[i..i + 4].try_into().unwrap()) as usize;
+        let len = u32::from_le_bytes(bytecode[i..i + 4].try_into()?) as usize;
         if (3..=100).contains(&len)
             && i + 4 + len <= bytecode.len()
             && let slice = &bytecode[i + 4..i + 4 + len]
@@ -355,7 +347,7 @@ pub fn inspect_lua_bytecode(bytecode: &[u8]) -> Result<LuaInfo, String> {
     })
 }
 
-pub fn extract_lua_bytecode(chunk_data: &[u8]) -> Result<Vec<u8>, String> {
+pub fn extract_lua_bytecode(chunk_data: &[u8]) -> Result<Vec<u8>> {
     if chunk_data.starts_with(LUA_MAGIC) {
         validate_lua_50_header(chunk_data)?;
         return Ok(chunk_data.to_vec());
@@ -374,10 +366,10 @@ pub fn extract_lua_bytecode(chunk_data: &[u8]) -> Result<Vec<u8>, String> {
         return Ok(raw.to_vec());
     }
 
-    Err("No valid Lua 5.0.2 bytecode found in this chunk.".into())
+    bail!("No valid Lua 5.0.2 bytecode found in this chunk.")
 }
 
-pub fn replace_lua_bytecode(chunk_data: &[u8], new_bytecode: &[u8]) -> Result<Vec<u8>, String> {
+pub fn replace_lua_bytecode(chunk_data: &[u8], new_bytecode: &[u8]) -> Result<Vec<u8>> {
     validate_lua_50_header(new_bytecode)?;
 
     if chunk_data.starts_with(LUA_MAGIC) {

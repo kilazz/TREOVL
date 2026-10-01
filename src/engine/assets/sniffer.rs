@@ -1,3 +1,4 @@
+use crate::engine::common::magic;
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::io::Cursor;
 
@@ -36,49 +37,65 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
         };
     }
 
-    let magic = &data[0..4];
+    let magic_bytes = &data[0..4];
 
-    // 1. High-Level Signature Check
-    let (kind, kind_name, icon) = match magic {
-        b"\x3D\x00\x41\x00" => (AssetKind::Texture, "Texture (DDS)", "🎨"),
-        b"\x99\x00\x41\x00" => (AssetKind::Texture, "Cubemap (DDS)", "🌐"),
-        b"\x98\x00\x41\x00" => (AssetKind::Texture, "Interface Image (TGA)", "🖼️"),
-        b"\x00\x00\xA1\x00" => (AssetKind::Audio, "Sound / Voice (WAV)", "🎵"),
-        b"\x35\x00\x41\x00" => (AssetKind::Mesh, "3D Mesh Geometry", "🗿"),
-        b"\x05\x00\x41\x00" => (AssetKind::Animation, "Skeletal Animation", "🎬"),
-        b"\x4B\x00\x41\x00" => (AssetKind::Object, "Object Entity", "🧊"),
-        b"\xB0\x00\x00\x04" | b"\x04\x00\x00\xB0" => {
-            (AssetKind::Event, "Animation Sound Event", "👣")
-        }
-        b"\x1bLua" => (AssetKind::Lua, "Lua 5.0 Bytecode", "📜"),
-        b"RIFF" => (AssetKind::Audio, "Raw WAV Audio", "🎵"),
-        b"DDS " => (AssetKind::Texture, "Raw DDS Texture", "🎨"),
-        // Materials Type 1 through 13 & Overlord 2 PBR
-        b"\x08\x06\x41\x00" | b"\x0A\x06\x41\x00" | b"\x0F\x06\x41\x00" | b"\x12\x06\x41\x00"
-        | b"\x16\x06\x41\x00" | b"\x1B\x06\x41\x00" | b"\x20\x06\x41\x00" | b"\x24\x06\x41\x00"
-        | b"\x26\x06\x41\x00" | b"\x28\x06\x41\x00" | b"\x2A\x06\x41\x00" | b"\x32\x06\x41\x00"
-        | b"\x36\x06\x41\x00" => (AssetKind::Material, "Shader Material", "🛠️"),
-        _ => {
-            // Check for Character AI / FaceFX / Behavior Containers (e.g. chunk_0037, chunk_0038)
-            if data.windows(4).any(|w| w == b"FACE")
-                || data.windows(8).any(|w| w == b"Triumph ")
-                || data.windows(6).any(|w| w == b"--Drop")
-            {
-                (AssetKind::Behavior, "Character AI & FaceFX", "🧠")
-            } else if data.windows(5).any(|w| w == b"Plate")
-                || data.windows(11).any(|w| w == b"plate_metal")
-            {
-                (AssetKind::Attachment, "Item Attachment Slot", "🍽️")
-            } else if data.windows(5).any(|w| w == b"<?xml") {
-                (AssetKind::Xml, "XML Document", "📋")
-            } else if data.windows(4).any(|w| w == b"\x24\x00\x41\x00") {
-                (AssetKind::Texture, "Texture (MipMap)", "🎨")
-            } else if data.len() <= 64 {
-                (AssetKind::Parameter, "Engine Parameter", "⚙️")
-            } else {
-                (AssetKind::Generic, "Binary Chunk", "📦")
-            }
-        }
+    // 1. High-Level Signature Check using centralized engine::common::magic
+    let (kind, kind_name, icon) = if magic_bytes == magic::TEX_3D {
+        (AssetKind::Texture, "Texture (DDS)", "🎨")
+    } else if magic_bytes == magic::TEX_CUBEMAP {
+        (AssetKind::Texture, "Cubemap (DDS)", "🌐")
+    } else if magic_bytes == magic::TEX_INTERFACE {
+        (AssetKind::Texture, "Interface Image (TGA)", "🖼️")
+    } else if magic_bytes == magic::AUDIO_WAV {
+        (AssetKind::Audio, "Sound / Voice (WAV)", "🎵")
+    } else if magic_bytes == magic::MESH {
+        (AssetKind::Mesh, "3D Mesh Geometry", "🗿")
+    } else if magic_bytes == magic::ANIM_CLIP {
+        (AssetKind::Animation, "Skeletal Animation", "🎬")
+    } else if magic_bytes == magic::OBJECT {
+        (AssetKind::Object, "Object Entity", "🧊")
+    } else if magic_bytes == magic::EVENT || magic_bytes == b"\x04\x00\x00\xB0" {
+        (AssetKind::Event, "Animation Sound Event", "👣")
+    } else if magic_bytes == magic::LUA {
+        (AssetKind::Lua, "Lua 5.0 Bytecode", "📜")
+    } else if magic_bytes == b"RIFF" {
+        (AssetKind::Audio, "Raw WAV Audio", "🎵")
+    } else if magic_bytes == b"DDS " {
+        (AssetKind::Texture, "Raw DDS Texture", "🎨")
+    } else if matches!(
+        magic_bytes,
+        b"\x08\x06\x41\x00"
+            | b"\x0A\x06\x41\x00"
+            | b"\x0F\x06\x41\x00"
+            | b"\x12\x06\x41\x00"
+            | b"\x16\x06\x41\x00"
+            | b"\x1B\x06\x41\x00"
+            | b"\x20\x06\x41\x00"
+            | b"\x24\x06\x41\x00"
+            | b"\x26\x06\x41\x00"
+            | b"\x28\x06\x41\x00"
+            | b"\x2A\x06\x41\x00"
+            | b"\x32\x06\x41\x00"
+            | b"\x36\x06\x41\x00"
+    ) {
+        (AssetKind::Material, "Shader Material", "🛠️")
+    } else if data.windows(4).any(|w| w == b"FACE")
+        || data.windows(8).any(|w| w == b"Triumph ")
+        || data.windows(6).any(|w| w == b"--Drop")
+    {
+        (AssetKind::Behavior, "Character AI & FaceFX", "🧠")
+    } else if data.windows(5).any(|w| w == b"Plate")
+        || data.windows(11).any(|w| w == b"plate_metal")
+    {
+        (AssetKind::Attachment, "Item Attachment Slot", "🍽️")
+    } else if data.windows(5).any(|w| w == b"<?xml") {
+        (AssetKind::Xml, "XML Document", "📋")
+    } else if data.windows(4).any(|w| w == magic::TEX_MIPMAP) {
+        (AssetKind::Texture, "Texture (MipMap)", "🎨")
+    } else if data.len() <= 64 {
+        (AssetKind::Parameter, "Engine Parameter", "⚙️")
+    } else {
+        (AssetKind::Generic, "Binary Chunk", "📦")
     };
 
     let extracted_name = extract_internal_strings(data);

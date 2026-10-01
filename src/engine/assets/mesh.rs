@@ -1,13 +1,17 @@
+use anyhow::{Context, Result, bail};
+use binrw::BinReaderExt;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use serde_json::json;
 use std::collections::HashMap;
 use std::io::Cursor;
 
-use super::animation::ObjectBone;
+use super::animation::{ObjectBone, parse_object_bone_container};
 use super::{
     build_chunk_from_elements, build_typed_container, parse_chunk_elements, parse_typed_container,
 };
+use crate::engine::common::{chunk_id, magic};
 use crate::engine::math::{Vector2, Vector3};
+use crate::utils::gltf_builder::GltfBuilder;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum VertexSemantic {
@@ -74,30 +78,38 @@ struct ParsedMeshData {
     stride: usize,
 }
 
-fn extract_mesh_geometry(chunk_data: &[u8]) -> Result<ParsedMeshData, String> {
+fn extract_mesh_geometry(chunk_data: &[u8]) -> Result<ParsedMeshData> {
     let mut bones = Vec::new();
 
-    // Check for ObjectBone container (ID 33 or 144-byte aligned blocks)
     if let Ok((_, elements)) = parse_chunk_elements(chunk_data) {
         for (id, chunk) in elements {
-            if (id == 33 || id == 22) && chunk.len() >= 144 && chunk.len().is_multiple_of(144) {
-                let mut c = Cursor::new(chunk.as_slice());
-                while (c.position() as usize) + 144 <= chunk.len() {
-                    if let Ok(bone) = ObjectBone::read(&mut c) {
-                        bones.push(bone);
+            if (id == chunk_id::OBJECT_BONES || id == chunk_id::DATA_BLOB)
+                && chunk.len() >= 144
+                && chunk.len().is_multiple_of(144)
+            {
+                if let Ok(parsed_bones) = parse_object_bone_container(&chunk) {
+                    bones = parsed_bones;
+                } else {
+                    let mut c = Cursor::new(chunk.as_slice());
+                    while (c.position() as usize) + 144 <= chunk.len() {
+                        if let Ok(bone) = c.read_le::<ObjectBone>() {
+                            bones.push(bone);
+                        } else {
+                            break;
+                        }
                     }
                 }
             }
         }
     }
 
-    let mesh_data_bytes = if chunk_data.len() > 4 && &chunk_data[0..4] == b"\x35\x00\x41\x00" {
+    let mesh_data_bytes = if chunk_data.starts_with(magic::MESH) {
         let (_, elements) = parse_typed_container(chunk_data)?;
         elements
             .into_iter()
-            .find(|(id, _)| *id == 1)
+            .find(|(id, _)| *id == chunk_id::SUB_CONTAINER)
             .map(|(_, data)| data)
-            .ok_or("MeshAsset container is missing element ID 1 (MeshData)".to_string())?
+            .context("MeshAsset container is missing element ID 1 (MeshData)")?
     } else {
         chunk_data.to_vec()
     };
@@ -106,60 +118,60 @@ fn extract_mesh_geometry(chunk_data: &[u8]) -> Result<ParsedMeshData, String> {
 
     let indice_chunk = sub_elements
         .iter()
-        .find(|(id, _)| *id == 10)
+        .find(|(id, _)| *id == chunk_id::INDEX_DATA)
         .map(|(_, data)| data)
-        .ok_or("Missing ID 10 (IndiceData)")?;
+        .context("Missing ID 10 (IndiceData)")?;
 
     let vertex_chunk = sub_elements
         .iter()
-        .find(|(id, _)| *id == 11)
+        .find(|(id, _)| *id == chunk_id::VERTEX_DATA)
         .map(|(_, data)| data)
-        .ok_or("Missing ID 11 (VertexBuffer)")?;
+        .context("Missing ID 11 (VertexBuffer)")?;
 
     let (_, indice_elements) = parse_chunk_elements(indice_chunk)?;
     let raw_indices = indice_elements
         .iter()
-        .find(|(id, _)| *id == 22)
+        .find(|(id, _)| *id == chunk_id::DATA_BLOB)
         .map(|(_, data)| data)
-        .ok_or("Missing index buffer blob ID 22")?;
+        .context("Missing index buffer blob ID 22")?;
 
     let mut indices = Vec::new();
     let mut cur_ind = Cursor::new(raw_indices);
     while (cur_ind.position() as usize) + 2 <= raw_indices.len() {
-        indices.push(cur_ind.read_u16::<LittleEndian>().unwrap());
+        indices.push(cur_ind.read_u16::<LittleEndian>()?);
     }
 
     let (_, vbuf_elements) = parse_chunk_elements(vertex_chunk)?;
     let info_chunk = vbuf_elements
         .iter()
-        .find(|(id, _)| *id == 20)
+        .find(|(id, _)| *id == chunk_id::TAG_STRING)
         .map(|(_, data)| data)
-        .ok_or("Missing VertexBufferInfo ID 20")?;
+        .context("Missing VertexBufferInfo ID 20")?;
 
     let raw_vertices = vbuf_elements
         .iter()
-        .find(|(id, _)| *id == 22)
+        .find(|(id, _)| *id == chunk_id::DATA_BLOB)
         .map(|(_, data)| data)
-        .ok_or("Missing vertex buffer blob ID 22")?;
+        .context("Missing vertex buffer blob ID 22")?;
 
     let (_, info_elements) = parse_chunk_elements(info_chunk)?;
     let stride_data = info_elements
         .iter()
-        .find(|(id, _)| *id == 21)
+        .find(|(id, _)| *id == chunk_id::NAME_STRING)
         .map(|(_, data)| data)
-        .ok_or("Missing Stride ID 21")?;
-    let stride = Cursor::new(stride_data).read_u32::<LittleEndian>().unwrap() as usize;
+        .context("Missing Stride ID 21")?;
+    let stride = Cursor::new(stride_data).read_u32::<LittleEndian>()? as usize;
 
     let decl_data = info_elements
         .iter()
-        .find(|(id, _)| *id == 23)
+        .find(|(id, _)| *id == chunk_id::FORMAT)
         .map(|(_, data)| data)
-        .ok_or("Missing Attribute Descriptor Table ID 23")?;
+        .context("Missing Attribute Descriptor Table ID 23")?;
 
     let mut cur_decl = Cursor::new(decl_data);
     let mut attributes = Vec::new();
     while (cur_decl.position() as usize) + 4 <= decl_data.len() {
-        let desc = cur_decl.read_u32::<LittleEndian>().unwrap();
+        let desc = cur_decl.read_u32::<LittleEndian>()?;
         attributes.push(VertexAttribute::from_descriptor(desc));
     }
 
@@ -213,8 +225,7 @@ fn extract_mesh_geometry(chunk_data: &[u8]) -> Result<ParsedMeshData, String> {
     })
 }
 
-/// Exports an Overlord 3D mesh chunk into self-contained Binary glTF 2.0 (.glb) format with Armature.
-pub fn export_mesh_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, MeshStats), String> {
+pub fn export_mesh_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, MeshStats)> {
     let parsed = extract_mesh_geometry(chunk_data)?;
     let vertex_count = parsed.positions.len();
 
@@ -235,126 +246,81 @@ pub fn export_mesh_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, MeshStats), Str
         max_pos = [0.0, 0.0, 0.0];
     }
 
-    let mut bin_data = Vec::new();
+    let mut builder = GltfBuilder::new();
 
-    // 1. Indices
-    let indices_offset = bin_data.len();
-    for &idx in &parsed.indices {
-        bin_data.write_u16::<LittleEndian>(idx).unwrap();
+    let mut ind_bytes = Vec::with_capacity(parsed.indices.len() * 2);
+    for idx in &parsed.indices {
+        ind_bytes.write_u16::<LittleEndian>(*idx)?;
     }
-    while !bin_data.len().is_multiple_of(4) {
-        bin_data.push(0);
-    }
-    let indices_length = parsed.indices.len() * 2;
+    let ind_view = builder.add_buffer_view(&ind_bytes, Some(34963));
 
-    // 2. Positions
-    let pos_offset = bin_data.len();
+    let mut pos_bytes = Vec::with_capacity(vertex_count * 12);
     for p in &parsed.positions {
-        bin_data.write_f32::<LittleEndian>(p.x).unwrap();
-        bin_data.write_f32::<LittleEndian>(p.y).unwrap();
-        bin_data.write_f32::<LittleEndian>(p.z).unwrap();
+        pos_bytes.write_f32::<LittleEndian>(p.x)?;
+        pos_bytes.write_f32::<LittleEndian>(p.y)?;
+        pos_bytes.write_f32::<LittleEndian>(p.z)?;
     }
-    let pos_length = vertex_count * 12;
+    let pos_view = builder.add_buffer_view(&pos_bytes, Some(34962));
 
-    // 3. Normals
-    let norm_offset = bin_data.len();
+    let mut norm_bytes = Vec::with_capacity(vertex_count * 12);
     for n in &parsed.normals {
-        bin_data.write_f32::<LittleEndian>(n.x).unwrap();
-        bin_data.write_f32::<LittleEndian>(n.y).unwrap();
-        bin_data.write_f32::<LittleEndian>(n.z).unwrap();
+        norm_bytes.write_f32::<LittleEndian>(n.x)?;
+        norm_bytes.write_f32::<LittleEndian>(n.y)?;
+        norm_bytes.write_f32::<LittleEndian>(n.z)?;
     }
-    let norm_length = vertex_count * 12;
+    let norm_view = builder.add_buffer_view(&norm_bytes, Some(34962));
 
-    // 4. UVs
-    let uv_offset = bin_data.len();
+    let mut uv_bytes = Vec::with_capacity(vertex_count * 8);
     for uv in &parsed.uvs {
-        bin_data.write_f32::<LittleEndian>(uv.x).unwrap();
-        bin_data.write_f32::<LittleEndian>(uv.y).unwrap();
+        uv_bytes.write_f32::<LittleEndian>(uv.x)?;
+        uv_bytes.write_f32::<LittleEndian>(uv.y)?;
     }
-    let uv_length = vertex_count * 8;
+    let uv_view = builder.add_buffer_view(&uv_bytes, Some(34962));
 
-    while !bin_data.len().is_multiple_of(4) {
-        bin_data.push(0);
-    }
+    let ind_acc = builder.add_accessor(ind_view, parsed.indices.len(), 5123, "SCALAR", None, None);
+    let pos_acc = builder.add_accessor(
+        pos_view,
+        vertex_count,
+        5126,
+        "VEC3",
+        Some(min_pos.to_vec()),
+        Some(max_pos.to_vec()),
+    );
+    let norm_acc = builder.add_accessor(norm_view, vertex_count, 5126, "VEC3", None, None);
+    let uv_acc = builder.add_accessor(uv_view, vertex_count, 5126, "VEC2", None, None);
 
-    // Build glTF Nodes (Mesh Node + Bone Nodes)
-    let mut nodes = Vec::new();
-    let mut scene_nodes = vec![0];
-
-    // Node 0: Main Mesh
-    nodes.push(json!({
-        "name": "OverlordMesh",
-        "mesh": 0
+    let mesh_idx = builder.add_mesh(json!({
+        "name": "Mesh_0",
+        "primitives": [{
+            "attributes": {
+                "POSITION": pos_acc,
+                "NORMAL": norm_acc,
+                "TEXCOORD_0": uv_acc
+            },
+            "indices": ind_acc,
+            "mode": 4
+        }]
     }));
 
-    // Add Armature bone nodes if present
-    for (i, bone) in parsed.bones.iter().enumerate() {
-        let node_idx = nodes.len();
-        scene_nodes.push(node_idx);
+    let mut scene_nodes = vec![0];
+    builder.add_node(json!({
+        "name": "OverlordMesh",
+        "mesh": mesh_idx
+    }));
 
-        nodes.push(json!({
+    for (i, bone) in parsed.bones.iter().enumerate() {
+        let node_idx = scene_nodes.len();
+        scene_nodes.push(node_idx);
+        builder.add_node(json!({
             "name": if bone.name.is_empty() { format!("Bone_{}", i) } else { bone.name.clone() },
-            "translation": [bone.transform.translation.x, bone.transform.translation.y, bone.transform.translation.z],
-            "rotation": [bone.transform.rotation.x, bone.transform.rotation.y, bone.transform.rotation.z, bone.transform.rotation.w]
+            "translation": [bone.translation.x, bone.translation.y, bone.translation.z],
+            "rotation": [bone.rotation.x, bone.rotation.y, bone.rotation.z, bone.rotation.w]
         }));
     }
 
-    let gltf_json = json!({
-        "asset": {
-            "version": "2.0",
-            "generator": "Overlord Modding Studio glTF Exporter"
-        },
-        "scene": 0,
-        "scenes": [{ "nodes": scene_nodes }],
-        "nodes": nodes,
-        "meshes": [{
-            "name": "Mesh_0",
-            "primitives": [{
-                "attributes": {
-                    "POSITION": 1,
-                    "NORMAL": 2,
-                    "TEXCOORD_0": 3
-                },
-                "indices": 0,
-                "mode": 4
-            }]
-        }],
-        "buffers": [{ "byteLength": bin_data.len() }],
-        "bufferViews": [
-            { "buffer": 0, "byteOffset": indices_offset, "byteLength": indices_length, "target": 34963 },
-            { "buffer": 0, "byteOffset": pos_offset, "byteLength": pos_length, "target": 34962 },
-            { "buffer": 0, "byteOffset": norm_offset, "byteLength": norm_length, "target": 34962 },
-            { "buffer": 0, "byteOffset": uv_offset, "byteLength": uv_length, "target": 34962 }
-        ],
-        "accessors": [
-            { "bufferView": 0, "byteOffset": 0, "componentType": 5123, "count": parsed.indices.len(), "type": "SCALAR" },
-            { "bufferView": 1, "byteOffset": 0, "componentType": 5126, "count": vertex_count, "type": "VEC3", "min": min_pos, "max": max_pos },
-            { "bufferView": 2, "byteOffset": 0, "componentType": 5126, "count": vertex_count, "type": "VEC3" },
-            { "bufferView": 3, "byteOffset": 0, "componentType": 5126, "count": vertex_count, "type": "VEC2" }
-        ]
-    });
+    builder.add_scene(scene_nodes);
 
-    let mut json_bytes = serde_json::to_vec(&gltf_json).unwrap();
-    while !json_bytes.len().is_multiple_of(4) {
-        json_bytes.push(b' ');
-    }
-
-    let total_length = 12 + 8 + json_bytes.len() + 8 + bin_data.len();
-    let mut glb = Vec::with_capacity(total_length);
-
-    glb.extend_from_slice(b"glTF");
-    glb.write_u32::<LittleEndian>(2).unwrap();
-    glb.write_u32::<LittleEndian>(total_length as u32).unwrap();
-
-    glb.write_u32::<LittleEndian>(json_bytes.len() as u32)
-        .unwrap();
-    glb.extend_from_slice(b"JSON");
-    glb.extend_from_slice(&json_bytes);
-
-    glb.write_u32::<LittleEndian>(bin_data.len() as u32)
-        .unwrap();
-    glb.extend_from_slice(b"BIN\0");
-    glb.extend_from_slice(&bin_data);
+    let glb = builder.build("Overlord Modding Studio glTF Exporter")?;
 
     let stats = MeshStats {
         vertex_count,
@@ -365,64 +331,63 @@ pub fn export_mesh_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, MeshStats), Str
     Ok((glb, stats))
 }
 
-pub fn import_glb_to_mesh(original_chunk: &[u8], glb_bytes: &[u8]) -> Result<Vec<u8>, String> {
+pub fn import_glb_to_mesh(original_chunk: &[u8], glb_bytes: &[u8]) -> Result<Vec<u8>> {
     if glb_bytes.len() < 20 || &glb_bytes[0..4] != b"glTF" {
-        return Err("Invalid .glb file format (missing 'glTF' signature)".into());
+        bail!("Invalid .glb file format (missing 'glTF' signature)");
     }
 
     let mut cur = Cursor::new(&glb_bytes[12..]);
-    let json_len = cur.read_u32::<LittleEndian>().map_err(|e| e.to_string())? as usize;
+    let json_len = cur.read_u32::<LittleEndian>()? as usize;
     let mut json_type = [0u8; 4];
-    std::io::Read::read_exact(&mut cur, &mut json_type).map_err(|e| e.to_string())?;
+    std::io::Read::read_exact(&mut cur, &mut json_type)?;
 
     if &json_type != b"JSON" {
-        return Err("Missing JSON chunk in .glb".into());
+        bail!("Missing JSON chunk in .glb");
     }
 
     let json_pos = 20;
     let json_slice = &glb_bytes[json_pos..json_pos + json_len];
-    let gltf: serde_json::Value =
-        serde_json::from_slice(json_slice).map_err(|e| format!("Invalid glTF JSON: {}", e))?;
+    let gltf: serde_json::Value = serde_json::from_slice(json_slice)?;
 
-    let bin_header_pos = json_pos + json_len;
+    let bin_header_pos = 20 + json_len;
     if bin_header_pos + 8 > glb_bytes.len() {
-        return Err("Missing BIN chunk in .glb".into());
+        bail!("Missing BIN chunk in .glb");
     }
 
     let mut bin_cur = Cursor::new(&glb_bytes[bin_header_pos..]);
-    let bin_len = bin_cur.read_u32::<LittleEndian>().unwrap() as usize;
+    let bin_len = bin_cur.read_u32::<LittleEndian>()? as usize;
     let bin_pos = bin_header_pos + 8;
     let bin_data = &glb_bytes[bin_pos..(bin_pos + bin_len).min(glb_bytes.len())];
 
     let prim = gltf["meshes"]
         .get(0)
         .and_then(|m| m["primitives"].get(0))
-        .ok_or("No mesh primitives found in glTF")?;
+        .context("No mesh primitives found in glTF")?;
 
     let accessors = gltf["accessors"]
         .as_array()
-        .ok_or("glTF missing accessors array")?;
+        .context("glTF missing accessors array")?;
     let buffer_views = gltf["bufferViews"]
         .as_array()
-        .ok_or("glTF missing bufferViews array")?;
+        .context("glTF missing bufferViews array")?;
 
-    let read_buffer_view_slice = |accessor_idx: usize| -> Result<&[u8], String> {
+    let read_buffer_view_slice = |accessor_idx: usize| -> Result<&[u8]> {
         let acc = accessors
             .get(accessor_idx)
-            .ok_or(format!("Missing accessor {}", accessor_idx))?;
+            .context(format!("Missing accessor {}", accessor_idx))?;
         let bv_idx = acc["bufferView"]
             .as_u64()
-            .ok_or("Accessor missing bufferView")? as usize;
+            .context("Accessor missing bufferView")? as usize;
         let bv = buffer_views
             .get(bv_idx)
-            .ok_or(format!("Missing bufferView {}", bv_idx))?;
+            .context(format!("Missing bufferView {}", bv_idx))?;
 
         let bv_offset = bv["byteOffset"].as_u64().unwrap_or(0) as usize;
         let acc_offset = acc["byteOffset"].as_u64().unwrap_or(0) as usize;
         let total_offset = bv_offset + acc_offset;
 
         if total_offset > bin_data.len() {
-            return Err("Accessor offset exceeds binary buffer".into());
+            bail!("Accessor offset exceeds binary buffer");
         }
 
         Ok(&bin_data[total_offset..])
@@ -430,7 +395,7 @@ pub fn import_glb_to_mesh(original_chunk: &[u8], glb_bytes: &[u8]) -> Result<Vec
 
     let pos_acc_idx = prim["attributes"]["POSITION"]
         .as_u64()
-        .ok_or("Primitive missing POSITION")? as usize;
+        .context("Primitive missing POSITION")? as usize;
     let pos_count = accessors[pos_acc_idx]["count"].as_u64().unwrap_or(0) as usize;
     let pos_slice = read_buffer_view_slice(pos_acc_idx)?;
     let mut pos_cur = Cursor::new(pos_slice);
@@ -482,7 +447,7 @@ pub fn import_glb_to_mesh(original_chunk: &[u8], glb_bytes: &[u8]) -> Result<Vec
 
     let indices_acc_idx = prim["indices"]
         .as_u64()
-        .ok_or("Primitive missing indices")? as usize;
+        .context("Primitive missing indices")? as usize;
     let indices_count = accessors[indices_acc_idx]["count"].as_u64().unwrap_or(0) as usize;
     let indices_comp = accessors[indices_acc_idx]["componentType"]
         .as_u64()
@@ -508,20 +473,20 @@ pub fn import_glb_to_mesh(original_chunk: &[u8], glb_bytes: &[u8]) -> Result<Vec
         .iter()
         .zip(raw_normals.iter().zip(raw_uvs.iter()))
     {
-        cur_vbuf.write_f32::<LittleEndian>(p.x).unwrap();
-        cur_vbuf.write_f32::<LittleEndian>(p.y).unwrap();
-        cur_vbuf.write_f32::<LittleEndian>(p.z).unwrap();
-        cur_vbuf.write_f32::<LittleEndian>(n.x).unwrap();
-        cur_vbuf.write_f32::<LittleEndian>(n.y).unwrap();
-        cur_vbuf.write_f32::<LittleEndian>(n.z).unwrap();
-        cur_vbuf.write_f32::<LittleEndian>(uv.x).unwrap();
-        cur_vbuf.write_f32::<LittleEndian>(uv.y).unwrap();
+        cur_vbuf.write_f32::<LittleEndian>(p.x)?;
+        cur_vbuf.write_f32::<LittleEndian>(p.y)?;
+        cur_vbuf.write_f32::<LittleEndian>(p.z)?;
+        cur_vbuf.write_f32::<LittleEndian>(n.x)?;
+        cur_vbuf.write_f32::<LittleEndian>(n.y)?;
+        cur_vbuf.write_f32::<LittleEndian>(n.z)?;
+        cur_vbuf.write_f32::<LittleEndian>(uv.x)?;
+        cur_vbuf.write_f32::<LittleEndian>(uv.y)?;
     }
 
     let mut raw_indices_bytes = Vec::with_capacity(index_buffer.len() * 2);
     let mut cur_idx = Cursor::new(&mut raw_indices_bytes);
     for idx in &index_buffer {
-        cur_idx.write_u16::<LittleEndian>(*idx).unwrap();
+        cur_idx.write_u16::<LittleEndian>(*idx)?;
     }
 
     let indice_elements = vec![
@@ -533,9 +498,9 @@ pub fn import_glb_to_mesh(original_chunk: &[u8], glb_bytes: &[u8]) -> Result<Vec
 
     let mut attr_table = Vec::new();
     let mut cur_attr = Cursor::new(&mut attr_table);
-    cur_attr.write_u32::<LittleEndian>(0x02010000).unwrap();
-    cur_attr.write_u32::<LittleEndian>(0x02040000).unwrap();
-    cur_attr.write_u32::<LittleEndian>(0x01050000).unwrap();
+    cur_attr.write_u32::<LittleEndian>(0x02010000)?;
+    cur_attr.write_u32::<LittleEndian>(0x02040000)?;
+    cur_attr.write_u32::<LittleEndian>(0x01050000)?;
 
     let info_elements = vec![
         (20, vec![0u8]),
@@ -552,7 +517,7 @@ pub fn import_glb_to_mesh(original_chunk: &[u8], glb_bytes: &[u8]) -> Result<Vec
     ];
     let new_vbuf_chunk = build_chunk_from_elements(false, &vbuf_elements);
 
-    let is_mesh_asset = original_chunk.len() > 4 && &original_chunk[0..4] == b"\x35\x00\x41\x00";
+    let is_mesh_asset = original_chunk.starts_with(magic::MESH);
     let mesh_data_bytes = if is_mesh_asset {
         let (_, elements) = parse_typed_container(original_chunk)?;
         elements
@@ -565,27 +530,11 @@ pub fn import_glb_to_mesh(original_chunk: &[u8], glb_bytes: &[u8]) -> Result<Vec
     };
 
     let (has_magic, mut mesh_elements) = parse_chunk_elements(&mesh_data_bytes)?;
-    let mut found_indices = false;
-    let mut found_vertices = false;
-
-    for (id, data) in mesh_elements.iter_mut() {
-        if *id == 10 {
-            *data = new_indice_chunk.clone();
-            found_indices = true;
-        } else if *id == 11 {
-            *data = new_vbuf_chunk.clone();
-            found_vertices = true;
-        }
-    }
-
-    if !found_indices {
-        mesh_elements.push((10, new_indice_chunk));
-    }
-    if !found_vertices {
-        mesh_elements.push((11, new_vbuf_chunk));
-    }
-
+    mesh_elements.retain(|(id, _)| *id != 10 && *id != 11);
+    mesh_elements.push((10, new_indice_chunk));
+    mesh_elements.push((11, new_vbuf_chunk));
     mesh_elements.sort_by_key(|&(id, _)| id);
+
     let final_mesh_data = build_chunk_from_elements(has_magic, &mesh_elements);
 
     if is_mesh_asset {
@@ -601,7 +550,7 @@ pub fn import_glb_to_mesh(original_chunk: &[u8], glb_bytes: &[u8]) -> Result<Vec
     }
 }
 
-pub fn export_mesh_to_obj(chunk_data: &[u8]) -> Result<(String, MeshStats), String> {
+pub fn export_mesh_to_obj(chunk_data: &[u8]) -> Result<(String, MeshStats)> {
     let parsed = extract_mesh_geometry(chunk_data)?;
     let vertex_count = parsed.positions.len();
 
@@ -622,14 +571,16 @@ pub fn export_mesh_to_obj(chunk_data: &[u8]) -> Result<(String, MeshStats), Stri
     }
 
     obj.push_str("\ns 1\n");
-    for tri in parsed.indices.as_chunks::<3>().0 {
-        let i1 = tri[0] as usize + 1;
-        let i2 = tri[1] as usize + 1;
-        let i3 = tri[2] as usize + 1;
-        obj.push_str(&format!(
-            "f {0}/{0}/{0} {1}/{1}/{1} {2}/{2}/{2}\n",
-            i1, i2, i3
-        ));
+    for tri in parsed.indices.chunks(3) {
+        if tri.len() == 3 {
+            let i1 = tri[0] as usize + 1;
+            let i2 = tri[1] as usize + 1;
+            let i3 = tri[2] as usize + 1;
+            obj.push_str(&format!(
+                "f {0}/{0}/{0} {1}/{1}/{1} {2}/{2}/{2}\n",
+                i1, i2, i3
+            ));
+        }
     }
 
     let stats = MeshStats {
@@ -641,7 +592,7 @@ pub fn export_mesh_to_obj(chunk_data: &[u8]) -> Result<(String, MeshStats), Stri
     Ok((obj, stats))
 }
 
-pub fn import_obj_to_mesh(original_chunk: &[u8], obj_content: &str) -> Result<Vec<u8>, String> {
+pub fn import_obj_to_mesh(original_chunk: &[u8], obj_content: &str) -> Result<Vec<u8>> {
     let mut raw_positions = Vec::new();
     let mut raw_normals = Vec::new();
     let mut raw_uvs = Vec::new();
@@ -687,7 +638,7 @@ pub fn import_obj_to_mesh(original_chunk: &[u8], obj_content: &str) -> Result<Ve
     }
 
     if raw_positions.is_empty() {
-        return Err("OBJ file contains no vertex positions ('v').".into());
+        bail!("OBJ file contains no vertex positions ('v').");
     }
 
     let mut unique_vertices = HashMap::new();
@@ -734,14 +685,14 @@ pub fn import_obj_to_mesh(original_chunk: &[u8], obj_content: &str) -> Result<Ve
 
                 let mut cur = Cursor::new(&mut vertex_buffer);
                 cur.set_position(cur.get_ref().len() as u64);
-                cur.write_f32::<LittleEndian>(pos.x).unwrap();
-                cur.write_f32::<LittleEndian>(pos.y).unwrap();
-                cur.write_f32::<LittleEndian>(pos.z).unwrap();
-                cur.write_f32::<LittleEndian>(norm.x).unwrap();
-                cur.write_f32::<LittleEndian>(norm.y).unwrap();
-                cur.write_f32::<LittleEndian>(norm.z).unwrap();
-                cur.write_f32::<LittleEndian>(uv.x).unwrap();
-                cur.write_f32::<LittleEndian>(uv.y).unwrap();
+                cur.write_f32::<LittleEndian>(pos.x)?;
+                cur.write_f32::<LittleEndian>(pos.y)?;
+                cur.write_f32::<LittleEndian>(pos.z)?;
+                cur.write_f32::<LittleEndian>(norm.x)?;
+                cur.write_f32::<LittleEndian>(norm.y)?;
+                cur.write_f32::<LittleEndian>(norm.z)?;
+                cur.write_f32::<LittleEndian>(uv.x)?;
+                cur.write_f32::<LittleEndian>(uv.y)?;
             }
         }
     }
@@ -752,7 +703,7 @@ pub fn import_obj_to_mesh(original_chunk: &[u8], obj_content: &str) -> Result<Ve
     let mut raw_indices_bytes = Vec::new();
     let mut cur_idx = Cursor::new(&mut raw_indices_bytes);
     for idx in &index_buffer {
-        cur_idx.write_u16::<LittleEndian>(*idx).unwrap();
+        cur_idx.write_u16::<LittleEndian>(*idx)?;
     }
 
     let indice_elements = vec![
@@ -764,9 +715,9 @@ pub fn import_obj_to_mesh(original_chunk: &[u8], obj_content: &str) -> Result<Ve
 
     let mut attr_table = Vec::new();
     let mut cur_attr = Cursor::new(&mut attr_table);
-    cur_attr.write_u32::<LittleEndian>(0x02010000).unwrap();
-    cur_attr.write_u32::<LittleEndian>(0x02040000).unwrap();
-    cur_attr.write_u32::<LittleEndian>(0x01050000).unwrap();
+    cur_attr.write_u32::<LittleEndian>(0x02010000)?;
+    cur_attr.write_u32::<LittleEndian>(0x02040000)?;
+    cur_attr.write_u32::<LittleEndian>(0x01050000)?;
 
     let info_elements = vec![
         (20, vec![0u8]),
@@ -783,7 +734,7 @@ pub fn import_obj_to_mesh(original_chunk: &[u8], obj_content: &str) -> Result<Ve
     ];
     let new_vbuf_chunk = build_chunk_from_elements(false, &vbuf_elements);
 
-    let is_mesh_asset = original_chunk.len() > 4 && &original_chunk[0..4] == b"\x35\x00\x41\x00";
+    let is_mesh_asset = original_chunk.starts_with(magic::MESH);
     let mesh_data_bytes = if is_mesh_asset {
         let (_, elements) = parse_typed_container(original_chunk)?;
         elements
@@ -796,27 +747,11 @@ pub fn import_obj_to_mesh(original_chunk: &[u8], obj_content: &str) -> Result<Ve
     };
 
     let (has_magic, mut mesh_elements) = parse_chunk_elements(&mesh_data_bytes)?;
-    let mut found_indices = false;
-    let mut found_vertices = false;
-
-    for (id, data) in mesh_elements.iter_mut() {
-        if *id == 10 {
-            *data = new_indice_chunk.clone();
-            found_indices = true;
-        } else if *id == 11 {
-            *data = new_vbuf_chunk.clone();
-            found_vertices = true;
-        }
-    }
-
-    if !found_indices {
-        mesh_elements.push((10, new_indice_chunk));
-    }
-    if !found_vertices {
-        mesh_elements.push((11, new_vbuf_chunk));
-    }
-
+    mesh_elements.retain(|(id, _)| *id != 10 && *id != 11);
+    mesh_elements.push((10, new_indice_chunk));
+    mesh_elements.push((11, new_vbuf_chunk));
     mesh_elements.sort_by_key(|&(id, _)| id);
+
     let final_mesh_data = build_chunk_from_elements(has_magic, &mesh_elements);
 
     if is_mesh_asset {

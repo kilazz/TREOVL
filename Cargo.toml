@@ -15,6 +15,10 @@ rfd = "0.17.2"
 flate2 = "1.1.10"
 hex = "0.4.3"
 walkdir = "2.5.0"
+anyhow = "1.0.104"
+binrw = "0.15.2"
+clap = { version = "4.6.7", features = ["derive"] }
+base64 = "0.23.1"
 
 [build-dependencies]
 slint-build = "1.18.1"

@@ -1,17 +1,29 @@
 use super::node::PrpNode;
+use crate::utils::zlib::{compress, decompress, is_zlib_compressed};
+use anyhow::{Context, Result, bail};
 use byteorder::{LittleEndian, WriteBytesExt};
 use std::fs;
 use std::path::Path;
 
-pub fn build_node(node: &PrpNode, project_dir: &Path) -> Result<Vec<u8>, String> {
+pub fn build_node(node: &PrpNode, project_dir: &Path) -> Result<Vec<u8>> {
     if !node.is_container {
-        let rel_path = node
-            .file_path
-            .as_ref()
-            .ok_or("Leaf node is missing file_path")?;
+        let rel_path = match &node.file_path {
+            Some(path) => path,
+            None => bail!("Leaf node ID 0x{:X} is missing file_path", node.id),
+        };
+
         let full_path = project_dir.join(rel_path);
-        let raw_data =
-            fs::read(&full_path).map_err(|e| format!("Failed to read {:?}: {}", full_path, e))?;
+        let mut raw_data = fs::read(&full_path)
+            .with_context(|| format!("Failed to read chunk file {:?}", full_path))?;
+
+        // Smart Level 9 compression if chunk payload was compressed
+        if is_zlib_compressed(&raw_data)
+            && let Ok(decompressed) = decompress(&raw_data)
+            && let Ok(optimized) = compress(&decompressed, 9)
+            && optimized.len() < raw_data.len()
+        {
+            raw_data = optimized;
+        }
 
         return Ok(raw_data);
     }
@@ -54,19 +66,17 @@ pub fn build_node(node: &PrpNode, project_dir: &Path) -> Result<Vec<u8>, String>
     table.push(control_byte);
 
     if has_large {
-        table
-            .write_u32::<LittleEndian>(large_entries.len() as u32)
-            .unwrap();
+        table.write_u32::<LittleEndian>(large_entries.len() as u32)?;
     }
 
     for (id, offset) in small_entries {
-        table.write_u8(id).unwrap();
-        table.write_u8(offset).unwrap();
+        table.write_u8(id)?;
+        table.write_u8(offset)?;
     }
 
     for (id, offset) in large_entries {
-        table.write_u32::<LittleEndian>(id).unwrap();
-        table.write_u32::<LittleEndian>(offset).unwrap();
+        table.write_u32::<LittleEndian>(id)?;
+        table.write_u32::<LittleEndian>(offset)?;
     }
 
     table.extend(data_segment);

@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 use std::path::Path;
 
+use crate::engine::common::magic;
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PrpNode {
     pub id: u32,
@@ -31,7 +33,8 @@ pub fn parse_node(
     let mut has_magic = false;
 
     if !is_root {
-        if data.len() >= 3 && &data[0..3] == b"\x01\x01\x00" {
+        // ACTIVELY USES magic::CONTAINER_MAGIC
+        if data.len() >= 3 && &data[0..3] == magic::CONTAINER_MAGIC {
             has_magic = true;
             pos = 3;
         } else if (data[0] & 0x80) == 0 {

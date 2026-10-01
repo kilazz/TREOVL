@@ -1,9 +1,91 @@
-use crate::engine::assets::parse_chunk_elements;
+use super::parse_chunk_elements;
+use crate::engine::common::magic;
 use crate::engine::math::{BoneRotation, Vector3, Vector4};
+use crate::utils::gltf_builder::GltfBuilder;
+use anyhow::Result;
+use binrw::{BinRead, BinReaderExt, BinWrite};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::io::Cursor;
+
+#[derive(Debug, Clone, BinRead, BinWrite)]
+#[brw(little)]
+pub struct ObjectBone {
+    #[br(map = |b: [u8; 32]| String::from_utf8_lossy(&b).trim_matches(char::from(0)).to_string())]
+    #[bw(map = |s: &String| {
+        let mut b = [0u8; 32];
+        let bs = s.as_bytes();
+        b[..bs.len().min(32)].copy_from_slice(&bs[..bs.len().min(32)]);
+        b
+    })]
+    pub name: String,
+
+    pub matrix: [f32; 16],
+    pub rotation: Vector4,
+    pub translation: Vector3,
+
+    pub skin_id: i32,
+    pub parent_index: i32,
+    pub next_sibling_index: i32,
+    pub first_child_index: i32,
+    pub reserved: i32,
+}
+
+#[allow(dead_code)]
+pub fn parse_object_bone_container(data: &[u8]) -> Result<Vec<ObjectBone>> {
+    let slice = if data.len() > 15 && data[0] == 0x03 && data[1] == 0x14 {
+        &data[15..]
+    } else {
+        data
+    };
+    let mut cur = Cursor::new(slice);
+    let mut bones = Vec::new();
+    while (cur.position() as usize) + 144 <= slice.len() {
+        if let Ok(bone) = cur.read_le::<ObjectBone>() {
+            bones.push(bone);
+        } else {
+            break;
+        }
+    }
+    Ok(bones)
+}
+
+#[allow(dead_code)]
+pub fn export_skeleton_to_glb(bones: &[ObjectBone], rig_name: &str) -> Result<Vec<u8>> {
+    let mut builder = GltfBuilder::new();
+    let mut root_indices = Vec::new();
+    for (i, bone) in bones.iter().enumerate() {
+        let mut children = Vec::new();
+        for (j, b2) in bones.iter().enumerate() {
+            if b2.parent_index == i as i32 && j != i {
+                children.push(j);
+            }
+        }
+        if bone.parent_index < 0 || bone.parent_index >= bones.len() as i32 {
+            root_indices.push(i);
+        }
+        let n = if bone.name.is_empty() {
+            format!("Bone_{}", i)
+        } else {
+            bone.name.clone()
+        };
+        let mut node = json!({
+            "name": n,
+            "translation": [bone.translation.x, bone.translation.y, bone.translation.z],
+            "rotation": [bone.rotation.x, bone.rotation.y, bone.rotation.z, bone.rotation.w]
+        });
+        if !children.is_empty() {
+            node["children"] = json!(children);
+        }
+        builder.add_node(node);
+    }
+    if root_indices.is_empty() {
+        root_indices.push(0);
+    }
+    builder.add_scene(root_indices);
+    builder.build(rig_name)
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct KeyframeTranslation {
@@ -35,199 +117,6 @@ pub struct AnimationClip {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Transform {
-    pub matrix: [f32; 16],
-    pub rotation: Vector4,
-    pub translation: Vector3,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ObjectBone {
-    pub name: String,
-    pub transform: Transform,
-    pub skin_id: i32,
-    pub parent_index: i32,
-    pub next_sibling_index: i32,
-    pub first_child_index: i32,
-    pub reserved: i32,
-}
-
-impl ObjectBone {
-    /// Reads a 144-byte ObjectBone from the binary cursor
-    pub fn read(cur: &mut Cursor<&[u8]>) -> Result<Self, std::io::Error> {
-        let mut name_bytes = [0u8; 32];
-        std::io::Read::read_exact(cur, &mut name_bytes)?;
-
-        // Find first null terminator to get clean name without trailing garbage
-        let str_len = name_bytes.iter().position(|&b| b == 0).unwrap_or(32);
-        let name = String::from_utf8_lossy(&name_bytes[..str_len])
-            .trim()
-            .to_string();
-
-        let mut matrix = [0f32; 16];
-        for m in &mut matrix {
-            let val = cur.read_f32::<LittleEndian>()?;
-            *m = if val.is_finite() { val } else { 0.0 };
-        }
-
-        let qx = cur.read_f32::<LittleEndian>()?;
-        let qy = cur.read_f32::<LittleEndian>()?;
-        let qz = cur.read_f32::<LittleEndian>()?;
-        let qw = cur.read_f32::<LittleEndian>()?;
-
-        let rotation = Vector4 {
-            x: if qx.is_finite() { qx } else { 0.0 },
-            y: if qy.is_finite() { qy } else { 0.0 },
-            z: if qz.is_finite() { qz } else { 0.0 },
-            w: if qw.is_finite() { qw } else { 1.0 },
-        };
-
-        let tx = cur.read_f32::<LittleEndian>()?;
-        let ty = cur.read_f32::<LittleEndian>()?;
-        let tz = cur.read_f32::<LittleEndian>()?;
-
-        let translation = Vector3 {
-            x: if tx.is_finite() { tx } else { 0.0 },
-            y: if ty.is_finite() { ty } else { 0.0 },
-            z: if tz.is_finite() { tz } else { 0.0 },
-        };
-
-        // 5 integers (5 * 4 = 20 bytes) -> total exact 144 bytes!
-        let skin_id = cur.read_i32::<LittleEndian>()?;
-        let parent_index = cur.read_i32::<LittleEndian>()?;
-        let next_sibling_index = cur.read_i32::<LittleEndian>()?;
-        let first_child_index = cur.read_i32::<LittleEndian>()?;
-        let reserved = cur.read_i32::<LittleEndian>()?;
-
-        Ok(Self {
-            name,
-            transform: Transform {
-                matrix,
-                rotation,
-                translation,
-            },
-            skin_id,
-            parent_index,
-            next_sibling_index,
-            first_child_index,
-            reserved,
-        })
-    }
-}
-
-/// Parses the ObjectBoneContainer (chunk ID 33) into a clean array of ObjectBones.
-pub fn parse_object_bone_container(data: &[u8]) -> Result<Vec<ObjectBone>, String> {
-    // Offset table: 7 bytes header + 8 bytes payload start = 15 bytes
-    let bones_slice = if data.len() > 15 && data[0] == 0x03 && data[1] == 0x14 {
-        &data[15..]
-    } else {
-        data
-    };
-
-    if bones_slice.len() < 144 {
-        return Err("Bone buffer is too small to contain an ObjectBone".into());
-    }
-
-    let mut cur = Cursor::new(bones_slice);
-    let mut bones = Vec::new();
-
-    while (cur.position() as usize) + 144 <= bones_slice.len() {
-        if let Ok(bone) = ObjectBone::read(&mut cur) {
-            bones.push(bone);
-        } else {
-            break;
-        }
-    }
-
-    if bones.is_empty() {
-        Err("No valid bones could be parsed".into())
-    } else {
-        Ok(bones)
-    }
-}
-
-/// Exports a hierarchical bone skeleton into a valid glTF 2.0 Binary (.glb) Armature for Blender.
-pub fn export_skeleton_to_glb(bones: &[ObjectBone], rig_name: &str) -> Result<Vec<u8>, String> {
-    if bones.is_empty() {
-        return Err("Cannot export empty bone array".into());
-    }
-
-    let mut nodes = Vec::new();
-    let mut root_indices = Vec::new();
-    let total_bones = bones.len();
-
-    for (i, bone) in bones.iter().enumerate() {
-        let mut children = Vec::new();
-        for (child_idx, other_bone) in bones.iter().enumerate() {
-            if other_bone.parent_index == i as i32 && child_idx != i {
-                children.push(child_idx);
-            }
-        }
-
-        // If root bone (parent_index is -1 or out of range), add to scene roots
-        if bone.parent_index < 0 || bone.parent_index >= total_bones as i32 {
-            root_indices.push(i);
-        }
-
-        let bone_name = if bone.name.is_empty() {
-            format!("Bone_{:02}", i)
-        } else {
-            bone.name.clone()
-        };
-
-        let mut node_json = json!({
-            "name": bone_name,
-            "translation": [bone.transform.translation.x, bone.transform.translation.y, bone.transform.translation.z],
-            "rotation": [bone.transform.rotation.x, bone.transform.rotation.y, bone.transform.rotation.z, bone.transform.rotation.w]
-        });
-
-        if !children.is_empty() {
-            node_json["children"] = json!(children);
-        }
-
-        nodes.push(node_json);
-    }
-
-    if root_indices.is_empty() {
-        root_indices.push(0);
-    }
-
-    let gltf_json = json!({
-        "asset": {
-            "version": "2.0",
-            "generator": "Overlord Modding Studio Armature Exporter"
-        },
-        "scene": 0,
-        "scenes": [{
-            "name": rig_name,
-            "nodes": root_indices
-        }],
-        "nodes": nodes
-    });
-
-    let mut json_bytes = serde_json::to_vec(&gltf_json).unwrap();
-    while !json_bytes.len().is_multiple_of(4) {
-        json_bytes.push(b' ');
-    }
-
-    let total_length = 12 + 8 + json_bytes.len();
-    let mut glb = Vec::with_capacity(total_length);
-
-    // 12-byte glTF Header
-    glb.extend_from_slice(b"glTF");
-    glb.write_u32::<LittleEndian>(2).unwrap();
-    glb.write_u32::<LittleEndian>(total_length as u32).unwrap();
-
-    // Chunk 0: JSON
-    glb.write_u32::<LittleEndian>(json_bytes.len() as u32)
-        .unwrap();
-    glb.extend_from_slice(b"JSON");
-    glb.extend_from_slice(&json_bytes);
-
-    Ok(glb)
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BonePosition {
     pub timestamp: u32,
     pub pos: Vector3,
@@ -246,9 +135,8 @@ impl BonePosition {
     }
 }
 
-/// Parses an Overlord Animation container chunk (05 00 41 00).
-pub fn parse_animation_clip(chunk_data: &[u8]) -> Result<AnimationClip, String> {
-    let payload = if chunk_data.len() > 4 && &chunk_data[0..4] == b"\x05\x00\x41\x00" {
+pub fn parse_animation_clip(chunk_data: &[u8]) -> Result<AnimationClip> {
+    let payload = if chunk_data.len() > 4 && &chunk_data[0..4] == magic::ANIM_CLIP {
         &chunk_data[4..]
     } else {
         chunk_data
@@ -325,8 +213,8 @@ pub fn parse_animation_clip(chunk_data: &[u8]) -> Result<AnimationClip, String> 
     })
 }
 
-fn parse_single_bone_track(data: &[u8], total_duration: f32) -> Result<BoneTrack, String> {
-    let payload = if data.len() > 4 && &data[0..4] == b"\x07\x00\x41\x00" {
+fn parse_single_bone_track(data: &[u8], total_duration: f32) -> Result<BoneTrack> {
+    let payload = if data.len() > 4 && &data[0..4] == magic::ANIM_TRACK {
         &data[4..]
     } else {
         data
@@ -409,12 +297,12 @@ fn parse_single_bone_track(data: &[u8], total_duration: f32) -> Result<BoneTrack
     })
 }
 
-pub fn export_animation_to_json(chunk_data: &[u8]) -> Result<String, String> {
+pub fn export_animation_to_json(chunk_data: &[u8]) -> Result<String> {
     let clip = parse_animation_clip(chunk_data)?;
-    serde_json::to_string_pretty(&clip).map_err(|e| e.to_string())
+    serde_json::to_string_pretty(&clip).map_err(|e| anyhow::anyhow!(e))
 }
 
-pub fn export_animation_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>, String> {
+pub fn export_animation_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>> {
     let clip = parse_animation_clip(chunk_data)?;
 
     let mut bin_data = Vec::new();
@@ -439,7 +327,7 @@ pub fn export_animation_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>, String> {
             let mut max_time = f32::NEG_INFINITY;
 
             for t in &track.translations {
-                bin_data.write_f32::<LittleEndian>(t.time_seconds).unwrap();
+                bin_data.write_f32::<LittleEndian>(t.time_seconds)?;
                 min_time = min_time.min(t.time_seconds);
                 max_time = max_time.max(t.time_seconds);
             }
@@ -450,9 +338,9 @@ pub fn export_animation_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>, String> {
 
             let val_offset = bin_data.len();
             for t in &track.translations {
-                bin_data.write_f32::<LittleEndian>(t.position.x).unwrap();
-                bin_data.write_f32::<LittleEndian>(t.position.y).unwrap();
-                bin_data.write_f32::<LittleEndian>(t.position.z).unwrap();
+                bin_data.write_f32::<LittleEndian>(t.position.x)?;
+                bin_data.write_f32::<LittleEndian>(t.position.y)?;
+                bin_data.write_f32::<LittleEndian>(t.position.z)?;
             }
             while !bin_data.len().is_multiple_of(4) {
                 bin_data.push(0);
@@ -509,7 +397,7 @@ pub fn export_animation_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>, String> {
             let mut max_time = f32::NEG_INFINITY;
 
             for r in &track.rotations {
-                bin_data.write_f32::<LittleEndian>(r.time_seconds).unwrap();
+                bin_data.write_f32::<LittleEndian>(r.time_seconds)?;
                 min_time = min_time.min(r.time_seconds);
                 max_time = max_time.max(r.time_seconds);
             }
@@ -520,18 +408,10 @@ pub fn export_animation_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>, String> {
 
             let val_offset = bin_data.len();
             for r in &track.rotations {
-                bin_data
-                    .write_f32::<LittleEndian>(r.rotation_quat.x)
-                    .unwrap();
-                bin_data
-                    .write_f32::<LittleEndian>(r.rotation_quat.y)
-                    .unwrap();
-                bin_data
-                    .write_f32::<LittleEndian>(r.rotation_quat.z)
-                    .unwrap();
-                bin_data
-                    .write_f32::<LittleEndian>(r.rotation_quat.w)
-                    .unwrap();
+                bin_data.write_f32::<LittleEndian>(r.rotation_quat.x)?;
+                bin_data.write_f32::<LittleEndian>(r.rotation_quat.y)?;
+                bin_data.write_f32::<LittleEndian>(r.rotation_quat.z)?;
+                bin_data.write_f32::<LittleEndian>(r.rotation_quat.w)?;
             }
             while !bin_data.len().is_multiple_of(4) {
                 bin_data.push(0);
@@ -601,7 +481,7 @@ pub fn export_animation_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>, String> {
         "accessors": accessors
     });
 
-    let mut json_bytes = serde_json::to_vec(&gltf_json).unwrap();
+    let mut json_bytes = serde_json::to_vec(&gltf_json)?;
     while !json_bytes.len().is_multiple_of(4) {
         json_bytes.push(b' ');
     }
@@ -610,16 +490,14 @@ pub fn export_animation_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>, String> {
     let mut glb = Vec::with_capacity(total_length);
 
     glb.extend_from_slice(b"glTF");
-    glb.write_u32::<LittleEndian>(2).unwrap();
-    glb.write_u32::<LittleEndian>(total_length as u32).unwrap();
+    glb.write_u32::<LittleEndian>(2)?;
+    glb.write_u32::<LittleEndian>(total_length as u32)?;
 
-    glb.write_u32::<LittleEndian>(json_bytes.len() as u32)
-        .unwrap();
+    glb.write_u32::<LittleEndian>(json_bytes.len() as u32)?;
     glb.extend_from_slice(b"JSON");
     glb.extend_from_slice(&json_bytes);
 
-    glb.write_u32::<LittleEndian>(bin_data.len() as u32)
-        .unwrap();
+    glb.write_u32::<LittleEndian>(bin_data.len() as u32)?;
     glb.extend_from_slice(b"BIN\0");
     glb.extend_from_slice(&bin_data);
 

@@ -1,3 +1,4 @@
+use anyhow::{Result, bail};
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::io::{Cursor, Read};
 
@@ -13,50 +14,34 @@ pub struct OverlordTexture {
     pub pixel_data: Vec<u8>,
 }
 
-/// Universally parses any Overlord texture chunk (Standard 3D Texture, TGA Interface Image, Cubemap, or MipMap).
-pub fn parse_texture_chunk(data: &[u8]) -> Result<OverlordTexture, String> {
+pub fn parse_texture_chunk(data: &[u8]) -> Result<OverlordTexture> {
     if data.len() < 4 {
-        return Err("Chunk data is too short.".into());
+        bail!("Chunk data is too short.");
     }
 
-    // -------------------------------------------------------------
-    // CASE 1: Interface Image (TGA / TIF) — Signature 98 00 41 00
-    // -------------------------------------------------------------
     if data.starts_with(b"\x98\x00\x41\x00") {
         let mut pos = 4;
         if pos >= data.len() {
-            return Err("Truncated TGA chunk header.".into());
+            bail!("Truncated TGA chunk header.");
         }
         let num_offsets = data[pos] as usize;
         pos += 1 + num_offsets * 2;
         if pos >= data.len() {
-            return Err("Corrupted TGA offset table.".into());
+            bail!("Corrupted TGA offset table.");
         }
 
-        // Skip String 1 (Pointer)
-        if pos + 4 > data.len() {
-            return Err("Truncated TGA string table.".into());
-        }
-        let s1_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap_or_default()) as usize;
+        let s1_len = u32::from_le_bytes(data[pos..pos + 4].try_into()?) as usize;
         pos += 4 + s1_len;
 
-        // Skip String 2 (File Name)
-        if pos + 4 > data.len() {
-            return Err("Truncated TGA string table.".into());
-        }
-        let s2_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap_or_default()) as usize;
+        let s2_len = u32::from_le_bytes(data[pos..pos + 4].try_into()?) as usize;
         pos += 4 + s2_len;
 
-        // Read Width & Height
-        if pos + 8 > data.len() {
-            return Err("Truncated TGA dimensions.".into());
-        }
-        let width = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap_or_default());
-        let height = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap_or_default());
+        let width = u32::from_le_bytes(data[pos..pos + 4].try_into()?);
+        let height = u32::from_le_bytes(data[pos + 4..pos + 8].try_into()?);
 
         let pixel_size = (width * height * 4) as usize;
         if pixel_size == 0 || pixel_size > data.len() {
-            return Err(format!("Invalid TGA dimensions: {}x{}", width, height));
+            bail!("Invalid TGA dimensions: {}x{}", width, height);
         }
 
         let pixel_data = data[data.len() - pixel_size..].to_vec();
@@ -70,9 +55,6 @@ pub fn parse_texture_chunk(data: &[u8]) -> Result<OverlordTexture, String> {
         });
     }
 
-    // -------------------------------------------------------------
-    // CASE 2: Standard Texture (3D 00 41 00) or Cubemap (99 00 41 00)
-    // -------------------------------------------------------------
     let is_cubemap = data.starts_with(b"\x99\x00\x41\x00");
 
     if let Some(mip_offset) = data.windows(4).position(|w| w == b"\x24\x00\x41\x00") {
@@ -82,11 +64,9 @@ pub fn parse_texture_chunk(data: &[u8]) -> Result<OverlordTexture, String> {
             pos += 1 + num_offsets * 2;
 
             if pos + 12 <= data.len() {
-                let width = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap_or_default());
-                let height =
-                    u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap_or_default());
-                let fmt_code =
-                    u32::from_le_bytes(data[pos + 8..pos + 12].try_into().unwrap_or_default());
+                let width = u32::from_le_bytes(data[pos..pos + 4].try_into()?);
+                let height = u32::from_le_bytes(data[pos + 4..pos + 8].try_into()?);
+                let fmt_code = u32::from_le_bytes(data[pos + 8..pos + 12].try_into()?);
                 pos += 12;
 
                 let format = TextureFormat::from_u32(fmt_code).unwrap_or(TextureFormat::DXT5);
@@ -116,12 +96,9 @@ pub fn parse_texture_chunk(data: &[u8]) -> Result<OverlordTexture, String> {
         }
     }
 
-    // -------------------------------------------------------------
-    // CASE 3: Standalone DDS File ("DDS ")
-    // -------------------------------------------------------------
     if data.starts_with(b"DDS ") && data.len() >= 128 {
-        let height = u32::from_le_bytes(data[12..16].try_into().unwrap_or_default());
-        let width = u32::from_le_bytes(data[16..20].try_into().unwrap_or_default());
+        let height = u32::from_le_bytes(data[12..16].try_into()?);
+        let width = u32::from_le_bytes(data[16..20].try_into()?);
         let fourcc = &data[84..88];
         let format = match fourcc {
             b"DXT1" => TextureFormat::DXT1,
@@ -130,7 +107,7 @@ pub fn parse_texture_chunk(data: &[u8]) -> Result<OverlordTexture, String> {
             _ => TextureFormat::UncompressedRGBA,
         };
 
-        let caps2 = u32::from_le_bytes(data[112..116].try_into().unwrap_or_default());
+        let caps2 = u32::from_le_bytes(data[112..116].try_into()?);
         let is_cubemap = (caps2 & 0x200) != 0;
 
         return Ok(OverlordTexture {
@@ -142,9 +119,6 @@ pub fn parse_texture_chunk(data: &[u8]) -> Result<OverlordTexture, String> {
         });
     }
 
-    // -------------------------------------------------------------
-    // CASE 4: Standard Sub-Container (ID 20=W, 21=H, 23=Fmt, 22=Data)
-    // -------------------------------------------------------------
     if let Ok((_, elements)) = parse_chunk_elements(data) {
         let mut width = 0;
         let mut height = 0;
@@ -174,27 +148,24 @@ pub fn parse_texture_chunk(data: &[u8]) -> Result<OverlordTexture, String> {
         }
     }
 
-    Err("Could not detect texture dimensions or valid pixel payload in this chunk.".into())
+    bail!("Could not detect texture dimensions or valid pixel payload in chunk.")
 }
 
-/// Prepends a standard 128-byte DDS header to the raw texture payload.
-pub fn export_to_dds(data: &[u8]) -> Result<Vec<u8>, String> {
+pub fn export_to_dds(data: &[u8]) -> Result<Vec<u8>> {
     let tex = parse_texture_chunk(data)?;
 
-    // If it's a TGA interface image chunk (98 00 41 00), generate an 18-byte TGA file
     if data.starts_with(b"\x98\x00\x41\x00") {
         let mut tga_file = Vec::with_capacity(18 + tex.pixel_data.len());
-        tga_file.push(0); // ID length
-        tga_file.push(0); // Color Map Type
-        tga_file.push(2); // Image Type (Uncompressed True-Color)
-        tga_file.extend_from_slice(&[0, 0, 0, 0, 0]); // Color Map Spec
-        tga_file.extend_from_slice(&[0, 0, 0, 0]); // X, Y origin
-        tga_file.extend_from_slice(&(tex.width as u16).to_le_bytes()); // Width
-        tga_file.extend_from_slice(&(tex.height as u16).to_le_bytes()); // Height
-        tga_file.push(32); // Bits per pixel
-        tga_file.push(8); // Image Descriptor (8 bits alpha)
+        tga_file.push(0);
+        tga_file.push(0);
+        tga_file.push(2);
+        tga_file.extend_from_slice(&[0, 0, 0, 0, 0]);
+        tga_file.extend_from_slice(&[0, 0, 0, 0]);
+        tga_file.extend_from_slice(&(tex.width as u16).to_le_bytes());
+        tga_file.extend_from_slice(&(tex.height as u16).to_le_bytes());
+        tga_file.push(32);
+        tga_file.push(8);
 
-        // Flip rows vertically for standard bottom-up TGA files
         let row_len = (tex.width * 4) as usize;
         for y in (0..tex.height as usize).rev() {
             let row_start = y * row_len;
@@ -213,29 +184,24 @@ pub fn export_to_dds(data: &[u8]) -> Result<Vec<u8>, String> {
     Ok(dds)
 }
 
-/// Replaces the texture payload inside an existing chunk from a user-supplied image file (DDS or TGA).
-pub fn replace_texture_in_chunk(chunk_data: &[u8], input_image: &[u8]) -> Result<Vec<u8>, String> {
-    // -------------------------------------------------------------
-    // CASE 1: Processing a TGA Interface Image chunk (98 00 41 00)
-    // -------------------------------------------------------------
+pub fn replace_texture_in_chunk(chunk_data: &[u8], input_image: &[u8]) -> Result<Vec<u8>> {
     if chunk_data.starts_with(b"\x98\x00\x41\x00") {
-        let (width, height, is_top_left, pixel_data) = if input_image.starts_with(b"DDS ")
-            && input_image.len() >= 128
-        {
-            let mut c = Cursor::new(input_image);
-            c.set_position(12);
-            let h = c.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
-            let w = c.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
-            (w, h, true, &input_image[128..])
-        } else if input_image.len() >= 18 {
-            let w = u16::from_le_bytes(input_image[12..14].try_into().unwrap_or_default()) as u32;
-            let h = u16::from_le_bytes(input_image[14..16].try_into().unwrap_or_default()) as u32;
-            let descriptor = input_image[17];
-            let top_left = (descriptor & 0x20) != 0;
-            (w, h, top_left, &input_image[18..])
-        } else {
-            return Err("Invalid image file selected for TGA chunk.".into());
-        };
+        let (width, height, is_top_left, pixel_data) =
+            if input_image.starts_with(b"DDS ") && input_image.len() >= 128 {
+                let mut c = Cursor::new(input_image);
+                c.set_position(12);
+                let h = c.read_u32::<LittleEndian>()?;
+                let w = c.read_u32::<LittleEndian>()?;
+                (w, h, true, &input_image[128..])
+            } else if input_image.len() >= 18 {
+                let w = u16::from_le_bytes(input_image[12..14].try_into()?) as u32;
+                let h = u16::from_le_bytes(input_image[14..16].try_into()?) as u32;
+                let descriptor = input_image[17];
+                let top_left = (descriptor & 0x20) != 0;
+                (w, h, top_left, &input_image[18..])
+            } else {
+                bail!("Invalid image file selected for TGA chunk.");
+            };
 
         let mut final_pixels = Vec::with_capacity(pixel_data.len());
         let row_len = (width * 4) as usize;
@@ -252,20 +218,16 @@ pub fn replace_texture_in_chunk(chunk_data: &[u8], input_image: &[u8]) -> Result
             }
         }
 
-        // Rebuild TGA chunk
         let mut pos = 4;
         let num_offsets = chunk_data[pos] as usize;
         pos += 1 + num_offsets * 2;
-        let s1_len =
-            u32::from_le_bytes(chunk_data[pos..pos + 4].try_into().unwrap_or_default()) as usize;
+        let s1_len = u32::from_le_bytes(chunk_data[pos..pos + 4].try_into()?) as usize;
         pos += 4 + s1_len;
-        let s2_len =
-            u32::from_le_bytes(chunk_data[pos..pos + 4].try_into().unwrap_or_default()) as usize;
+        let s2_len = u32::from_le_bytes(chunk_data[pos..pos + 4].try_into()?) as usize;
         pos += 4 + s2_len;
 
-        let old_width = u32::from_le_bytes(chunk_data[pos..pos + 4].try_into().unwrap_or_default());
-        let old_height =
-            u32::from_le_bytes(chunk_data[pos + 4..pos + 8].try_into().unwrap_or_default());
+        let old_width = u32::from_le_bytes(chunk_data[pos..pos + 4].try_into()?);
+        let old_height = u32::from_le_bytes(chunk_data[pos + 4..pos + 8].try_into()?);
         let old_pixel_size = (old_width * old_height * 4) as usize;
         let padding_end = chunk_data.len().saturating_sub(old_pixel_size);
         let unknown_padding = if padding_end > pos + 8 {
@@ -282,18 +244,15 @@ pub fn replace_texture_in_chunk(chunk_data: &[u8], input_image: &[u8]) -> Result
         return Ok(out);
     }
 
-    // -------------------------------------------------------------
-    // CASE 2: Standard 3D Texture (3D 00 41 00) or Cubemap (99 00 41 00)
-    // -------------------------------------------------------------
     if chunk_data.starts_with(b"\x3D\x00\x41\x00") || chunk_data.starts_with(b"\x99\x00\x41\x00") {
         if input_image.len() < 128 || &input_image[0..4] != b"DDS " {
-            return Err("Invalid DDS file selected (must begin with 'DDS ').".into());
+            bail!("Invalid DDS file selected (must begin with 'DDS ').");
         }
 
         let mut c = Cursor::new(input_image);
         c.set_position(12);
-        let new_height = c.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
-        let new_width = c.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
+        let new_height = c.read_u32::<LittleEndian>()?;
+        let new_width = c.read_u32::<LittleEndian>()?;
 
         c.set_position(28);
         let mut mip_count = c.read_u32::<LittleEndian>().unwrap_or(1);
@@ -303,28 +262,25 @@ pub fn replace_texture_in_chunk(chunk_data: &[u8], input_image: &[u8]) -> Result
 
         c.set_position(84);
         let mut fourcc = [0u8; 4];
-        c.read_exact(&mut fourcc).map_err(|e| e.to_string())?;
+        c.read_exact(&mut fourcc)?;
 
         let (new_format, block_size) = match &fourcc {
             b"DXT1" => (7u32, 8usize),
             b"DXT3" => (9u32, 16usize),
             b"DXT5" => (11u32, 16usize),
-            _ => (5u32, 4usize), // Uncompressed RGBA
+            _ => (5u32, 4usize),
         };
 
-        // 1. Extract strings and padding from the original chunk
         let type_id = &chunk_data[0..4];
         let mut pos = 4;
         let num_offsets = chunk_data[pos] as usize;
         pos += 1 + num_offsets * 2;
 
-        let s1_len =
-            u32::from_le_bytes(chunk_data[pos..pos + 4].try_into().unwrap_or_default()) as usize;
+        let s1_len = u32::from_le_bytes(chunk_data[pos..pos + 4].try_into()?) as usize;
         let s1_bytes = &chunk_data[pos + 4..pos + 4 + s1_len];
         pos += 4 + s1_len;
 
-        let s2_len =
-            u32::from_le_bytes(chunk_data[pos..pos + 4].try_into().unwrap_or_default()) as usize;
+        let s2_len = u32::from_le_bytes(chunk_data[pos..pos + 4].try_into()?) as usize;
         let s2_bytes = &chunk_data[pos + 4..pos + 4 + s2_len];
         pos += 4 + s2_len;
 
@@ -334,7 +290,6 @@ pub fn replace_texture_in_chunk(chunk_data: &[u8], input_image: &[u8]) -> Result
             pos += 4;
         }
 
-        // 2. Build MipMap blocks (24 00 41 00 sub-containers) from the new DDS file
         let mut mip_blocks = Vec::new();
         let mut mip_offsets = Vec::new();
         let mut current_mip_offset = 0usize;
@@ -356,10 +311,9 @@ pub fn replace_texture_in_chunk(chunk_data: &[u8], input_image: &[u8]) -> Result
 
             let mip_pixels = &input_image[pixel_pos..pixel_pos + mip_size];
 
-            // Build Sub-Container: 24 00 41 00 + Table (04 1400 1504 1708 160C) + W + H + Format + Pixels
             let mut mip_chunk = Vec::with_capacity(25 + mip_pixels.len());
             mip_chunk.extend_from_slice(b"\x24\x00\x41\x00");
-            mip_chunk.push(4); // 4 small entries
+            mip_chunk.push(4);
             mip_chunk.extend_from_slice(&[20, 0, 21, 4, 23, 8, 22, 12]);
             mip_chunk.extend_from_slice(&w.to_le_bytes());
             mip_chunk.extend_from_slice(&h.to_le_bytes());
@@ -375,11 +329,10 @@ pub fn replace_texture_in_chunk(chunk_data: &[u8], input_image: &[u8]) -> Result
             h = (h / 2).max(1);
         }
 
-        // 3. Assemble the top-level chunk
         let mut out = Vec::new();
         out.extend_from_slice(type_id);
 
-        out.push(4); // 4 table entries in parent container
+        out.push(4);
         out.extend_from_slice(&[20, 0]);
         out.extend_from_slice(&[21, (4 + s1_bytes.len()) as u8]);
         out.extend_from_slice(&[19, (4 + s1_bytes.len() + 4 + s2_bytes.len()) as u8]);
@@ -394,7 +347,6 @@ pub fn replace_texture_in_chunk(chunk_data: &[u8], input_image: &[u8]) -> Result
         out.extend_from_slice(s2_bytes);
         out.extend_from_slice(&ff_pad);
 
-        // MipMap TOC Table
         let max_offset = mip_offsets.last().map(|&(_, off)| off).unwrap_or(0);
         if max_offset <= 255 {
             out.push(mip_offsets.len() as u8);
@@ -403,7 +355,7 @@ pub fn replace_texture_in_chunk(chunk_data: &[u8], input_image: &[u8]) -> Result
                 out.push(*off as u8);
             }
         } else {
-            out.push(0x81); // 1 small + N large entries
+            out.push(0x81);
             out.extend_from_slice(&((mip_offsets.len().saturating_sub(1)) as u32).to_le_bytes());
             out.extend_from_slice(&[0, 0]);
             for (idx, off) in &mip_offsets[1..] {
@@ -425,21 +377,18 @@ pub fn replace_texture_in_chunk(chunk_data: &[u8], input_image: &[u8]) -> Result
         return Ok(out);
     }
 
-    // -------------------------------------------------------------
-    // CASE 3: Fallback for generic sub-containers
-    // -------------------------------------------------------------
     if input_image.len() < 128 || &input_image[0..4] != b"DDS " {
-        return Err("Invalid DDS file selected.".into());
+        bail!("Invalid DDS file selected.");
     }
 
     let mut c = Cursor::new(input_image);
     c.set_position(12);
-    let height = c.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
-    let width = c.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
+    let height = c.read_u32::<LittleEndian>()?;
+    let width = c.read_u32::<LittleEndian>()?;
 
     c.set_position(84);
     let mut fourcc = [0u8; 4];
-    c.read_exact(&mut fourcc).map_err(|e| e.to_string())?;
+    c.read_exact(&mut fourcc)?;
 
     let new_format = match &fourcc {
         b"DXT1" => 7u32,

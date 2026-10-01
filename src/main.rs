@@ -6,9 +6,8 @@ mod utils;
 slint::include_modules!();
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() > 1 {
-        cli::handle_cli(&args)?;
+    if std::env::args().len() > 1 {
+        cli::handle_cli()?;
         return Ok(());
     }
 

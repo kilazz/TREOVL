@@ -1,3 +1,4 @@
+use anyhow::{Result, bail};
 use byteorder::{LittleEndian, ReadBytesExt};
 use serde::{Deserialize, Serialize};
 use std::io::{Cursor, Read};
@@ -15,25 +16,28 @@ pub struct PrpHeader {
 }
 
 impl PrpHeader {
-    pub fn read(data: &[u8]) -> Result<Self, String> {
+    pub fn read(data: &[u8]) -> Result<Self> {
         if data.len() < HEADER_SIZE {
-            return Err(format!("File too small: {} bytes", data.len()));
+            bail!(
+                "Package file is too small ({} bytes) to contain a valid header",
+                data.len()
+            );
         }
 
         let mut cur = Cursor::new(&data[..HEADER_SIZE]);
         let mut magic_bytes = [0u8; 4];
-        cur.read_exact(&mut magic_bytes).unwrap();
+        cur.read_exact(&mut magic_bytes)?;
 
         let magic = String::from_utf8_lossy(&magic_bytes)
             .trim_matches(char::from(0))
             .to_string();
-        let major_version = cur.read_u16::<LittleEndian>().unwrap();
-        let minor_version = cur.read_u16::<LittleEndian>().unwrap();
-        let file_id = cur.read_u32::<LittleEndian>().unwrap();
-        let data_size = cur.read_u32::<LittleEndian>().unwrap();
+        let major_version = cur.read_u16::<LittleEndian>()?;
+        let minor_version = cur.read_u16::<LittleEndian>()?;
+        let file_id = cur.read_u32::<LittleEndian>()?;
+        let data_size = cur.read_u32::<LittleEndian>()?;
 
         let mut name_bytes = [0u8; 160];
-        cur.read_exact(&mut name_bytes).unwrap();
+        cur.read_exact(&mut name_bytes)?;
         let pack_name = String::from_utf8_lossy(&name_bytes)
             .trim_matches(char::from(0))
             .to_string();
