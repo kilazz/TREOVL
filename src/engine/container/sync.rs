@@ -11,8 +11,8 @@ use crate::engine::assets::animation::{
     export_animation_to_glb, export_animation_to_json, export_skeleton_to_glb,
     parse_object_bone_container,
 };
+use crate::engine::assets::parse_chunk_elements;
 use crate::engine::assets::sniffer::{AssetKind, SniffedAsset, sniff_asset};
-use crate::engine::assets::{parse_chunk_elements, parse_typed_container};
 use crate::engine::common::magic;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -259,7 +259,6 @@ impl AssetProcessor for MeshProcessor {
             &glb_bytes,
         )?;
 
-        // Only export standalone .rig.glb when legitimate bones are confirmed
         if stats.is_skinned
             && let Ok(bones) = parse_object_bone_container(data)
             && !bones.is_empty()
@@ -313,6 +312,38 @@ impl AssetProcessor for AnimationProcessor {
                 chunk_rel_path: format!("chunks/{}.bin", stem),
                 asset_kind: "Animation".into(),
                 vanilla_crc32: calculate_crc32(&glb_bytes),
+                is_modified: false,
+            },
+        )))
+    }
+}
+
+pub struct VfxProcessor;
+impl AssetProcessor for VfxProcessor {
+    fn process(
+        &self,
+        data: &[u8],
+        stem: &str,
+        sniffed: &SniffedAsset,
+        workspace: &ProjectWorkspace,
+    ) -> Result<Option<(String, AssetSyncEntry)>> {
+        if sniffed.kind != AssetKind::Vfx {
+            return Ok(None);
+        }
+
+        let json_str = crate::engine::assets::vfx::export_vfx_to_json(data)?;
+        let out_name = build_asset_filename(&sniffed.display_name, stem, "json");
+
+        fs::write(
+            workspace.assets_dir.join("vfx").join(&out_name),
+            json_str.as_bytes(),
+        )?;
+        Ok(Some((
+            format!("assets/vfx/{}", out_name),
+            AssetSyncEntry {
+                chunk_rel_path: format!("chunks/{}.bin", stem),
+                asset_kind: "Vfx".into(),
+                vanilla_crc32: calculate_crc32(json_str.as_bytes()),
                 is_modified: false,
             },
         )))
@@ -518,112 +549,6 @@ impl AssetProcessor for ObjectProcessor {
     }
 }
 
-fn build_unknown_chunk_dossier(chunk_data: &[u8], stem: &str) -> serde_json::Value {
-    let magic_hex = if chunk_data.len() >= 4 {
-        hex::encode_upper(&chunk_data[..4])
-    } else {
-        String::from("TOO_SHORT")
-    };
-
-    let reversed_term = if chunk_data.len() >= 4 {
-        let val = u32::from_le_bytes(chunk_data[0..4].try_into().unwrap_or_default());
-        crate::engine::analysis::dictionary::DICTIONARY.lookup(val)
-    } else {
-        None
-    };
-
-    let stride_analysis = crate::engine::analysis::pattern::analyze_stride_and_pattern(chunk_data)
-        .map(|s| {
-            json!({
-                "detected_stride": s.detected_stride,
-                "element_count": s.element_count,
-                "pattern_type": s.pattern_type,
-                "samples": s.samples
-            })
-        });
-
-    let mut extracted_strings = Vec::new();
-    let mut i = 0;
-    while i < chunk_data.len() {
-        if i + 4 <= chunk_data.len() {
-            let str_len =
-                u32::from_le_bytes(chunk_data[i..i + 4].try_into().unwrap_or_default()) as usize;
-            if (3..=128).contains(&str_len)
-                && i + 4 + str_len <= chunk_data.len()
-                && let slice = &chunk_data[i + 4..i + 4 + str_len]
-                && slice.iter().all(|&b| (0x20..=0x7E).contains(&b))
-                && let Ok(s) = std::str::from_utf8(slice)
-            {
-                let clean = s.trim_matches(char::from(0)).trim();
-                if clean.len() >= 3 && !extracted_strings.contains(&clean.to_string()) {
-                    extracted_strings.push(clean.to_string());
-                }
-            }
-        }
-        i += 1;
-    }
-
-    if let Ok((has_magic, elements)) = parse_chunk_elements(chunk_data) {
-        let mut sub_elements_info = Vec::new();
-        for (sub_id, sub_data) in elements {
-            sub_elements_info.push(json!({
-                "sub_id": sub_id,
-                "sub_id_hex": format!("0x{:X}", sub_id),
-                "size_bytes": sub_data.len(),
-                "hex_preview": hex::encode_upper(&sub_data[..sub_data.len().min(32)])
-            }));
-        }
-        if !sub_elements_info.is_empty() {
-            return json!({
-                "chunk": stem,
-                "structure_type": "Untyped Container Sub-Table",
-                "has_container_magic": has_magic,
-                "total_bytes": chunk_data.len(),
-                "reversed_term_guess": reversed_term,
-                "stride_detector": stride_analysis,
-                "sub_elements_count": sub_elements_info.len(),
-                "sub_elements": sub_elements_info,
-                "embedded_strings": extracted_strings,
-                "full_hex": hex::encode_upper(chunk_data)
-            });
-        }
-    }
-
-    if let Ok((type_id, elements)) = parse_typed_container(chunk_data) {
-        let mut sub_elements_info = Vec::new();
-        for (sub_id, sub_data) in elements {
-            sub_elements_info.push(json!({
-                "sub_id": sub_id,
-                "size_bytes": sub_data.len(),
-                "hex_preview": hex::encode_upper(&sub_data[..sub_data.len().min(32)])
-            }));
-        }
-        return json!({
-            "chunk": stem,
-            "structure_type": "Typed Container",
-            "type_id_hex": format!("{:08X}", type_id),
-            "total_bytes": chunk_data.len(),
-            "reversed_term_guess": reversed_term,
-            "stride_detector": stride_analysis,
-            "sub_elements_count": sub_elements_info.len(),
-            "sub_elements": sub_elements_info,
-            "embedded_strings": extracted_strings,
-            "full_hex": hex::encode_upper(chunk_data)
-        });
-    }
-
-    json!({
-        "chunk": stem,
-        "structure_type": "Raw Leaf Data",
-        "total_bytes": chunk_data.len(),
-        "magic_header_hex": magic_hex,
-        "reversed_term_guess": reversed_term,
-        "stride_detector": stride_analysis,
-        "embedded_strings": extracted_strings,
-        "full_hex": hex::encode_upper(chunk_data)
-    })
-}
-
 pub struct RawProcessor;
 impl AssetProcessor for RawProcessor {
     fn process(
@@ -636,15 +561,6 @@ impl AssetProcessor for RawProcessor {
         let out_name = format!("{}.bin", stem);
         let bin_path = workspace.assets_dir.join("raw_chunks").join(&out_name);
         fs::write(&bin_path, data)?;
-
-        let dossier = build_unknown_chunk_dossier(data, stem);
-        let meta_path = workspace
-            .assets_dir
-            .join("raw_chunks")
-            .join(format!("{}.meta.json", stem));
-        if let Ok(meta_json_str) = serde_json::to_string_pretty(&dossier) {
-            let _ = fs::write(meta_path, meta_json_str);
-        }
 
         Ok(Some((
             format!("assets/raw_chunks/{}", out_name),
@@ -686,6 +602,7 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize> {
         "parameters",
         "ui",
         "objects",
+        "vfx",
     ];
     for dir in dirs {
         fs::create_dir_all(workspace.assets_dir.join(dir))?;
@@ -697,6 +614,7 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize> {
         Box::new(MaterialProcessor),
         Box::new(MeshProcessor),
         Box::new(AnimationProcessor),
+        Box::new(VfxProcessor),
         Box::new(LuaProcessor),
         Box::new(XmlProcessor),
         Box::new(ParameterProcessor),
@@ -837,6 +755,11 @@ pub fn sync_assets_to_chunks(project_dir: &Path) -> Result<usize> {
                         String::from_utf8(asset_bytes).context("Object JSON is not valid UTF-8")?;
                     crate::engine::assets::object::import_object_from_json(&json_str)?
                 }
+                "Vfx" => {
+                    let json_str =
+                        String::from_utf8(asset_bytes).context("VFX JSON is not valid UTF-8")?;
+                    crate::engine::assets::vfx::import_vfx_from_json(&json_str)?
+                }
                 "Animation" => baseline_chunk,
                 "Parameter" => {
                     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&asset_bytes) {
@@ -936,6 +859,7 @@ pub fn revert_single_asset(project_dir: &Path, chunk_path_str: &str) -> Result<(
         Box::new(MaterialProcessor),
         Box::new(MeshProcessor),
         Box::new(AnimationProcessor),
+        Box::new(VfxProcessor),
         Box::new(LuaProcessor),
         Box::new(XmlProcessor),
         Box::new(ParameterProcessor),

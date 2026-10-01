@@ -18,6 +18,7 @@ pub enum AssetKind {
     Attachment = 11,
     Parameter = 12,
     UI = 13,
+    Vfx = 14,
 }
 
 pub struct SniffedAsset {
@@ -40,7 +41,7 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
 
     let magic_bytes = &data[0..4];
 
-    // 1. High-Level Signature Check using centralized engine::common::magic
+    // 1. High-Level Signature Check
     let (kind, kind_name, icon) = if magic_bytes == magic::TEX_3D {
         (AssetKind::Texture, "Texture (DDS)", "🎨")
     } else if magic_bytes == magic::TEX_CUBEMAP {
@@ -55,6 +56,9 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
         (AssetKind::Animation, "Skeletal Animation", "🎬")
     } else if magic_bytes == magic::OBJECT {
         (AssetKind::Object, "3D Object Entity", "🧊")
+    } else if data.len() >= 4 && data[2] == 0x73 && data[3] == 0x00 {
+        // Triumph Particle / VFX System: 0x0073xxxx
+        (AssetKind::Vfx, "Particle System / VFX", "🔥")
     } else if magic_bytes == b"\x76\x00\x41\x00" {
         (AssetKind::UI, "UI Sprite Slice", "🖼️")
     } else if magic_bytes == b"\x77\x00\x41\x00" {
@@ -70,14 +74,13 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
     } else if (data.len() >= 4 && data[2] == 0x41 && data[1] == 0x06)
         || (data.len() >= 4 && data[3] == 0x00 && data[2] == 0x46)
     {
-        // Catch all Overlord 1 (0x004106xx) and Overlord 2 (0x0046xxxx) shader materials
         (AssetKind::Material, "Shader Material", "🛠️")
     } else if data.len() >= 4 && data[2] == 0x71 && data[3] == 0x00 {
-        // Direct detection of Triumph Engine UI Class: 0x0071xxxx (Menus, HUD, Windows)
         (AssetKind::UI, "UI / Menu Layout", "🖥️")
     } else if data.windows(5).any(|w| w == b"<?xml") {
-        // XML check must strictly precede string keyword heuristics
         (AssetKind::Xml, "XML Document", "📋")
+    } else if data.windows(4).any(|w| w == b".clb") {
+        (AssetKind::Parameter, "Collision Boundary Ref (.clb)", "🧱")
     } else if data.windows(4).any(|w| w == b"FACE")
         || data.windows(8).any(|w| w == b"Triumph ")
         || data.windows(6).any(|w| w == b"--Drop")
@@ -133,6 +136,7 @@ fn extract_internal_strings(data: &[u8]) -> Option<String> {
                         || clean.ends_with(".wav")
                         || clean.ends_with(".tga")
                         || clean.ends_with(".xml")
+                        || clean.ends_with(".clb")
                     {
                         return Some(clean.to_string());
                     }

@@ -15,6 +15,7 @@ pub mod sniffer;
 pub mod terrain;
 pub mod texture;
 pub mod ui;
+pub mod vfx;
 
 pub type ChunkElement = (u32, Vec<u8>);
 
