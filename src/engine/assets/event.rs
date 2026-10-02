@@ -25,13 +25,19 @@ pub struct SoundCueVariation {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SoundEventJson {
-    pub type_id_hex: String,
+    pub _engine_metadata: SoundEventEngineMetadataJson,
     pub event_name: String,
     pub group_path: String,
     pub flags_hex: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub variations: Vec<SoundCueVariation>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub raw_properties: Option<Vec<RawEventProp>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct SoundEventEngineMetadataJson {
+    pub type_id_hex: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub unmapped_properties: Vec<RawEventProp>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -52,7 +58,7 @@ pub fn export_event_to_json(chunk_data: &[u8]) -> Result<String> {
     let mut event_name = String::new();
     let mut flags_hex = String::from("04004021");
     let mut variations = Vec::new();
-    let mut raw_properties = Vec::new();
+    let mut unmapped_properties = Vec::new();
 
     for (id, chunk) in &elements {
         match *id {
@@ -72,8 +78,9 @@ pub fn export_event_to_json(chunk_data: &[u8]) -> Result<String> {
             40 => {
                 variations = parse_sound_cue_variations(chunk);
             }
+            23 | 19 | 1 => {}
             _ => {
-                raw_properties.push(RawEventProp {
+                unmapped_properties.push(RawEventProp {
                     id: *id,
                     hex: hex::encode_upper(chunk),
                 });
@@ -81,17 +88,17 @@ pub fn export_event_to_json(chunk_data: &[u8]) -> Result<String> {
         }
     }
 
-    let event_json = SoundEventJson {
+    let metadata = SoundEventEngineMetadataJson {
         type_id_hex: format!("{:08X}", type_id),
+        unmapped_properties,
+    };
+
+    let event_json = SoundEventJson {
+        _engine_metadata: metadata,
         event_name,
         group_path,
         flags_hex,
         variations,
-        raw_properties: if raw_properties.is_empty() {
-            None
-        } else {
-            Some(raw_properties)
-        },
     };
 
     serde_json::to_string_pretty(&event_json).map_err(|e| anyhow::anyhow!(e))
@@ -99,8 +106,8 @@ pub fn export_event_to_json(chunk_data: &[u8]) -> Result<String> {
 
 pub fn import_event_from_json(json_str: &str) -> Result<Vec<u8>> {
     let parsed: SoundEventJson = serde_json::from_str(json_str)?;
-    let type_id =
-        u32::from_str_radix(&parsed.type_id_hex, 16).context("Invalid TypeID hex in Event JSON")?;
+    let type_id = u32::from_str_radix(&parsed._engine_metadata.type_id_hex, 16)
+        .context("Invalid TypeID hex in Event JSON metadata")?;
 
     let mut elements = Vec::new();
     elements.push((20, write_length_prefixed_string(&parsed.group_path)));
@@ -119,13 +126,11 @@ pub fn import_event_from_json(json_str: &str) -> Result<Vec<u8>> {
     elements.push((19, vec![0xFF, 0xFF, 0xFF, 0xFF]));
     elements.push((1, vec![0u8]));
 
-    if let Some(raw_props) = parsed.raw_properties {
-        for p in raw_props {
-            if ![20, 21, 22, 23, 40, 19, 1].contains(&p.id)
-                && let Ok(b) = hex::decode(&p.hex)
-            {
-                elements.push((p.id, b));
-            }
+    for p in parsed._engine_metadata.unmapped_properties {
+        if ![20, 21, 22, 23, 40, 19, 1].contains(&p.id)
+            && let Ok(b) = hex::decode(&p.hex)
+        {
+            elements.push((p.id, b));
         }
     }
 

@@ -10,8 +10,7 @@ use crate::engine::common::{read_length_prefixed_string, write_length_prefixed_s
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CharacterActorJson {
-    pub type_id_hex: String,
-    pub engine_class: String,
+    pub _engine_metadata: CharacterEngineMetadataJson,
     pub character_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_tag: Option<String>,
@@ -51,6 +50,14 @@ pub struct CharacterActorJson {
     pub effect_receptors: Vec<CharacterAttachmentReceptorJson>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub minion_grapple_bones: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct CharacterEngineMetadataJson {
+    pub type_id_hex: String,
+    pub engine_class: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_flags_hex: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub unmapped_raw_blocks: Vec<RawCharacterBlock>,
 }
@@ -61,7 +68,6 @@ pub struct CharacterFlagsJson {
     pub can_be_targeted: bool,
     pub ragdoll_on_death: bool,
     pub is_civilian: bool,
-    pub raw_flags_hex: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -143,14 +149,6 @@ pub struct CharacterMorphParamsJson {
     pub blend_scale: Option<f32>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-pub struct CharacterSocketsJson {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub carry_grip_hex: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub equipment_inventory_hex: Option<String>,
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CharacterModelBinding {
     pub object_path: String,
@@ -211,6 +209,7 @@ pub fn export_character_to_json(
     let mut minion_grapple_bones = Vec::new();
     let mut attributes = CharacterAttributesJson::default();
     let mut flags = CharacterFlagsJson::default();
+    let mut raw_flags_hex_val = None;
     let mut timings = CharacterCombatTimingsJson::default();
     let mut knockback = CharacterKnockbackJson::default();
     let mut state_rewards = CharacterStateAndRewardsJson::default();
@@ -239,8 +238,8 @@ pub fn export_character_to_json(
                     can_be_targeted: (mask & 0x0100_0000) != 0,
                     ragdoll_on_death: (mask & 0x0040_0000) != 0,
                     is_civilian: (mask & 0x0000_0002) != 0,
-                    raw_flags_hex: format!("0x{:08X}", mask),
                 };
+                raw_flags_hex_val = Some(format!("0x{:08X}", mask));
             }
             23 if !chunk.is_empty() => {
                 attributes.is_enabled = Some(chunk[0] != 0);
@@ -398,9 +397,15 @@ pub fn export_character_to_json(
         }
     }
 
-    let char_json = CharacterActorJson {
+    let metadata = CharacterEngineMetadataJson {
         type_id_hex: format!("{:08X}", type_id),
         engine_class: "TREActorController".to_string(),
+        raw_flags_hex: raw_flags_hex_val,
+        unmapped_raw_blocks,
+    };
+
+    let char_json = CharacterActorJson {
+        _engine_metadata: metadata,
         character_name,
         resource_tag,
         model_binding,
@@ -421,7 +426,6 @@ pub fn export_character_to_json(
         transformations,
         effect_receptors,
         minion_grapple_bones,
-        unmapped_raw_blocks,
     };
 
     serde_json::to_string_pretty(&char_json).map_err(|e| anyhow::anyhow!(e))
@@ -429,13 +433,13 @@ pub fn export_character_to_json(
 
 pub fn import_character_from_json(json_str: &str, project_dir: Option<&Path>) -> Result<Vec<u8>> {
     let parsed: CharacterActorJson = serde_json::from_str(json_str)?;
-    let type_id = u32::from_str_radix(&parsed.type_id_hex, 16)
-        .context("Invalid TypeID hex in Character JSON")?;
+    let type_id = u32::from_str_radix(&parsed._engine_metadata.type_id_hex, 16)
+        .context("Invalid TypeID hex in Character JSON metadata")?;
 
     let mut elements = Vec::new();
 
-    // 1. Unmapped blocks fallback
-    for block in &parsed.unmapped_raw_blocks {
+    // 1. Restore unmapped raw engine blocks
+    for block in &parsed._engine_metadata.unmapped_raw_blocks {
         let mut chunk_bytes = hex::decode(&block.hex)
             .with_context(|| format!("Invalid hex payload in block ID {}", block.id))?;
 
@@ -448,7 +452,7 @@ pub fn import_character_from_json(json_str: &str, project_dir: Option<&Path>) ->
         elements.push((block.id, chunk_bytes));
     }
 
-    // 2. Identity & Naming
+    // 2. Synthesize all structured properties cleanly
     if let Some(ref tag) = parsed.resource_tag {
         elements.push((20, write_length_prefixed_string(tag)));
     }
@@ -457,20 +461,36 @@ pub fn import_character_from_json(json_str: &str, project_dir: Option<&Path>) ->
     elements.push((25, write_length_prefixed_string(&parsed.character_name)));
 
     if let Some(ref flags) = parsed.actor_flags {
-        let mut mask = u32::from_str_radix(flags.raw_flags_hex.trim_start_matches("0x"), 16)
-            .unwrap_or(0x2140_0000);
+        let mut mask = if let Some(ref raw_h) = parsed._engine_metadata.raw_flags_hex {
+            u32::from_str_radix(raw_h.trim_start_matches("0x"), 16).unwrap_or(0x2140_0000)
+        } else {
+            0x2140_0000
+        };
+
         if flags.casts_dynamic_shadows {
             mask |= 0x2000_0000;
+        } else {
+            mask &= !0x2000_0000;
         }
+
         if flags.can_be_targeted {
             mask |= 0x0100_0000;
+        } else {
+            mask &= !0x0100_0000;
         }
+
         if flags.ragdoll_on_death {
             mask |= 0x0040_0000;
+        } else {
+            mask &= !0x0040_0000;
         }
+
         if flags.is_civilian {
             mask |= 0x0000_0002;
+        } else {
+            mask &= !0x0000_0002;
         }
+
         elements.push((22, mask.to_le_bytes().to_vec()));
     }
 
@@ -615,15 +635,17 @@ fn parse_equipment_definition(elements: &[(u32, Vec<u8>)]) -> Option<CharacterEq
     let mut item_name = String::from("Standard Plate / Prop");
 
     if let Some((_, chunk63)) = elements.iter().find(|(id, _)| *id == 63) {
-        if let Ok((_, sub)) = parse_typed_container(chunk63) {
-            for (_, sdata) in sub {
-                if let Some(name) = read_length_prefixed_string(&sdata) {
-                    item_name = name;
+        let mut i = 0;
+        while i + 4 <= chunk63.len() {
+            if let Some(s) = read_length_prefixed_string(&chunk63[i..]) {
+                if !s.is_empty() && !s.starts_with('[') {
+                    item_name = s;
                     break;
                 }
+                i += 4 + s.len();
+            } else {
+                i += 1;
             }
-        } else if let Some(name) = read_length_prefixed_string(chunk63) {
-            item_name = name;
         }
     }
 

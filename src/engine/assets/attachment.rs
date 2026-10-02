@@ -10,7 +10,7 @@ use crate::engine::common::{read_length_prefixed_string, write_length_prefixed_s
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ItemAttachmentJson {
-    pub resource_tag: String,
+    pub _engine_metadata: AttachmentEngineMetadataJson,
     pub item_name: String,
     pub internal_model_slot: String,
     pub mesh_package: String,
@@ -20,6 +20,11 @@ pub struct ItemAttachmentJson {
     pub flags: ItemFlagsJson,
     pub socket: ItemSocketConfigJson,
     pub physics: ItemPhysicsConfigJson,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct AttachmentEngineMetadataJson {
+    pub resource_tag: String,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub unmapped_properties: Vec<RawAttachmentProp>,
 }
@@ -170,9 +175,7 @@ pub fn export_attachment_to_json(data: &[u8]) -> Result<String> {
                             hold_offset = pos;
                         }
                     }
-                    23 | 28 | 36 | 140 | 141 | 19 | 1 => {
-                        // Standard structural constants handled automatically upon import
-                    }
+                    23 | 28 | 36 | 140 | 141 | 19 | 1 => {}
                     _ => {
                         unmapped_properties.push(RawAttachmentProp {
                             id,
@@ -198,8 +201,13 @@ pub fn export_attachment_to_json(data: &[u8]) -> Result<String> {
         }
     }
 
-    let item_json = ItemAttachmentJson {
+    let metadata = AttachmentEngineMetadataJson {
         resource_tag,
+        unmapped_properties,
+    };
+
+    let item_json = ItemAttachmentJson {
+        _engine_metadata: metadata,
         item_name,
         internal_model_slot,
         mesh_package,
@@ -209,7 +217,6 @@ pub fn export_attachment_to_json(data: &[u8]) -> Result<String> {
         flags,
         socket,
         physics,
-        unmapped_properties,
     };
 
     serde_json::to_string_pretty(&item_json).map_err(|e| anyhow::anyhow!(e))
@@ -225,7 +232,6 @@ pub fn import_attachment_from_json(json_str: &str) -> Result<Vec<u8>> {
     ));
     item_sub.push((21, write_length_prefixed_string(&parsed.item_name)));
 
-    // Reconstruct bitmask flags
     let mut flag_bits = u32::from_str_radix(parsed.flags.raw_mask_hex.trim_start_matches("0x"), 16)
         .unwrap_or(0x2100_0000);
     if parsed.flags.is_pickable {
@@ -243,14 +249,12 @@ pub fn import_attachment_from_json(json_str: &str) -> Result<Vec<u8>> {
     item_sub.push((28, vec![0u8]));
     item_sub.push((29, build_socket_data(&parsed.socket)));
 
-    // Mesh and submesh bindings
     let mesh_elems = vec![
         (20, write_length_prefixed_string(&parsed.mesh_package)),
         (21, write_length_prefixed_string(&parsed.submesh_name)),
     ];
     item_sub.push((30, build_chunk_from_elements(false, &mesh_elems)));
 
-    // Physics & Collision properties
     item_sub.push((35, parsed.physics.category_id.to_le_bytes().to_vec()));
     item_sub.push((36, vec![1u8, 1, 0, 0]));
     item_sub.push((
@@ -282,11 +286,9 @@ pub fn import_attachment_from_json(json_str: &str) -> Result<Vec<u8>> {
     ));
     item_sub.push((140, vec![1u8, 1, 0, 0]));
     item_sub.push((141, vec![1u8, 1, 0, 0]));
-
-    // Hold Offset transform vector
     item_sub.push((143, build_transform_offset(parsed.hold_offset)));
 
-    for prop in parsed.unmapped_properties {
+    for prop in parsed._engine_metadata.unmapped_properties {
         if let Ok(b) = hex::decode(&prop.hex) {
             item_sub.push((prop.id, b));
         }
@@ -298,26 +300,23 @@ pub fn import_attachment_from_json(json_str: &str) -> Result<Vec<u8>> {
 
     let item_resource_blob = build_typed_container(0x0046_200D, &item_sub);
 
-    // Rebuild Sound Bank Descriptor (0x04000057)
     let sound_elems = vec![
         (10, write_length_prefixed_string(&parsed.sound_bank)),
         (11, vec![0, 0, 0, 0]),
     ];
     let sound_blob = build_typed_container(0x0400_0057, &sound_elems);
 
-    // Build Root Container (Control byte 0x03)
     let root_elements = vec![
-        (20, write_length_prefixed_string(&parsed.resource_tag)),
+        (
+            20,
+            write_length_prefixed_string(&parsed._engine_metadata.resource_tag),
+        ),
         (21, item_resource_blob),
         (30, sound_blob),
     ];
 
     Ok(build_chunk_from_elements(false, &root_elements))
 }
-
-// =========================================================================
-// INTERNAL DECODING & ENCODING HELPERS
-// =========================================================================
 
 fn parse_transform_offset(chunk: &[u8]) -> Option<[f32; 3]> {
     if chunk.len() >= 15 && chunk[0] == 1 && chunk[1] == 20 {

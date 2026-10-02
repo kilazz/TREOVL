@@ -18,9 +18,7 @@ fn is_empty_container(chunk: &[u8]) -> bool {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ObjectEntityJson {
-    pub type_id_hex: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub class_name: Option<String>,
+    pub _engine_metadata: ObjectEngineMetadataJson,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group_tag: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -43,6 +41,13 @@ pub struct ObjectEntityJson {
     pub attachments: Vec<AttachmentSlotJson>,
     #[serde(default = "default_true")]
     pub has_sentinel_terminator: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ObjectEngineMetadataJson {
+    pub type_id_hex: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub class_name: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub raw_fallbacks: Vec<RawFallbackComponentJson>,
 }
@@ -345,9 +350,14 @@ pub fn export_object_to_json(data: &[u8], output_dir: Option<&Path>) -> Result<S
         }
     }
 
-    let entity_json = ObjectEntityJson {
+    let metadata = ObjectEngineMetadataJson {
         type_id_hex: format!("{:08X}", type_id),
         class_name,
+        raw_fallbacks,
+    };
+
+    let entity_json = ObjectEntityJson {
+        _engine_metadata: metadata,
         group_tag,
         entity_name: entity_name.clone(),
         scale,
@@ -359,7 +369,6 @@ pub fn export_object_to_json(data: &[u8], output_dir: Option<&Path>) -> Result<S
         bones: bones.clone(),
         attachments,
         has_sentinel_terminator,
-        raw_fallbacks,
     };
 
     if let Some(dir) = output_dir
@@ -377,13 +386,14 @@ pub fn export_object_to_json(data: &[u8], output_dir: Option<&Path>) -> Result<S
 
 pub fn import_object_from_json(json_str: &str) -> Result<Vec<u8>> {
     let parsed: ObjectEntityJson = serde_json::from_str(json_str)?;
-    let type_id = u32::from_str_radix(&parsed.type_id_hex, 16)
-        .context("Invalid TypeID hex in Object JSON")?;
+    let type_id = u32::from_str_radix(&parsed._engine_metadata.type_id_hex, 16)
+        .context("Invalid TypeID hex in Object JSON metadata")?;
 
     let mut elements = Vec::new();
 
     let get_fallback = |id: u32| -> Option<Vec<u8>> {
         parsed
+            ._engine_metadata
             .raw_fallbacks
             .iter()
             .find(|fb| fb.id == id)
@@ -463,7 +473,7 @@ pub fn import_object_from_json(json_str: &str) -> Result<Vec<u8>> {
         elements.push((1, vec![0u8]));
     }
 
-    for fb in &parsed.raw_fallbacks {
+    for fb in &parsed._engine_metadata.raw_fallbacks {
         if ![20, 21, 30, 32, 33, 34, 35, 36, 37, 19, 1].contains(&fb.id)
             && let Ok(raw) = hex::decode(&fb.hex)
         {

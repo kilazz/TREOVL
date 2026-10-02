@@ -8,10 +8,15 @@ use crate::engine::common::read_length_prefixed_string;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MaterialJson {
-    pub type_id_hex: String,
-    pub engine_generation: String,
+    pub _engine_metadata: MaterialEngineMetadataJson,
     pub material_name: String,
     pub blocks: Vec<MaterialBlock>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct MaterialEngineMetadataJson {
+    pub type_id_hex: String,
+    pub engine_generation: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -169,13 +174,11 @@ pub fn export_material_to_json(chunk_data: &[u8]) -> Result<String> {
         let mut ptr = None;
         let mut name = None;
 
-        // Check if block is a length-prefixed ASCII string using the safe helper
         if let Some(s) = read_length_prefixed_string(&chunk) {
             btype = "string".to_string();
             value = Some(s);
         }
 
-        // Check if block is a texture link container
         if btype == "raw" && !chunk.is_empty() {
             let num_offsets = chunk[0] as usize;
             if (num_offsets == 1 || num_offsets == 2) && chunk.len() > 1 + num_offsets * 2 {
@@ -208,7 +211,6 @@ pub fn export_material_to_json(chunk_data: &[u8]) -> Result<String> {
             }
         }
 
-        // Parse 4-byte scalar parameters (Float vs Integer)
         if btype == "raw" && chunk.len() == 4 && (41..=55).contains(&id) {
             let mut cur = Cursor::new(&chunk);
             let raw_u32 = cur.read_u32::<LittleEndian>().unwrap_or(0);
@@ -239,9 +241,13 @@ pub fn export_material_to_json(chunk_data: &[u8]) -> Result<String> {
         });
     }
 
-    let mat_json = MaterialJson {
+    let metadata = MaterialEngineMetadataJson {
         type_id_hex: format!("{:08X}", type_id),
         engine_generation: engine_gen.to_string(),
+    };
+
+    let mat_json = MaterialJson {
+        _engine_metadata: metadata,
         material_name: mat_name.to_string(),
         blocks,
     };
@@ -251,8 +257,8 @@ pub fn export_material_to_json(chunk_data: &[u8]) -> Result<String> {
 
 pub fn import_material_from_json(json_str: &str) -> Result<Vec<u8>> {
     let mat_json: MaterialJson = serde_json::from_str(json_str)?;
-    let type_id = u32::from_str_radix(&mat_json.type_id_hex, 16)
-        .map_err(|_| anyhow::anyhow!("Invalid hexadecimal Type ID"))?;
+    let type_id = u32::from_str_radix(&mat_json._engine_metadata.type_id_hex, 16)
+        .map_err(|_| anyhow::anyhow!("Invalid hexadecimal Type ID metadata"))?;
 
     let mut elements = Vec::new();
 

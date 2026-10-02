@@ -10,7 +10,7 @@ use crate::engine::common::{read_length_prefixed_string, write_length_prefixed_s
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct VfxGraphJson {
-    pub type_id_hex: String,
+    pub _engine_metadata: VfxEngineMetadataJson,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -21,6 +21,12 @@ pub struct VfxGraphJson {
     pub enabled: Option<bool>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub emitters: Vec<VfxEmitterJson>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct VfxEngineMetadataJson {
+    pub type_id_hex: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub components: Vec<VfxComponentBlockJson>,
 }
 
@@ -118,14 +124,18 @@ pub fn export_vfx_to_json(chunk_data: &[u8]) -> Result<String> {
         });
     }
 
-    let vfx_json = VfxGraphJson {
+    let metadata = VfxEngineMetadataJson {
         type_id_hex: format!("{:08X}", type_id),
+        components,
+    };
+
+    let vfx_json = VfxGraphJson {
+        _engine_metadata: metadata,
         group_path,
         vfx_name,
         effect_id_hex,
         enabled,
         emitters,
-        components,
     };
 
     serde_json::to_string_pretty(&vfx_json).map_err(|e| anyhow::anyhow!(e))
@@ -133,12 +143,12 @@ pub fn export_vfx_to_json(chunk_data: &[u8]) -> Result<String> {
 
 pub fn import_vfx_from_json(json_str: &str) -> Result<Vec<u8>> {
     let parsed: VfxGraphJson = serde_json::from_str(json_str)?;
-    let type_id =
-        u32::from_str_radix(&parsed.type_id_hex, 16).context("Invalid TypeID hex in VFX JSON")?;
+    let type_id = u32::from_str_radix(&parsed._engine_metadata.type_id_hex, 16)
+        .context("Invalid TypeID hex in VFX JSON metadata")?;
 
     let mut elements = Vec::new();
 
-    for comp in parsed.components {
+    for comp in parsed._engine_metadata.components {
         let mut raw_bytes = hex::decode(&comp.hex)
             .with_context(|| format!("Invalid hex payload in component ID {}", comp.id))?;
 
@@ -162,7 +172,7 @@ pub fn import_vfx_from_json(json_str: &str) -> Result<Vec<u8>> {
             }
             23 => {
                 if let Some(en) = parsed.enabled {
-                    raw_bytes = vec![if en { 1u8 } else { 0u8 }];
+                    raw_bytes = vec![if en { 1 } else { 0 }];
                 }
             }
             1 if !parsed.emitters.is_empty() => {
@@ -269,7 +279,6 @@ fn parse_single_emitter(data: &[u8]) -> Result<VfxEmitterJson> {
             _ => {}
         }
 
-        // Auto-decode 3D vectors (12 bytes = 3x f32)
         if ptype == "hex" && chunk.len() == 12 {
             let mut cur = Cursor::new(&chunk);
             if let (Ok(x), Ok(y), Ok(z)) = (
@@ -289,7 +298,6 @@ fn parse_single_emitter(data: &[u8]) -> Result<VfxEmitterJson> {
             }
         }
 
-        // Auto-decode 4D vectors (16 bytes = 4x f32)
         if ptype == "hex" && chunk.len() == 16 {
             let mut cur = Cursor::new(&chunk);
             if let (Ok(x), Ok(y), Ok(z), Ok(w)) = (
@@ -311,7 +319,6 @@ fn parse_single_emitter(data: &[u8]) -> Result<VfxEmitterJson> {
             }
         }
 
-        // Auto-decode 4-byte numbers (Float / Uint / Color)
         if ptype == "hex" && chunk.len() == 4 {
             if (40..=48).contains(&id) {
                 color_hex = Some(hex::encode_upper(&chunk));
@@ -346,7 +353,6 @@ fn parse_single_emitter(data: &[u8]) -> Result<VfxEmitterJson> {
             }
         }
 
-        // Auto-decode 1- and 2-byte integers / flags
         if ptype == "hex" && (chunk.len() == 1 || chunk.len() == 2) {
             let mut val = 0u32;
             for (b_i, &byte) in chunk.iter().enumerate() {

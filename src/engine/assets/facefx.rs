@@ -8,11 +8,16 @@ use crate::engine::common::read_length_prefixed_string;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FaceFxJson {
-    pub type_id_hex: String,
-    pub resource_path: String,
+    pub _engine_metadata: FaceFxEngineMetadataJson,
     pub actor_name: String,
     pub fxe_filename: String,
     pub fxe_size: usize,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct FaceFxEngineMetadataJson {
+    pub type_id_hex: String,
+    pub resource_path: String,
 }
 
 pub fn export_facefx_to_json(chunk_data: &[u8], assets_dir: &Path, stem: &str) -> Result<String> {
@@ -71,9 +76,13 @@ pub fn export_facefx_to_json(chunk_data: &[u8], assets_dir: &Path, stem: &str) -
         fs::write(&fxe_out_path, &fxe_payload)?;
     }
 
-    let fx_json = FaceFxJson {
+    let metadata = FaceFxEngineMetadataJson {
         type_id_hex: format!("{:08X}", type_id),
         resource_path,
+    };
+
+    let fx_json = FaceFxJson {
+        _engine_metadata: metadata,
         actor_name,
         fxe_filename,
         fxe_size: fxe_payload.len(),

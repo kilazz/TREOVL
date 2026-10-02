@@ -11,9 +11,7 @@ use crate::engine::common::{read_length_prefixed_string, write_length_prefixed_s
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TerrainPaletteJson {
-    pub type_id_hex: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resource_tag: Option<String>,
+    pub _engine_metadata: TerrainPaletteEngineMetadataJson,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub palette_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -24,9 +22,17 @@ pub struct TerrainPaletteJson {
     pub terrain_splat_layers: Vec<SplatLayerJson>,
     pub foliage_scatter_groups: HashMap<String, Vec<FoliageMeshJson>>,
     pub environment: EnvironmentLinksJson,
-    pub terminator_sentinel: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct TerrainPaletteEngineMetadataJson {
+    pub type_id_hex: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub raw_fallback_components: Option<Vec<RawComponentJson>>,
+    pub resource_tag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminator_sentinel: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub raw_fallback_components: Vec<RawComponentJson>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -104,16 +110,10 @@ pub fn export_terrain_palette_to_json(data: &[u8]) -> Result<String> {
     let mut terrain_splat_layers = Vec::new();
     let mut foliage_scatter_groups: HashMap<String, Vec<FoliageMeshJson>> = HashMap::new();
     let mut environment = EnvironmentLinksJson::default();
-    let mut terminator_sentinel = "FFFFFFFF".to_string();
+    let mut terminator_sentinel = None;
     let mut raw_components = Vec::new();
 
     for (id, chunk) in &elements {
-        raw_components.push(RawComponentJson {
-            id: *id,
-            role: get_component_role(*id).to_string(),
-            hex: hex::encode_upper(chunk),
-        });
-
         match *id {
             20 => resource_tag = read_length_prefixed_string(chunk),
             21 => palette_name = read_length_prefixed_string(chunk),
@@ -163,15 +163,27 @@ pub fn export_terrain_palette_to_json(data: &[u8]) -> Result<String> {
                 }
             }
             19 => {
-                terminator_sentinel = hex::encode_upper(chunk);
+                terminator_sentinel = Some(hex::encode_upper(chunk));
             }
-            _ => {}
+            _ => {
+                raw_components.push(RawComponentJson {
+                    id: *id,
+                    role: get_component_role(*id).to_string(),
+                    hex: hex::encode_upper(chunk),
+                });
+            }
         }
     }
 
-    let json_data = TerrainPaletteJson {
+    let metadata = TerrainPaletteEngineMetadataJson {
         type_id_hex: format!("{:08X}", type_id),
         resource_tag,
+        terminator_sentinel,
+        raw_fallback_components: raw_components,
+    };
+
+    let json_data = TerrainPaletteJson {
+        _engine_metadata: metadata,
         palette_name,
         thumbnail,
         render_flags,
@@ -180,8 +192,6 @@ pub fn export_terrain_palette_to_json(data: &[u8]) -> Result<String> {
         terrain_splat_layers,
         foliage_scatter_groups,
         environment,
-        terminator_sentinel,
-        raw_fallback_components: Some(raw_components),
     };
 
     serde_json::to_string_pretty(&json_data).map_err(|e| anyhow::anyhow!(e))
@@ -189,61 +199,57 @@ pub fn export_terrain_palette_to_json(data: &[u8]) -> Result<String> {
 
 pub fn import_terrain_palette_from_json(json_str: &str) -> Result<Vec<u8>> {
     let parsed: TerrainPaletteJson = serde_json::from_str(json_str)?;
-    let type_id = u32::from_str_radix(&parsed.type_id_hex, 16)
-        .context("Invalid TypeID hex in Terrain Palette JSON")?;
+    let type_id = u32::from_str_radix(&parsed._engine_metadata.type_id_hex, 16)
+        .context("Invalid TypeID hex in Terrain Palette JSON metadata")?;
 
     let mut elements = Vec::new();
 
-    if let Some(raw_list) = parsed.raw_fallback_components {
-        for comp in raw_list {
-            let mut raw_bytes = hex::decode(&comp.hex)
-                .with_context(|| format!("Invalid hex payload in component ID {}", comp.id))?;
+    for comp in parsed._engine_metadata.raw_fallback_components {
+        let mut raw_bytes = hex::decode(&comp.hex)
+            .with_context(|| format!("Invalid hex payload in component ID {}", comp.id))?;
 
-            match comp.id {
-                20 => {
-                    if let Some(ref tag) = parsed.resource_tag {
-                        raw_bytes = write_length_prefixed_string(tag);
-                    }
+        match comp.id {
+            40..=53 => {
+                if let Some(tex) = parsed.textures.iter().find(|t| t.slot_id == comp.id) {
+                    raw_bytes = build_texture_link(&tex.pointer_tag, &tex.filename);
                 }
-                21 => {
-                    if let Some(ref name) = parsed.palette_name {
-                        raw_bytes = write_length_prefixed_string(name);
-                    }
-                }
-                22 => {
-                    if let Ok(flags_bytes) = hex::decode(&parsed.render_flags.raw_hex) {
-                        raw_bytes = flags_bytes;
-                    }
-                }
-                23 => {
-                    raw_bytes = vec![parsed.sub_layer_counter];
-                }
-                40..=53 => {
-                    if let Some(tex) = parsed.textures.iter().find(|t| t.slot_id == comp.id) {
-                        raw_bytes = build_texture_link(&tex.pointer_tag, &tex.filename);
-                    }
-                }
-                54 => {
-                    // Rebuild splat and foliage layers from edited JSON instead of blindly copying old hex
-                    if let Ok(rebuilt) = rebuild_splat_and_foliage_container(
-                        &parsed.terrain_splat_layers,
-                        &parsed.foliage_scatter_groups,
-                    ) {
-                        raw_bytes = rebuilt;
-                    }
-                }
-                62 => {
-                    if let Some(ref thumb) = parsed.thumbnail {
-                        raw_bytes = write_length_prefixed_string(thumb);
-                    }
-                }
-                _ => {}
             }
-
-            elements.push((comp.id, raw_bytes));
+            54 => {
+                if let Ok(rebuilt) = rebuild_splat_and_foliage_container(
+                    &parsed.terrain_splat_layers,
+                    &parsed.foliage_scatter_groups,
+                ) {
+                    raw_bytes = rebuilt;
+                }
+            }
+            _ => {}
         }
+
+        elements.push((comp.id, raw_bytes));
     }
 
+    if let Some(ref tag) = parsed._engine_metadata.resource_tag {
+        elements.push((20, write_length_prefixed_string(tag)));
+    }
+    if let Some(ref name) = parsed.palette_name {
+        elements.push((21, write_length_prefixed_string(name)));
+    }
+    if let Ok(flags_bytes) = hex::decode(&parsed.render_flags.raw_hex) {
+        elements.push((22, flags_bytes));
+    }
+    elements.push((23, vec![parsed.sub_layer_counter]));
+
+    if let Some(ref thumb) = parsed.thumbnail {
+        elements.push((62, write_length_prefixed_string(thumb)));
+    }
+
+    if let Some(ref sent) = parsed._engine_metadata.terminator_sentinel
+        && let Ok(sent_bytes) = hex::decode(sent)
+    {
+        elements.push((19, sent_bytes));
+    }
+
+    elements.sort_by_key(|(id, _)| *id);
     Ok(build_typed_container(type_id, &elements))
 }
 
