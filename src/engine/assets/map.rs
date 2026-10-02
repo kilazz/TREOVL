@@ -1,5 +1,6 @@
 use super::parse_chunk_elements;
 use super::terrain::{add_terrain_to_builder, parse_terrain_geometry};
+use crate::engine::common::read_length_prefixed_string;
 use crate::engine::math::Vector3;
 use crate::utils::gltf_builder::GltfBuilder;
 use anyhow::{Context, Result};
@@ -49,21 +50,13 @@ pub fn parse_omp_map(chunk_data: &[u8]) -> Result<MapInfo> {
                             for (e_idx, e_chunk) in &entity_table {
                                 if let Ok((_, e_props)) = parse_chunk_elements(e_chunk) {
                                     for (pid, pval) in e_props {
-                                        if pid == 31 && pval.len() >= 4 {
-                                            let mut cur = Cursor::new(&pval[0..4]);
-                                            let slen = cur.read_u32::<LittleEndian>().unwrap_or(0)
-                                                as usize;
-                                            if slen + 4 <= pval.len()
-                                                && let Ok(ename) =
-                                                    std::str::from_utf8(&pval[4..4 + slen])
-                                            {
-                                                entities.push(MapEntity {
-                                                    name: ename
-                                                        .trim_matches(char::from(0))
-                                                        .to_string(),
-                                                    index: *e_idx,
-                                                });
-                                            }
+                                        if pid == 31
+                                            && let Some(ename) = read_length_prefixed_string(&pval)
+                                        {
+                                            entities.push(MapEntity {
+                                                name: ename,
+                                                index: *e_idx,
+                                            });
                                         }
                                     }
                                 }
@@ -80,13 +73,9 @@ pub fn parse_omp_map(chunk_data: &[u8]) -> Result<MapInfo> {
                     z: cur.read_f32::<LittleEndian>().unwrap_or(0.0),
                 });
             }
-            34 if chunk.len() >= 4 => {
-                let mut cur = Cursor::new(&chunk[0..4]);
-                let len = cur.read_u32::<LittleEndian>()? as usize;
-                if len == chunk.len() - 4
-                    && let Ok(s) = std::str::from_utf8(&chunk[4..])
-                {
-                    map_name = s.trim_matches(char::from(0)).to_string();
+            34 => {
+                if let Some(s) = read_length_prefixed_string(&chunk) {
+                    map_name = s;
                 }
             }
             _ => {}
@@ -100,10 +89,6 @@ pub fn parse_omp_map(chunk_data: &[u8]) -> Result<MapInfo> {
         entities,
     })
 }
-
-// -------------------------------------------------------------
-// STANDARD LEVEL EXPORTER (CORRECT GLTF 2.0 SCENE)
-// -------------------------------------------------------------
 
 pub fn export_level_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>> {
     let payload = if chunk_data.starts_with(b"OMP") && chunk_data.len() > 43 {
@@ -126,7 +111,6 @@ pub fn export_level_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>> {
     let mut builder = GltfBuilder::new();
     let mut scene_nodes = Vec::new();
 
-    // 1. Terrain Mesh
     let terrain_node = add_terrain_to_builder(
         &mut builder,
         &terrain_geom,
@@ -134,7 +118,6 @@ pub fn export_level_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>> {
     )?;
     scene_nodes.push(terrain_node);
 
-    // 2. Geometry for Entity Locators (3D Pyramid)
     let marker_verts: [[f32; 3]; 5] = [
         [0.0, 3.0, 0.0],
         [-1.0, 0.0, -1.0],
@@ -177,7 +160,6 @@ pub fn export_level_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>> {
         }]
     }));
 
-    // 3. Player Spawn Locator
     if let Some(spawn) = map_info.player_spawn {
         let spawn_node = builder.add_node(json!({
             "name": "Player_Start_Location",
@@ -187,7 +169,6 @@ pub fn export_level_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>> {
         scene_nodes.push(spawn_node);
     }
 
-    // 4. Placed Entities
     for (i, ent) in map_info.entities.iter().enumerate() {
         let ent_node = builder.add_node(json!({
             "name": format!("{}_{}", ent.name, i + 1),
@@ -201,10 +182,6 @@ pub fn export_level_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>> {
     builder.build("Overlord Modding Studio Level Exporter")
 }
 
-// -------------------------------------------------------------
-// FULL LEVEL SCENE ASSEMBLER
-// -------------------------------------------------------------
-
 pub fn assemble_level_scene_glb(omp_data: &[u8], assets_dir: &Path) -> Result<Vec<u8>> {
     let map_info = parse_omp_map(omp_data)?;
     let mut builder = GltfBuilder::new();
@@ -217,7 +194,6 @@ pub fn assemble_level_scene_glb(omp_data: &[u8], assets_dir: &Path) -> Result<Ve
     };
     let (_, elements) = parse_chunk_elements(payload)?;
 
-    // 1. Correctly include terrain geometry
     if let Some((_, terr_data)) = elements.iter().find(|(id, _)| *id == 20)
         && let Ok(terrain_geom) = parse_terrain_geometry(terr_data)
     {
@@ -229,23 +205,28 @@ pub fn assemble_level_scene_glb(omp_data: &[u8], assets_dir: &Path) -> Result<Ve
         scene_nodes.push(terr_node);
     }
 
-    // 2. Scan and Instance Entities from assets/meshes
     let meshes_dir = assets_dir.join("meshes");
+    let mut mesh_files = Vec::new();
+    if meshes_dir.exists()
+        && let Ok(entries) = std::fs::read_dir(&meshes_dir)
+    {
+        for e in entries.flatten() {
+            let fname = e.file_name().to_string_lossy().to_string();
+            if fname.ends_with(".glb") {
+                mesh_files.push(fname);
+            }
+        }
+    }
 
     for (i, ent) in map_info.entities.iter().enumerate() {
         let mut model_name = format!("{}_{}", ent.name, i + 1);
-        if meshes_dir.exists()
-            && let Ok(entries) = std::fs::read_dir(&meshes_dir)
+        let lower_ent = ent.name.to_lowercase();
+
+        if let Some(matched) = mesh_files
+            .iter()
+            .find(|f| f.to_lowercase().contains(&lower_ent))
         {
-            for e in entries.flatten() {
-                let fname = e.file_name().to_string_lossy().to_string();
-                if fname.to_lowercase().contains(&ent.name.to_lowercase())
-                    && fname.ends_with(".glb")
-                {
-                    model_name = format!("{}_[Model: {}]", ent.name, fname);
-                    break;
-                }
-            }
+            model_name = format!("{}_[Model: {}]", ent.name, matched);
         }
 
         let node_id = builder.add_node(json!({

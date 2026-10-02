@@ -1,6 +1,5 @@
-use byteorder::{LittleEndian, ReadBytesExt};
-use crc32fast::Hasher;
-use std::io::Cursor;
+use crate::engine::common::Endian;
+pub use crate::engine::common::calculate_triumph_crc32;
 
 pub const FOOTER_SIZE: usize = 16;
 pub const MAGIC_FOOTER_1: u32 = 0xDEADBEEF;
@@ -10,6 +9,7 @@ pub const MAGIC_FOOTER_2: u32 = 0xFEEDDEAF;
 pub struct PrpFooter {
     pub original_crc: u32,
     pub hash2: u32,
+    pub endian: Endian,
 }
 
 pub fn check_footer(data: &[u8]) -> Option<PrpFooter> {
@@ -18,25 +18,33 @@ pub fn check_footer(data: &[u8]) -> Option<PrpFooter> {
     }
 
     let footer_start = data.len() - FOOTER_SIZE;
-    let mut cur = Cursor::new(&data[footer_start..]);
+    let slice = &data[footer_start..];
 
-    let m1 = cur.read_u32::<LittleEndian>().unwrap_or(0);
-    let m2 = cur.read_u32::<LittleEndian>().unwrap_or(0);
-    let original_crc = cur.read_u32::<LittleEndian>().unwrap_or(0);
-    let hash2 = cur.read_u32::<LittleEndian>().unwrap_or(0);
-
-    if m1 == MAGIC_FOOTER_1 && m2 == MAGIC_FOOTER_2 {
-        Some(PrpFooter {
+    // Check Little-Endian (PC)
+    let m1_le = u32::from_le_bytes(slice[0..4].try_into().unwrap_or_default());
+    let m2_le = u32::from_le_bytes(slice[4..8].try_into().unwrap_or_default());
+    if m1_le == MAGIC_FOOTER_1 && m2_le == MAGIC_FOOTER_2 {
+        let original_crc = u32::from_le_bytes(slice[8..12].try_into().unwrap_or_default());
+        let hash2 = u32::from_le_bytes(slice[12..16].try_into().unwrap_or_default());
+        return Some(PrpFooter {
             original_crc,
             hash2,
-        })
-    } else {
-        None
+            endian: Endian::Little,
+        });
     }
-}
 
-pub fn calculate_triumph_crc32(data_without_footer: &[u8]) -> u32 {
-    let mut hasher = Hasher::new();
-    hasher.update(data_without_footer);
-    !hasher.finalize()
+    // Check Big-Endian (Xbox 360 / PS3)
+    let m1_be = u32::from_be_bytes(slice[0..4].try_into().unwrap_or_default());
+    let m2_be = u32::from_be_bytes(slice[4..8].try_into().unwrap_or_default());
+    if m1_be == MAGIC_FOOTER_1 && m2_be == MAGIC_FOOTER_2 {
+        let original_crc = u32::from_be_bytes(slice[8..12].try_into().unwrap_or_default());
+        let hash2 = u32::from_be_bytes(slice[12..16].try_into().unwrap_or_default());
+        return Some(PrpFooter {
+            original_crc,
+            hash2,
+            endian: Endian::Big,
+        });
+    }
+
+    None
 }

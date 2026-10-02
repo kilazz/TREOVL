@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crc32fast::Hasher;
+use crate::engine::common::{calculate_crc32, calculate_triumph_crc32};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
@@ -55,12 +55,12 @@ impl HashDictionary {
         let mut standard_crc_map = HashMap::new();
 
         for &word in KNOWN_KEYWORDS {
-            let mut hasher = Hasher::new();
-            hasher.update(word.as_bytes());
-            let crc = hasher.finalize();
+            let bytes = word.as_bytes();
+            let crc = calculate_crc32(bytes);
+            let triumph_crc = calculate_triumph_crc32(bytes);
 
             standard_crc_map.insert(crc, word);
-            triumph_crc_map.insert(!crc, word); // Triumph inverted CRC
+            triumph_crc_map.insert(triumph_crc, word);
         }
 
         Self {

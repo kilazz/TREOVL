@@ -1,12 +1,15 @@
-use slint::{ModelRc, VecModel};
-use std::path::{Path, PathBuf};
+use slint::{Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
+use std::fs;
+use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc::Receiver};
 
 use crate::AppWindow;
+use crate::engine::assets::sniffer::AssetKind;
 use crate::engine::service;
 use crate::gui::commands::WorkerCommand;
-use crate::gui::{AppState, scan_project_folder};
+use crate::gui::{ActiveMeshPreview, AppState, resolve_project_dir, scan_project_folder};
 use crate::utils::logger::UiLogger;
+use crate::utils::{dds_decoder, renderer};
 
 pub struct BackgroundWorker {
     ui_handle: slint::Weak<AppWindow>,
@@ -35,6 +38,266 @@ impl BackgroundWorker {
 
     pub fn handle_command(&mut self, cmd: WorkerCommand) {
         match cmd {
+            WorkerCommand::SelectAsset {
+                filtered_index,
+                path,
+                kind,
+            } => {
+                let bytes = fs::read(&path).unwrap_or_default();
+                let path_str = path.to_string_lossy().to_string();
+
+                if kind != AssetKind::Mesh {
+                    let mut st = self.state.lock().unwrap();
+                    st.active_mesh = None;
+                }
+
+                match kind {
+                    AssetKind::Texture => {
+                        let mut tex_buf = None;
+                        let mut tex_desc = String::from("Invalid or corrupted texture");
+                        let mut ok = false;
+
+                        if let Ok(tex) = crate::engine::assets::texture::parse_texture_chunk(&bytes)
+                        {
+                            let rgba = dds_decoder::decode_to_rgba(
+                                tex.width,
+                                tex.height,
+                                tex.format,
+                                &tex.pixel_data,
+                            );
+                            let mut buf =
+                                SharedPixelBuffer::<Rgba8Pixel>::new(tex.width, tex.height);
+                            let dest = buf.make_mut_bytes();
+                            let copy_len = dest.len().min(rgba.len());
+                            dest[..copy_len].copy_from_slice(&rgba[..copy_len]);
+                            tex_buf = Some(buf);
+                            tex_desc = format!(
+                                "Resolution: {}x{} | Format: {:?}",
+                                tex.width, tex.height, tex.format
+                            );
+                            ok = true;
+                        }
+
+                        let ui_h = self.ui_handle.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_h.upgrade() {
+                                ui.set_selected_index(filtered_index);
+                                ui.set_active_file_path(path_str.into());
+                                ui.set_active_kind_id(0);
+                                if let Some(buf) = tex_buf {
+                                    ui.set_tex_preview(Image::from_rgba8(buf));
+                                }
+                                ui.set_tex_info(tex_desc.into());
+                                ui.set_has_texture(ok);
+                            }
+                        });
+                    }
+                    AssetKind::Mesh => {
+                        let mut mesh_info = String::from("Failed to parse mesh buffer");
+                        let mut mesh_buf = None;
+                        let mut has_mesh = false;
+
+                        if let Ok(parsed) =
+                            crate::engine::assets::mesh::extract_mesh_geometry(&bytes)
+                        {
+                            mesh_info = format!(
+                                "Vertices: {} | Triangles: {} | Skinned: {}",
+                                parsed.positions.len(),
+                                parsed.indices.len() / 3,
+                                parsed.is_skinned
+                            );
+
+                            let cam = {
+                                let mut st = self.state.lock().unwrap();
+                                st.active_mesh = Some(ActiveMeshPreview {
+                                    positions: parsed.positions.clone(),
+                                    indices: parsed.indices.clone(),
+                                    normals: parsed.normals.clone(),
+                                });
+                                st.camera
+                            };
+
+                            let buf = renderer::render_mesh_preview(
+                                &parsed.positions,
+                                &parsed.indices,
+                                &parsed.normals,
+                                512,
+                                512,
+                                &cam,
+                            );
+                            mesh_buf = Some(buf);
+                            has_mesh = true;
+                        }
+
+                        let ui_h = self.ui_handle.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_h.upgrade() {
+                                ui.set_selected_index(filtered_index);
+                                ui.set_active_file_path(path_str.into());
+                                ui.set_active_kind_id(3);
+                                ui.set_mesh_info(mesh_info.into());
+                                if let Some(buf) = mesh_buf {
+                                    ui.set_mesh_preview(Image::from_rgba8(buf));
+                                    ui.set_has_mesh(true);
+                                } else {
+                                    ui.set_has_mesh(has_mesh);
+                                }
+                            }
+                        });
+                    }
+                    AssetKind::Audio => {
+                        let ui_h = self.ui_handle.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_h.upgrade() {
+                                ui.set_selected_index(filtered_index);
+                                ui.set_active_file_path(path_str.into());
+                                ui.set_active_kind_id(1);
+                            }
+                        });
+                    }
+                    AssetKind::Material => {
+                        let json = crate::engine::assets::material::export_material_to_json(&bytes)
+                            .unwrap_or_default();
+                        let ui_h = self.ui_handle.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_h.upgrade() {
+                                ui.set_selected_index(filtered_index);
+                                ui.set_active_file_path(path_str.into());
+                                ui.set_active_kind_id(2);
+                                ui.set_mat_json_text(json.into());
+                            }
+                        });
+                    }
+                    AssetKind::Lua => {
+                        let disasm = crate::engine::assets::lua::disassemble_lua_bytecode(&bytes)
+                            .unwrap_or_default();
+                        let ui_h = self.ui_handle.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_h.upgrade() {
+                                ui.set_selected_index(filtered_index);
+                                ui.set_active_file_path(path_str.into());
+                                ui.set_active_kind_id(4);
+                                ui.set_mat_json_text(disasm.into());
+                            }
+                        });
+                    }
+                    AssetKind::UI => {
+                        let json = crate::engine::assets::ui::export_ui_to_json(&bytes)
+                            .unwrap_or_default();
+                        let ui_h = self.ui_handle.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_h.upgrade() {
+                                ui.set_selected_index(filtered_index);
+                                ui.set_active_file_path(path_str.into());
+                                ui.set_active_kind_id(6);
+                                ui.set_mat_json_text(json.into());
+                            }
+                        });
+                    }
+                    AssetKind::Object => {
+                        let json =
+                            crate::engine::assets::object::export_object_to_json(&bytes, None)
+                                .unwrap_or_default();
+                        let ui_h = self.ui_handle.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_h.upgrade() {
+                                ui.set_selected_index(filtered_index);
+                                ui.set_active_file_path(path_str.into());
+                                ui.set_active_kind_id(7);
+                                ui.set_mat_json_text(json.into());
+                            }
+                        });
+                    }
+                    AssetKind::Animation => {
+                        let mut info = String::new();
+                        if let Ok(clip) =
+                            crate::engine::assets::animation::parse_animation_clip(&bytes)
+                        {
+                            info = format!(
+                                "Clip: {} | Rig: {} | {:.1} FPS | Duration: {:.3}s | Tracks: {}",
+                                clip.name,
+                                clip.target_rig,
+                                clip.frame_rate,
+                                clip.duration_seconds,
+                                clip.bone_tracks.len()
+                            );
+                        }
+                        let json =
+                            crate::engine::assets::animation::export_animation_to_json(&bytes)
+                                .unwrap_or_default();
+                        let ui_h = self.ui_handle.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_h.upgrade() {
+                                ui.set_selected_index(filtered_index);
+                                ui.set_active_file_path(path_str.into());
+                                ui.set_active_kind_id(8);
+                                ui.set_mesh_info(info.into());
+                                ui.set_mat_json_text(json.into());
+                            }
+                        });
+                    }
+                    AssetKind::TerrainPalette => {
+                        let json =
+                            crate::engine::assets::terrain_palette::export_terrain_palette_to_json(
+                                &bytes,
+                            )
+                            .unwrap_or_default();
+                        let ui_h = self.ui_handle.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_h.upgrade() {
+                                ui.set_selected_index(filtered_index);
+                                ui.set_active_file_path(path_str.into());
+                                ui.set_active_kind_id(9);
+                                ui.set_mat_json_text(json.into());
+                            }
+                        });
+                    }
+                    _ => {
+                        let ui_h = self.ui_handle.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_h.upgrade() {
+                                ui.set_selected_index(filtered_index);
+                                ui.set_active_file_path(path_str.into());
+                                ui.set_active_kind_id(5);
+                            }
+                        });
+                    }
+                }
+            }
+
+            WorkerCommand::RotateMeshViewport {
+                delta_yaw,
+                delta_pitch,
+            } => {
+                let buf_opt = {
+                    let mut st = self.state.lock().unwrap();
+                    st.camera.yaw += delta_yaw;
+                    st.camera.pitch = (st.camera.pitch + delta_pitch).clamp(-1.45, 1.45);
+                    let cam = st.camera;
+
+                    st.active_mesh.as_ref().map(|mesh| {
+                        renderer::render_mesh_preview(
+                            &mesh.positions,
+                            &mesh.indices,
+                            &mesh.normals,
+                            512,
+                            512,
+                            &cam,
+                        )
+                    })
+                };
+
+                if let Some(buf) = buf_opt {
+                    let ui_h = self.ui_handle.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = ui_h.upgrade() {
+                            ui.set_mesh_preview(Image::from_rgba8(buf));
+                            ui.set_has_mesh(true);
+                        }
+                    });
+                }
+            }
+
             WorkerCommand::UnpackArchive { src, dst } => {
                 self.logger
                     .log(&format!("[*] Unpacking archive: {:?}", src));
@@ -81,7 +344,7 @@ impl BackgroundWorker {
                 }
             }
             WorkerCommand::LoadProject { proj_dir } => {
-                let actual_dir = self.resolve_project_dir(proj_dir);
+                let actual_dir = resolve_project_dir(&proj_dir);
                 self.logger
                     .log(&format!("[*] Loading project from: {:?}", actual_dir));
 
@@ -132,7 +395,7 @@ impl BackgroundWorker {
                 });
             }
             WorkerCommand::CleanRebuild { proj_dir } => {
-                let actual_dir = self.resolve_project_dir(proj_dir);
+                let actual_dir = resolve_project_dir(&proj_dir);
                 self.logger.log(&format!(
                     "[*] Performing clean rebuild from vanilla: {:?}",
                     actual_dir
@@ -155,7 +418,7 @@ impl BackgroundWorker {
                 proj_dir,
                 chunk_path,
             } => {
-                let actual_dir = self.resolve_project_dir(proj_dir);
+                let actual_dir = resolve_project_dir(&proj_dir);
                 self.logger
                     .log(&format!("[*] Reverting asset to vanilla: {:?}", chunk_path));
                 match crate::engine::container::sync::revert_single_asset(&actual_dir, &chunk_path)
@@ -177,7 +440,7 @@ impl BackgroundWorker {
                 }
             }
             WorkerCommand::PackArchive { proj_dir } => {
-                let actual_dir = self.resolve_project_dir(proj_dir);
+                let actual_dir = resolve_project_dir(&proj_dir);
                 self.logger
                     .log(&format!("[*] Packing project: {:?}", actual_dir));
                 let out = actual_dir.join("rebuilt.prp");
@@ -301,8 +564,10 @@ impl BackgroundWorker {
                             out_path, v_count, tri_count
                         ));
                     } else {
-                        self.logger
-                            .log(&format!("[+] Terrain OBJ exported: {:?}", out_path));
+                        self.logger.log(&format!(
+                            "[+] Terrain OBJ exported: {:?} ({} vertices, {} triangles)",
+                            out_path, v_count, tri_count
+                        ));
                     }
                 }
                 Err(e) => self.logger.log(&format!("[!] Terrain export error: {}", e)),
@@ -389,14 +654,6 @@ impl BackgroundWorker {
                     .logger
                     .log(&format!("[!] Terrain Palette save error: {}", e)),
             },
-        }
-    }
-
-    fn resolve_project_dir(&self, path: PathBuf) -> PathBuf {
-        if path.is_file() {
-            path.parent().map(|p| p.to_path_buf()).unwrap_or(path)
-        } else {
-            path
         }
     }
 

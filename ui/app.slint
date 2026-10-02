@@ -39,6 +39,8 @@ export component AppWindow inherits Window {
     in-out property <image> tex_preview;
     in-out property <string> tex_info: "No texture loaded.";
     in-out property <bool> has_texture: false;
+    in-out property <image> mesh_preview;
+    in-out property <bool> has_mesh: false;
     in-out property <string> mat_json_text: "";
     in-out property <string> mesh_info: "No mesh loaded.";
 
@@ -58,6 +60,9 @@ export component AppWindow inherits Window {
     callback apply_patch(string, string);
     callback select_asset(int);
     callback filter_changed(string);
+
+    // Interactive 3D Viewport Orbit Callback
+    callback rotate_mesh_viewport(float, float);
 
     // Contextual Operations Callbacks
     callback export_dds(string, string);
@@ -527,13 +532,13 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        // CONTEXT 3: 3D MESH & TERRAIN
+                        // CONTEXT 3: 3D MESH & TERRAIN (WITH INTERACTIVE 3D VIEWPORT)
                         if root.active_kind_id == 3: VerticalLayout {
-                            spacing: 12px;
-                            alignment: start;
+                            spacing: 10px;
+                            vertical-stretch: 1;
 
                             SectionTitle {
-                                text: "3D GEOMETRY & TERRAIN EXPORT";
+                                text: "3D GEOMETRY, MIKKTSPACE TANGENTS & VIEWPORT";
                                 text-color: #f0b132;
                             }
 
@@ -571,13 +576,70 @@ export component AppWindow inherits Window {
                                         if (out != "") { root.export_terrain_obj(root.active_file_path, out); }
                                     }
                                 }
+
+                                Rectangle {
+                                    horizontal-stretch: 1;
+                                }
+
+                                Text {
+                                    text: root.mesh_info;
+                                    font-family: "Consolas";
+                                    color: #cfcfcf;
+                                    font-size: 11px;
+                                    vertical-alignment: center;
+                                }
                             }
 
-                            Text {
-                                text: root.mesh_info;
-                                font-family: "Consolas";
-                                color: #cfcfcf;
-                                font-size: 11px;
+                            // Interactive 3D Orbit Viewport
+                            Rectangle {
+                                background: #111214;
+                                border-radius: 4px;
+                                border-width: 1px;
+                                border-color: #353535;
+                                clip: true;
+                                vertical-stretch: 1;
+
+                                Image {
+                                    source: root.mesh_preview;
+                                    width: 100%;
+                                    height: 100%;
+                                    image-fit: contain;
+                                }
+
+                                if !root.has_mesh: Text {
+                                    text: "Select a 3D Mesh (.bin) to preview model in interactive 3D viewport";
+                                    color: #808080;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                    horizontal-alignment: center;
+                                }
+
+                                property <length> drag_last_x: 0px;
+                                property <length> drag_last_y: 0px;
+                                property <bool> is_dragging: false;
+
+                                TouchArea {
+                                    mouse-cursor: grab;
+                                    moved => {
+                                        if (self.pressed) {
+                                            if (!is_dragging) {
+                                                is_dragging = true;
+                                                drag_last_x = self.mouse-x;
+                                                drag_last_y = self.mouse-y;
+                                            } else {
+                                                let dx = (self.mouse-x - drag_last_x) / 1px;
+                                                let dy = (self.mouse-y - drag_last_y) / 1px;
+                                                drag_last_x = self.mouse-x;
+                                                drag_last_y = self.mouse-y;
+                                                if (dx != 0 || dy != 0) {
+                                                    root.rotate_mesh_viewport(dx / 80.0, dy / 80.0);
+                                                }
+                                            }
+                                        } else {
+                                            is_dragging = false;
+                                        }
+                                    }
+                                }
                             }
                         }
 

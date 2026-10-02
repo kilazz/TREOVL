@@ -13,7 +13,9 @@ use std::thread;
 
 use crate::engine::assets::sniffer::{AssetKind, sniff_asset};
 use crate::engine::container::sync::{AssetSyncCache, calculate_crc32};
+use crate::engine::math::Vector3;
 use crate::utils::logger::UiLogger;
+use crate::utils::renderer::ViewportCamera;
 use crate::{AppWindow, AssetItem};
 use commands::WorkerCommand;
 use worker::BackgroundWorker;
@@ -24,12 +26,32 @@ pub struct CachedAsset {
     pub kind: AssetKind,
 }
 
+#[derive(Clone)]
+pub struct ActiveMeshPreview {
+    pub positions: Vec<Vector3>,
+    pub indices: Vec<u32>,
+    pub normals: Vec<Vector3>,
+}
+
 #[derive(Default)]
 pub struct AppState {
     pub all_ui_items: Vec<AssetItem>,
     pub all_cached_assets: Vec<CachedAsset>,
     pub visible_indices: Vec<usize>,
     pub current_proj_dir: Option<PathBuf>,
+    pub camera: ViewportCamera,
+    pub active_mesh: Option<ActiveMeshPreview>,
+}
+
+/// Resolves a directory path whether a directory or a child file was passed.
+pub fn resolve_project_dir(path: &Path) -> PathBuf {
+    if path.is_file() {
+        path.parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    }
 }
 
 pub fn scan_project_folder(project_dir: &Path) -> (Vec<AssetItem>, Vec<CachedAsset>) {

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use crate::engine::common::{magic, parse_raw_container_table};
+use crate::engine::common::{extract_slices_from_table, magic, parse_raw_container_table};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PrpNode {
@@ -36,24 +36,17 @@ pub fn parse_node(
         Err(_) => return save_leaf(data, node_id, is_large, chunk_counter, output_dir),
     };
 
-    let mut children = Vec::with_capacity(table.entries.len());
-    for i in 0..table.entries.len() {
-        let entry = table.entries[i];
-        let start = table.data_start + entry.offset;
-        let end = if i + 1 < table.entries.len() {
-            table.data_start + table.entries[i + 1].offset
-        } else {
-            data.len()
-        };
+    let slices = extract_slices_from_table(data, &table);
+    if slices.len() != table.entries.len() {
+        return save_leaf(data, node_id, is_large, chunk_counter, output_dir);
+    }
 
-        if start > data.len() || end > data.len() || end < start {
-            return save_leaf(data, node_id, is_large, chunk_counter, output_dir);
-        }
-
+    let mut children = Vec::with_capacity(slices.len());
+    for (child_id, child_is_large, child_slice) in slices {
         let child_node = parse_node(
-            &data[start..end],
-            entry.id,
-            entry.is_large,
+            child_slice,
+            child_id,
+            child_is_large,
             false,
             chunk_counter,
             output_dir,
@@ -78,7 +71,7 @@ fn save_leaf(data: &[u8], node_id: u32, is_large: bool, counter: &mut u32, dir: 
     let vanilla_path = dir.join("chunks_vanilla").join(&filename);
 
     let _ = std::fs::write(&working_path, data);
-    let _ = std::fs::write(&vanilla_path, data); // Pristine baseline copy
+    let _ = std::fs::write(&vanilla_path, data);
 
     PrpNode {
         id: node_id,

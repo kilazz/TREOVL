@@ -1,5 +1,4 @@
 use anyhow::Result;
-use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -8,7 +7,6 @@ use crate::engine::assets::animation::{
     export_animation_to_glb, export_animation_to_json, export_skeleton_to_glb,
     parse_object_bone_container,
 };
-use crate::engine::assets::parse_chunk_elements;
 use crate::engine::assets::sniffer::{AssetKind, SniffedAsset};
 use crate::engine::common::magic;
 
@@ -38,6 +36,74 @@ pub trait AssetProcessor: Sync + Send {
         sniffed: &SniffedAsset,
         workspace: &ProjectWorkspace,
     ) -> Result<Option<(String, AssetSyncEntry)>>;
+}
+
+pub struct CharacterProcessor;
+impl AssetProcessor for CharacterProcessor {
+    fn process(
+        &self,
+        data: &[u8],
+        stem: &str,
+        sniffed: &SniffedAsset,
+        workspace: &ProjectWorkspace,
+    ) -> Result<Option<(String, AssetSyncEntry)>> {
+        if sniffed.kind != AssetKind::Character {
+            return Ok(None);
+        }
+
+        let json_str = crate::engine::assets::character::export_character_to_json(
+            data,
+            Some(&workspace.assets_dir),
+            stem,
+        )?;
+        let out_name = build_asset_filename(&sniffed.display_name, stem, "json");
+
+        let char_dir = workspace.assets_dir.join("characters");
+        fs::create_dir_all(&char_dir)?;
+        fs::write(char_dir.join(&out_name), json_str.as_bytes())?;
+
+        Ok(Some((
+            format!("assets/characters/{}", out_name),
+            AssetSyncEntry {
+                chunk_rel_path: format!("chunks/{}.bin", stem),
+                asset_kind: "Character".into(),
+                vanilla_crc32: calculate_crc32(json_str.as_bytes()),
+                is_modified: false,
+            },
+        )))
+    }
+}
+
+pub struct AttachmentProcessor;
+impl AssetProcessor for AttachmentProcessor {
+    fn process(
+        &self,
+        data: &[u8],
+        stem: &str,
+        sniffed: &SniffedAsset,
+        workspace: &ProjectWorkspace,
+    ) -> Result<Option<(String, AssetSyncEntry)>> {
+        if sniffed.kind != AssetKind::Attachment {
+            return Ok(None);
+        }
+
+        let json_str = crate::engine::assets::attachment::export_attachment_to_json(data)?;
+        let out_name = build_asset_filename(&sniffed.display_name, stem, "json");
+
+        let attach_dir = workspace.assets_dir.join("attachments");
+        fs::create_dir_all(&attach_dir)?;
+        fs::write(attach_dir.join(&out_name), json_str.as_bytes())?;
+
+        Ok(Some((
+            format!("assets/attachments/{}", out_name),
+            AssetSyncEntry {
+                chunk_rel_path: format!("chunks/{}.bin", stem),
+                asset_kind: "Attachment".into(),
+                vanilla_crc32: calculate_crc32(json_str.as_bytes()),
+                is_modified: false,
+            },
+        )))
+    }
 }
 
 pub struct TextureProcessor;
@@ -345,7 +411,7 @@ impl AssetProcessor for EventProcessor {
         workspace: &ProjectWorkspace,
     ) -> Result<Option<(String, AssetSyncEntry)>> {
         if sniffed.kind != AssetKind::Event
-            && !data.starts_with(b"\xB0\x00\x00\x04")
+            && !data.starts_with(magic::EVENT)
             && !data.starts_with(b"\x83\x00\x00\x04")
         {
             return Ok(None);
@@ -354,53 +420,7 @@ impl AssetProcessor for EventProcessor {
         let out_name = build_asset_filename(&sniffed.display_name, stem, "json");
         let abs_path = workspace.assets_dir.join("events").join(&out_name);
 
-        let json_val =
-            if let Ok((type_id, elements)) = crate::engine::assets::parse_typed_container(data) {
-                let mut props = Vec::new();
-                let mut group_path = None;
-                let mut event_name = None;
-
-                for (id, chunk) in elements {
-                    if id == 20 && chunk.len() >= 4 {
-                        let slen =
-                            u32::from_le_bytes(chunk[0..4].try_into().unwrap_or_default()) as usize;
-                        if slen + 4 <= chunk.len() {
-                            group_path = std::str::from_utf8(&chunk[4..4 + slen])
-                                .ok()
-                                .map(|s| s.trim_matches(char::from(0)).to_string());
-                        }
-                    } else if id == 21 && chunk.len() >= 4 {
-                        let slen =
-                            u32::from_le_bytes(chunk[0..4].try_into().unwrap_or_default()) as usize;
-                        if slen + 4 <= chunk.len() {
-                            event_name = std::str::from_utf8(&chunk[4..4 + slen])
-                                .ok()
-                                .map(|s| s.trim_matches(char::from(0)).to_string());
-                        }
-                    }
-
-                    props.push(json!({
-                        "id": id,
-                        "size": chunk.len(),
-                        "hex": hex::encode_upper(&chunk)
-                    }));
-                }
-
-                json!({
-                    "type": "event_table",
-                    "type_id_hex": format!("{:08X}", type_id),
-                    "group_path": group_path,
-                    "event_name": event_name,
-                    "properties": props
-                })
-            } else {
-                json!({
-                    "type": "raw_event",
-                    "hex": hex::encode_upper(data)
-                })
-            };
-
-        let json_str = serde_json::to_string_pretty(&json_val)?;
+        let json_str = crate::engine::assets::event::export_event_to_json(data)?;
         fs::write(&abs_path, json_str.as_bytes())?;
 
         Ok(Some((
@@ -467,12 +487,7 @@ impl AssetProcessor for XmlProcessor {
         let out_name = build_asset_filename(&sniffed.display_name, stem, "xml");
         let abs_path = workspace.assets_dir.join("xml").join(&out_name);
 
-        let xml_payload = if let Some(pos) = data.windows(5).position(|w| w == b"<?xml") {
-            &data[pos..]
-        } else {
-            data
-        };
-
+        let xml_payload = crate::engine::assets::xml::extract_xml_payload(data);
         fs::write(&abs_path, xml_payload)?;
 
         Ok(Some((
@@ -503,72 +518,7 @@ impl AssetProcessor for ParameterProcessor {
         let out_name = format!("{}.json", stem);
         let abs_path = workspace.assets_dir.join("parameters").join(&out_name);
 
-        let param_json = if data.len() == 24 && data.starts_with(&[3, 20, 0, 21]) {
-            let slen = u32::from_le_bytes(data[7..11].try_into().unwrap_or_default()) as usize;
-            if slen <= 13
-                && let Ok(slot_id) = std::str::from_utf8(&data[11..11 + slen])
-            {
-                json!({
-                    "type": "asset_group_slot",
-                    "slot_id": slot_id.trim_matches(char::from(0)),
-                })
-            } else {
-                json!({ "type": "raw_bytes", "hex": hex::encode_upper(data) })
-            }
-        } else if data.starts_with(b"\x57\x00\x00\x04") && data.len() >= 14 {
-            let mut sfx_label = String::new();
-            if let Ok((_, sub_elem)) = parse_chunk_elements(&data[4..]) {
-                for (sid, sval) in sub_elem {
-                    if sid == 10 && sval.len() >= 4 {
-                        let slen =
-                            u32::from_le_bytes(sval[0..4].try_into().unwrap_or_default()) as usize;
-                        if slen <= sval.len() - 4 {
-                            sfx_label = String::from_utf8_lossy(&sval[4..4 + slen])
-                                .trim_matches(char::from(0))
-                                .to_string();
-                        }
-                    }
-                }
-            }
-            json!({
-                "type": "sound_bank_descriptor",
-                "label": sfx_label
-            })
-        } else if data.len() == 4 {
-            let val_u32 = u32::from_le_bytes(data[0..4].try_into().unwrap_or_default());
-            let val_f32 = f32::from_le_bytes(data[0..4].try_into().unwrap_or_default());
-            json!({
-                "type": "scalar_32bit",
-                "uint_value": val_u32,
-                "float_value": if val_f32.is_finite() { val_f32 } else { 0.0 },
-                "hex": hex::encode_upper(data)
-            })
-        } else {
-            let string_candidate = if data.len() >= 4 {
-                let slen = u32::from_le_bytes(data[0..4].try_into().unwrap_or_default()) as usize;
-                if (slen == data.len() - 4 || slen == data.len() - 5)
-                    && data[4..4 + slen]
-                        .iter()
-                        .all(|&b| (0x20..=0x7E).contains(&b) || b == 0)
-                {
-                    std::str::from_utf8(&data[4..4 + slen])
-                        .ok()
-                        .map(|s| s.trim_matches(char::from(0)).to_string())
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            if let Some(text) = string_candidate {
-                json!({ "type": "string", "value": text })
-            } else {
-                json!({ "type": "raw_bytes", "size": data.len(), "hex": hex::encode_upper(data) })
-            }
-        };
-
-        let json_str = serde_json::to_string_pretty(&param_json)?;
+        let json_str = crate::engine::assets::parameter::export_parameter_to_json(data, stem)?;
         fs::write(&abs_path, json_str.as_bytes())?;
 
         Ok(Some((
@@ -677,6 +627,8 @@ impl AssetProcessor for RawProcessor {
 
 pub fn get_standard_processors() -> Vec<Box<dyn AssetProcessor>> {
     vec![
+        Box::new(CharacterProcessor),
+        Box::new(AttachmentProcessor),
         Box::new(TextureProcessor),
         Box::new(AudioProcessor),
         Box::new(MaterialProcessor),

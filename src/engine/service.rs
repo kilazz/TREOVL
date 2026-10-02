@@ -78,9 +78,9 @@ pub fn export_terrain(chunk_path: &Path, out_path: &Path, is_glb: bool) -> Resul
         fs::write(out_path, glb)?;
         Ok((v_count, tri_count))
     } else {
-        let obj = export_terrain_to_obj(&data)?;
+        let (obj, v_count, tri_count) = export_terrain_to_obj(&data)?;
         fs::write(out_path, obj)?;
-        Ok((0, 0))
+        Ok((v_count, tri_count))
     }
 }
 

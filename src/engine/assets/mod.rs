@@ -1,16 +1,22 @@
 use anyhow::{Result, bail};
 use byteorder::{LittleEndian, WriteBytesExt};
 
-use crate::engine::common::{magic, parse_raw_container_table, serialize_container_payload};
+use crate::engine::common::{
+    extract_elements_from_table, magic, parse_raw_container_table, serialize_container_payload,
+};
 
 pub mod animation;
+pub mod attachment;
 pub mod audio;
+pub mod character;
+pub mod event;
 pub mod facefx;
 pub mod lua;
 pub mod map;
 pub mod material;
 pub mod mesh;
 pub mod object;
+pub mod parameter;
 pub mod shader;
 pub mod sniffer;
 pub mod terrain;
@@ -18,26 +24,13 @@ pub mod terrain_palette;
 pub mod texture;
 pub mod ui;
 pub mod vfx;
+pub mod xml;
 
 pub type ChunkElement = (u32, Vec<u8>);
 
 pub fn parse_chunk_elements(data: &[u8]) -> Result<(bool, Vec<ChunkElement>)> {
     let table = parse_raw_container_table(data, 0, true)?;
-    let mut elements = Vec::with_capacity(table.entries.len());
-
-    for i in 0..table.entries.len() {
-        let start = table.data_start + table.entries[i].offset;
-        let end = if i + 1 < table.entries.len() {
-            table.data_start + table.entries[i + 1].offset
-        } else {
-            data.len()
-        };
-
-        if start <= data.len() && end <= data.len() && start <= end {
-            elements.push((table.entries[i].id, data[start..end].to_vec()));
-        }
-    }
-
+    let elements = extract_elements_from_table(data, &table);
     Ok((table.has_magic, elements))
 }
 
@@ -57,24 +50,9 @@ pub fn parse_typed_container(data: &[u8]) -> Result<(u32, Vec<ChunkElement>)> {
     if data.len() < 5 {
         bail!("Data is too short to be a typed container.");
     }
-
     let type_id = u32::from_le_bytes(data[0..4].try_into()?);
     let table = parse_raw_container_table(data, 4, false)?;
-    let mut elements = Vec::with_capacity(table.entries.len());
-
-    for i in 0..table.entries.len() {
-        let start = table.data_start + table.entries[i].offset;
-        let end = if i + 1 < table.entries.len() {
-            table.data_start + table.entries[i + 1].offset
-        } else {
-            data.len()
-        };
-
-        if start <= data.len() && end <= data.len() && start <= end {
-            elements.push((table.entries[i].id, data[start..end].to_vec()));
-        }
-    }
-
+    let elements = extract_elements_from_table(data, &table);
     Ok((type_id, elements))
 }
 

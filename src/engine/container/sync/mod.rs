@@ -42,6 +42,9 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize> {
         "objects",
         "vfx",
         "events",
+        "facefx",
+        "characters",
+        "attachments",
         "terrain_palettes",
     ];
     for dir in dirs {
@@ -145,6 +148,19 @@ pub fn sync_assets_to_chunks(project_dir: &Path) -> Result<usize> {
             };
 
             let updated_chunk = match entry.asset_kind.as_str() {
+                "Character" => {
+                    let json_str = String::from_utf8(asset_bytes)
+                        .context("Character JSON is not valid UTF-8")?;
+                    crate::engine::assets::character::import_character_from_json(
+                        &json_str,
+                        Some(project_dir),
+                    )?
+                }
+                "Attachment" => {
+                    let json_str = String::from_utf8(asset_bytes)
+                        .context("Attachment JSON is not valid UTF-8")?;
+                    crate::engine::assets::attachment::import_attachment_from_json(&json_str)?
+                }
                 "Texture" => crate::engine::assets::texture::replace_texture_in_chunk(
                     &baseline_chunk,
                     &asset_bytes,
@@ -171,7 +187,6 @@ pub fn sync_assets_to_chunks(project_dir: &Path) -> Result<usize> {
                 }
                 "Lua" => {
                     let bytecode = if rel_asset_path.ends_with(".lua") {
-                        // Auto-compile source code text to 32-bit bytecode using luac50.exe
                         match crate::engine::assets::lua::compile_lua_script(&abs_asset_path) {
                             Ok(compiled_bin) => compiled_bin,
                             Err(e) => {
@@ -212,21 +227,18 @@ pub fn sync_assets_to_chunks(project_dir: &Path) -> Result<usize> {
                     crate::engine::assets::vfx::import_vfx_from_json(&json_str)?
                 }
                 "Event" => {
-                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&asset_bytes) {
-                        if v["type"] == "event_table"
-                            && let Some(hex_str) = v["type_id_hex"].as_str()
-                            && let Ok(type_id) = u32::from_str_radix(hex_str, 16)
-                            && let Some(props) = v["properties"].as_array()
-                        {
-                            let mut elements = Vec::new();
-                            for p in props {
-                                let pid = p["id"].as_u64().unwrap_or(0) as u32;
-                                let phex = p["hex"].as_str().unwrap_or("");
-                                if let Ok(bytes) = hex::decode(phex) {
-                                    elements.push((pid, bytes));
-                                }
-                            }
-                            crate::engine::assets::build_typed_container(type_id, &elements)
+                    let json_str =
+                        String::from_utf8(asset_bytes).context("Event JSON is not valid UTF-8")?;
+                    crate::engine::assets::event::import_event_from_json(&json_str)?
+                }
+                "FaceFx" => {
+                    let fxe_path = abs_asset_path.with_extension("fxe");
+                    if fxe_path.exists() {
+                        let fxe_data = fs::read(&fxe_path)?;
+                        if let Some(pos) = baseline_chunk.windows(4).position(|w| w == b"FACE") {
+                            let mut new_chunk = baseline_chunk[..pos].to_vec();
+                            new_chunk.extend_from_slice(&fxe_data);
+                            new_chunk
                         } else {
                             baseline_chunk
                         }
@@ -235,56 +247,12 @@ pub fn sync_assets_to_chunks(project_dir: &Path) -> Result<usize> {
                     }
                 }
                 "Animation" => baseline_chunk,
-                "Parameter" => {
-                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&asset_bytes) {
-                        if v["type"] == "asset_group_slot"
-                            && let Some(slot_id) = v["slot_id"].as_str()
-                        {
-                            let s_bytes = slot_id.as_bytes();
-                            let mut buf = Vec::with_capacity(7 + 4 + s_bytes.len() + 8);
-                            buf.push(3);
-                            buf.extend_from_slice(&[20, 0]);
-                            buf.extend_from_slice(&[21, (4 + s_bytes.len()) as u8]);
-                            buf.extend_from_slice(&[30, (4 + s_bytes.len() + 4) as u8]);
-                            buf.extend_from_slice(&(s_bytes.len() as u32).to_le_bytes());
-                            buf.extend_from_slice(s_bytes);
-                            buf.extend_from_slice(&[1, 1, 0, 0]);
-                            buf.extend_from_slice(&[1, 1, 0, 0]);
-                            buf
-                        } else if v["type"] == "string"
-                            && let Some(s) = v["value"].as_str()
-                        {
-                            let mut buf = Vec::new();
-                            let s_bytes = s.as_bytes();
-                            buf.extend_from_slice(&(s_bytes.len() as u32).to_le_bytes());
-                            buf.extend_from_slice(s_bytes);
-                            buf
-                        } else if v["type"] == "scalar_32bit"
-                            && let Some(hex_str) = v["hex"].as_str()
-                        {
-                            hex::decode(hex_str).unwrap_or(baseline_chunk)
-                        } else if let Some(hex_str) = v["hex"].as_str() {
-                            hex::decode(hex_str).unwrap_or(baseline_chunk)
-                        } else {
-                            baseline_chunk
-                        }
-                    } else {
-                        baseline_chunk
-                    }
-                }
+                "Parameter" => crate::engine::assets::parameter::import_parameter_from_json(
+                    &asset_bytes,
+                    &baseline_chunk,
+                )?,
                 "Xml" => {
-                    if let Some(pos) = baseline_chunk.windows(5).position(|w| w == b"<?xml") {
-                        let mut out = baseline_chunk[..pos].to_vec();
-                        out.extend_from_slice(&asset_bytes);
-                        out
-                    } else if baseline_chunk.len() > 4 {
-                        let mut buf = Vec::new();
-                        buf.extend_from_slice(&(asset_bytes.len() as u32).to_le_bytes());
-                        buf.extend_from_slice(&asset_bytes);
-                        buf
-                    } else {
-                        asset_bytes
-                    }
+                    crate::engine::assets::xml::import_xml_payload(&baseline_chunk, &asset_bytes)?
                 }
                 "Raw" => asset_bytes,
                 _ => continue,

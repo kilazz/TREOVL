@@ -1,5 +1,7 @@
 use anyhow::{Result, bail};
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{BigEndian, LittleEndian, ReadBytesExt, WriteBytesExt};
+use crc32fast::Hasher;
+use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 
 #[allow(dead_code)]
@@ -32,6 +34,71 @@ pub mod chunk_id {
     pub const OBJECT_BONES: u32 = 33;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Endian {
+    #[default]
+    Little, // PC (Intel/AMD)
+    Big, // Xbox 360 (PowerPC) / PlayStation 3 (Cell)
+}
+
+impl Endian {
+    pub fn read_u16(self, cur: &mut Cursor<&[u8]>) -> Result<u16, std::io::Error> {
+        match self {
+            Endian::Little => cur.read_u16::<LittleEndian>(),
+            Endian::Big => cur.read_u16::<BigEndian>(),
+        }
+    }
+
+    pub fn read_u32(self, cur: &mut Cursor<&[u8]>) -> Result<u32, std::io::Error> {
+        match self {
+            Endian::Little => cur.read_u32::<LittleEndian>(),
+            Endian::Big => cur.read_u32::<BigEndian>(),
+        }
+    }
+
+    pub fn read_f32(self, cur: &mut Cursor<&[u8]>) -> Result<f32, std::io::Error> {
+        match self {
+            Endian::Little => cur.read_f32::<LittleEndian>(),
+            Endian::Big => cur.read_f32::<BigEndian>(),
+        }
+    }
+
+    pub fn write_u16(self, cur: &mut impl std::io::Write, val: u16) -> Result<(), std::io::Error> {
+        match self {
+            Endian::Little => cur.write_u16::<LittleEndian>(val),
+            Endian::Big => cur.write_u16::<BigEndian>(val),
+        }
+    }
+
+    pub fn write_u32(self, cur: &mut impl std::io::Write, val: u32) -> Result<(), std::io::Error> {
+        match self {
+            Endian::Little => cur.write_u32::<LittleEndian>(val),
+            Endian::Big => cur.write_u32::<BigEndian>(val),
+        }
+    }
+
+    pub fn u32_to_bytes(self, val: u32) -> [u8; 4] {
+        match self {
+            Endian::Little => val.to_le_bytes(),
+            Endian::Big => val.to_be_bytes(),
+        }
+    }
+}
+
+/// Detects archive endianness by reading the file size field at offset 12 in the PRP header.
+pub fn detect_endianness(header_bytes: &[u8]) -> Endian {
+    if header_bytes.len() < 16 {
+        return Endian::Little;
+    }
+
+    let size_le = u32::from_le_bytes(header_bytes[12..16].try_into().unwrap_or_default());
+    if size_le > 0x7FFF_FFFF {
+        Endian::Big
+    } else {
+        Endian::Little
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ContainerTableEntry {
     pub id: u32,
@@ -44,13 +111,57 @@ pub struct ParsedContainerTable {
     pub has_magic: bool,
     pub data_start: usize,
     pub entries: Vec<ContainerTableEntry>,
+    pub endian: Endian,
 }
 
-/// Unified parser for Triumph Studios container offset tables.
 pub fn parse_raw_container_table(
+    data: &[u8],
+    pos: usize,
+    allow_magic: bool,
+) -> Result<ParsedContainerTable> {
+    // We default to Little Endian as 99% of Overlord mods are for PC.
+    let mut endian = Endian::Little;
+
+    let mut temp_pos = pos;
+    if allow_magic
+        && data.len() >= temp_pos + 3
+        && &data[temp_pos..temp_pos + 3] == magic::CONTAINER_MAGIC
+    {
+        temp_pos += 3;
+    }
+
+    // Safely deduce chunk endianness if there is a 'large_count' component.
+    // This prevents interpreting unrelated memory addresses/offsets as large Endian flags.
+    if data.len() > temp_pos + 4 {
+        let control_byte = data[temp_pos];
+        if (control_byte & 0x80) != 0 {
+            // Has large entries
+            let l_le = u32::from_le_bytes(
+                data[temp_pos + 1..temp_pos + 5]
+                    .try_into()
+                    .unwrap_or_default(),
+            );
+            let l_be = u32::from_be_bytes(
+                data[temp_pos + 1..temp_pos + 5]
+                    .try_into()
+                    .unwrap_or_default(),
+            );
+            // If the element count is completely absurd in Little-Endian but sane (<10,000)
+            // in Big-Endian, we confidently mark this chunk as Xbox/PS3 Big-Endian format.
+            if l_le > 10_000 && l_be < 10_000 {
+                endian = Endian::Big;
+            }
+        }
+    }
+
+    parse_raw_container_table_with_endian(data, pos, allow_magic, endian)
+}
+
+pub fn parse_raw_container_table_with_endian(
     data: &[u8],
     mut pos: usize,
     allow_magic: bool,
+    endian: Endian,
 ) -> Result<ParsedContainerTable> {
     let mut has_magic = false;
     if allow_magic && data.len() >= pos + 3 && &data[pos..pos + 3] == magic::CONTAINER_MAGIC {
@@ -73,7 +184,7 @@ pub fn parse_raw_container_table(
             bail!("Corrupted container header: truncated large count");
         }
         let mut cur = Cursor::new(&data[pos..pos + 4]);
-        large_count = cur.read_u32::<LittleEndian>()? as usize;
+        large_count = endian.read_u32(&mut cur)? as usize;
         pos += 4;
     }
 
@@ -102,8 +213,8 @@ pub fn parse_raw_container_table(
     }
 
     for _ in 0..large_count {
-        let id = cur.read_u32::<LittleEndian>()?;
-        let offset = cur.read_u32::<LittleEndian>()? as usize;
+        let id = endian.read_u32(&mut cur)?;
+        let offset = endian.read_u32(&mut cur)? as usize;
         entries.push(ContainerTableEntry {
             id,
             offset,
@@ -121,11 +232,49 @@ pub fn parse_raw_container_table(
         has_magic,
         data_start,
         entries,
+        endian,
     })
 }
 
-/// Unified builder for Triumph container tables and data segments.
+pub fn extract_slices_from_table<'a>(
+    data: &'a [u8],
+    table: &ParsedContainerTable,
+) -> Vec<(u32, bool, &'a [u8])> {
+    let mut elements = Vec::with_capacity(table.entries.len());
+    for i in 0..table.entries.len() {
+        let entry = &table.entries[i];
+        let start = table.data_start + entry.offset;
+        let end = if i + 1 < table.entries.len() {
+            table.data_start + table.entries[i + 1].offset
+        } else {
+            data.len()
+        };
+
+        if start <= data.len() && end <= data.len() && start <= end {
+            elements.push((entry.id, entry.is_large, &data[start..end]));
+        }
+    }
+    elements
+}
+
+pub fn extract_elements_from_table(
+    data: &[u8],
+    table: &ParsedContainerTable,
+) -> Vec<(u32, Vec<u8>)> {
+    extract_slices_from_table(data, table)
+        .into_iter()
+        .map(|(id, _, slice)| (id, slice.to_vec()))
+        .collect()
+}
+
 pub fn serialize_container_payload<'a, I>(elements: I) -> Vec<u8>
+where
+    I: IntoIterator<Item = (u32, bool, &'a [u8])>,
+{
+    serialize_container_payload_with_endian(elements, Endian::Little)
+}
+
+pub fn serialize_container_payload_with_endian<'a, I>(elements: I, endian: Endian) -> Vec<u8>
 where
     I: IntoIterator<Item = (u32, bool, &'a [u8])>,
 {
@@ -156,35 +305,41 @@ where
     out.push(control_byte);
 
     if has_large {
-        out.write_u32::<LittleEndian>(large_entries.len() as u32)
-            .unwrap();
+        let _ = endian.write_u32(&mut out, large_entries.len() as u32);
     }
     for (id, offset) in small_entries {
         out.write_u8(id).unwrap();
         out.write_u8(offset).unwrap();
     }
     for (id, offset) in large_entries {
-        out.write_u32::<LittleEndian>(id).unwrap();
-        out.write_u32::<LittleEndian>(offset).unwrap();
+        let _ = endian.write_u32(&mut out, id);
+        let _ = endian.write_u32(&mut out, offset);
     }
     out.extend_from_slice(&data_segment);
     out
 }
 
 pub fn read_length_prefixed_string(data: &[u8]) -> Option<String> {
-    if data.len() < 4 {
+    if data.len() < 5 {
         return None;
     }
     let len = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
-    if len > 0 && len <= data.len() - 4 {
-        let slice = &data[4..4 + len];
-        let clean = slice.strip_suffix(&[0]).unwrap_or(slice);
-        std::str::from_utf8(clean)
-            .ok()
-            .map(|s| s.trim().to_string())
-    } else {
-        None
+    if len == 0 || len > 2048 || len > data.len() - 4 {
+        return None;
     }
+    let slice = &data[4..4 + len];
+    let clean = slice.strip_suffix(&[0]).unwrap_or(slice);
+
+    if !clean
+        .iter()
+        .all(|&b| (0x20..=0x7E).contains(&b) || b == b'\t' || b == b'\r' || b == b'\n')
+    {
+        return None;
+    }
+
+    std::str::from_utf8(clean)
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 pub fn write_length_prefixed_string(s: &str) -> Vec<u8> {
@@ -193,4 +348,14 @@ pub fn write_length_prefixed_string(s: &str) -> Vec<u8> {
     out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
     out.extend_from_slice(bytes);
     out
+}
+
+pub fn calculate_crc32(data: &[u8]) -> u32 {
+    let mut hasher = Hasher::new();
+    hasher.update(data);
+    hasher.finalize()
+}
+
+pub fn calculate_triumph_crc32(data: &[u8]) -> u32 {
+    !calculate_crc32(data)
 }

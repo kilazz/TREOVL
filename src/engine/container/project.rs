@@ -1,8 +1,6 @@
 use anyhow::{Context, Result, bail};
-use byteorder::{LittleEndian, WriteBytesExt};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::{Cursor, Write};
 use std::path::Path;
 
 use super::builder::build_node;
@@ -12,12 +10,15 @@ use super::footer::{
 use super::header::{HEADER_SIZE, PrpHeader};
 use super::node::{PrpNode, parse_node};
 use super::sync::{export_smart_assets, sync_assets_to_chunks};
+use crate::engine::common::Endian;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ProjectManifest {
     pub header: PrpHeader,
     pub has_footer: bool,
     pub footer_hash2: u32,
+    #[serde(default)]
+    pub endian: Endian,
     pub root: PrpNode,
 }
 
@@ -29,10 +30,14 @@ pub fn unpack_archive(archive_path: &Path, output_dir: &Path) -> Result<(usize, 
     let footer_opt = check_footer(&data);
     let has_footer = footer_opt.is_some();
     let footer_hash2 = footer_opt.as_ref().map(|f| f.hash2).unwrap_or(0x7C809B8B);
+    let endian = footer_opt
+        .as_ref()
+        .map(|f| f.endian)
+        .unwrap_or(header.endian);
 
     let mut log = format!(
-        "Magic: '{}' | Version: {}.{} | Package: '{}'\n",
-        header.magic, header.major_version, header.minor_version, header.pack_name
+        "Magic: '{}' | Version: {}.{} | Package: '{}' | Platform: {:?}\n",
+        header.magic, header.major_version, header.minor_version, header.pack_name, endian
     );
 
     if let Some(ref footer) = footer_opt {
@@ -44,7 +49,6 @@ pub fn unpack_archive(archive_path: &Path, output_dir: &Path) -> Result<(usize, 
         ));
     }
 
-    // Create both the working chunks directory and the pristine baseline directory
     fs::create_dir_all(output_dir.join("chunks"))?;
     fs::create_dir_all(output_dir.join("chunks_vanilla"))?;
 
@@ -62,6 +66,7 @@ pub fn unpack_archive(archive_path: &Path, output_dir: &Path) -> Result<(usize, 
         header,
         has_footer,
         footer_hash2,
+        endian,
         root: root_node,
     };
 
@@ -100,7 +105,6 @@ pub fn pack_archive(
         );
     }
 
-    // Always inject modifications from assets/ into pure vanilla baseline chunks
     if let Ok(synced) = sync_assets_to_chunks(project_dir)
         && synced > 0
     {
@@ -114,32 +118,18 @@ pub fn pack_archive(
     let manifest: ProjectManifest = serde_json::from_str(&manifest_str)?;
 
     let payload = build_node(&manifest.root, project_dir, compression_level)?;
-
-    let mut header_bytes = vec![0u8; HEADER_SIZE];
-    let mut cur = Cursor::new(&mut header_bytes);
-
-    let mut magic = manifest.header.magic.into_bytes();
-    magic.resize(4, 0);
-    cur.write_all(&magic)?;
-    cur.write_u16::<LittleEndian>(manifest.header.major_version)?;
-    cur.write_u16::<LittleEndian>(manifest.header.minor_version)?;
-    cur.write_u32::<LittleEndian>(manifest.header.file_id)?;
-    cur.write_u32::<LittleEndian>(payload.len() as u32)?;
-
-    let mut pack_name = manifest.header.pack_name.into_bytes();
-    pack_name.resize(160, 0);
-    cur.write_all(&pack_name)?;
-
-    let mut final_binary = header_bytes;
+    let mut final_binary = manifest.header.write(payload.len() as u32)?;
     final_binary.extend(payload);
 
     if manifest.has_footer {
         let crc = calculate_triumph_crc32(&final_binary);
         let mut footer = Vec::with_capacity(FOOTER_SIZE);
-        footer.write_u32::<LittleEndian>(MAGIC_FOOTER_1)?;
-        footer.write_u32::<LittleEndian>(MAGIC_FOOTER_2)?;
-        footer.write_u32::<LittleEndian>(crc)?;
-        footer.write_u32::<LittleEndian>(manifest.footer_hash2)?;
+        let _ = manifest.endian.write_u32(&mut footer, MAGIC_FOOTER_1);
+        let _ = manifest.endian.write_u32(&mut footer, MAGIC_FOOTER_2);
+        let _ = manifest.endian.write_u32(&mut footer, crc);
+        let _ = manifest
+            .endian
+            .write_u32(&mut footer, manifest.footer_hash2);
         final_binary.extend(footer);
     }
 

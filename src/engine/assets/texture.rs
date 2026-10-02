@@ -5,6 +5,7 @@ use std::io::{Cursor, Read};
 use super::{
     build_chunk_from_elements, build_typed_container, parse_chunk_elements, parse_typed_container,
 };
+use crate::engine::common::magic;
 use crate::utils::dds_decoder::TextureFormat;
 use crate::utils::dds_encoder::generate_dds_header;
 
@@ -17,8 +18,8 @@ pub struct OverlordTexture {
     pub pixel_data: Vec<u8>,
 }
 
-/// Parses any Overlord texture chunk (TGA UI image, 3D mipmapped texture, or cubemap).
-/// Fully extracts the entire mipmap chain into a continuous binary payload.
+/// Parses an Overlord texture chunk (UI image, 2D/3D mipmapped texture, or cubemap).
+/// Extracts the entire pixel stream and detects dimensions, formats, and mipmap chains.
 pub fn parse_texture_chunk(data: &[u8]) -> Result<OverlordTexture> {
     if data.len() < 4 {
         bail!("Chunk data is too short to be a valid texture.");
@@ -27,7 +28,7 @@ pub fn parse_texture_chunk(data: &[u8]) -> Result<OverlordTexture> {
     // =========================================================================
     // 1. TGA Interface Image (TypeID: 0x00410098)
     // =========================================================================
-    if data.starts_with(b"\x98\x00\x41\x00") {
+    if data.starts_with(magic::TEX_INTERFACE) {
         let mut pos = 4;
         if pos >= data.len() {
             bail!("Truncated TGA chunk header.");
@@ -64,14 +65,12 @@ pub fn parse_texture_chunk(data: &[u8]) -> Result<OverlordTexture> {
         });
     }
 
-    let is_cubemap = data.starts_with(b"\x99\x00\x41\x00");
+    let is_cubemap = data.starts_with(magic::TEX_CUBEMAP);
 
     // =========================================================================
-    // 2. Mipmapped 3D Texture (0x0041003D) or Cubemap (0x00410099)
+    // 2. Mipmapped 2D/3D Texture (0x0041003D) or Cubemap (0x00410099)
     // =========================================================================
-    if data.starts_with(b"\x3D\x00\x41\x00") || data.starts_with(b"\x99\x00\x41\x00") {
-        // High-level AST container traversal:
-        // Root Container -> Element 1 (Level 1 Wrapper) -> Element 20 (Level 2 Mip List) -> Mip Chunks (0x00410024)
+    if data.starts_with(magic::TEX_3D) || is_cubemap {
         if let Ok((_, root_elements)) = parse_typed_container(data)
             && let Some((_, level_1_data)) = root_elements.into_iter().find(|(id, _)| *id == 1)
             && let Ok((_, level_1_elements)) = parse_chunk_elements(&level_1_data)
@@ -83,7 +82,7 @@ pub fn parse_texture_chunk(data: &[u8]) -> Result<OverlordTexture> {
             let mut first_width = 0;
             let mut first_height = 0;
             let mut first_format = TextureFormat::DXT5;
-            let mip_count = mips.len() as u32;
+            let total_mips = mips.len() as u32;
 
             for (idx, (_, mip_bytes)) in mips.into_iter().enumerate() {
                 if let Ok((_, mip_props)) = parse_typed_container(&mip_bytes) {
@@ -117,6 +116,12 @@ pub fn parse_texture_chunk(data: &[u8]) -> Result<OverlordTexture> {
                 }
             }
 
+            let mip_count = if is_cubemap {
+                total_mips / 6
+            } else {
+                total_mips
+            };
+
             if first_width > 0 && first_height > 0 && !all_pixels.is_empty() {
                 return Ok(OverlordTexture {
                     width: first_width,
@@ -129,18 +134,18 @@ pub fn parse_texture_chunk(data: &[u8]) -> Result<OverlordTexture> {
             }
         }
 
-        // Resilient byte scanning fallback across all 0x00410024 mip chunks
+        // Resilient binary scanning fallback across 0x00410024 mip chunks
         let mut all_mips_data = Vec::new();
         let mut first_width = 0;
         let mut first_height = 0;
         let mut first_format = TextureFormat::DXT5;
-        let mut mip_count = 0;
+        let mut total_mips_scanned = 0;
 
         let mut search_pos = 0;
         while search_pos + 4 <= data.len() {
             if let Some(rel) = data[search_pos..]
                 .windows(4)
-                .position(|w| w == b"\x24\x00\x41\x00")
+                .position(|w| w == magic::TEX_MIPMAP)
             {
                 let mip_start = search_pos + rel;
                 let mut pos = mip_start + 4;
@@ -169,13 +174,13 @@ pub fn parse_texture_chunk(data: &[u8]) -> Result<OverlordTexture> {
                         };
 
                         if pos + mip_size <= data.len() {
-                            if mip_count == 0 {
+                            if total_mips_scanned == 0 {
                                 first_width = width;
                                 first_height = height;
                                 first_format = format;
                             }
                             all_mips_data.extend_from_slice(&data[pos..pos + mip_size]);
-                            mip_count += 1;
+                            total_mips_scanned += 1;
                             search_pos = pos + mip_size;
                             continue;
                         }
@@ -187,7 +192,13 @@ pub fn parse_texture_chunk(data: &[u8]) -> Result<OverlordTexture> {
             }
         }
 
-        if mip_count > 0 {
+        if total_mips_scanned > 0 {
+            let mip_count = if is_cubemap {
+                total_mips_scanned / 6
+            } else {
+                total_mips_scanned
+            };
+
             return Ok(OverlordTexture {
                 width: first_width,
                 height: first_height,
@@ -227,58 +238,25 @@ pub fn parse_texture_chunk(data: &[u8]) -> Result<OverlordTexture> {
         });
     }
 
-    // =========================================================================
-    // 4. Element-based Flat Container Fallback
-    // =========================================================================
-    if let Ok((_, elements)) = parse_chunk_elements(data) {
-        let mut width = 0;
-        let mut height = 0;
-        let mut format = 7;
-        let mut pixel_data = Vec::new();
-
-        for (id, chunk) in elements {
-            let mut c = Cursor::new(&chunk);
-            match id {
-                20 if chunk.len() >= 4 => width = c.read_u32::<LittleEndian>().unwrap_or(0),
-                21 if chunk.len() >= 4 => height = c.read_u32::<LittleEndian>().unwrap_or(0),
-                23 if chunk.len() >= 4 => format = c.read_u32::<LittleEndian>().unwrap_or(7),
-                22 => pixel_data = chunk.to_vec(),
-                _ => {}
-            }
-        }
-
-        if width > 0 && height > 0 && !pixel_data.is_empty() {
-            let tex_format = TextureFormat::from_u32(format).unwrap_or(TextureFormat::DXT5);
-            return Ok(OverlordTexture {
-                width,
-                height,
-                format: tex_format,
-                mip_count: 1,
-                is_cubemap: false,
-                pixel_data,
-            });
-        }
-    }
-
     bail!("Could not detect texture dimensions or valid pixel payload in chunk.")
 }
 
 /// Exports any texture chunk to a standard DirectDraw Surface (DDS) or TGA file.
-/// Preserves all mipmap levels in the exported DDS header.
+/// Preserves all mipmap levels and cubemap face layouts in the exported DDS header.
 pub fn export_to_dds(data: &[u8]) -> Result<Vec<u8>> {
     let tex = parse_texture_chunk(data)?;
 
-    if data.starts_with(b"\x98\x00\x41\x00") {
+    if data.starts_with(magic::TEX_INTERFACE) {
         let mut tga_file = Vec::with_capacity(18 + tex.pixel_data.len());
         tga_file.push(0);
         tga_file.push(0);
-        tga_file.push(2); // Uncompressed true-color image
+        tga_file.push(2);
         tga_file.extend_from_slice(&[0, 0, 0, 0, 0]);
         tga_file.extend_from_slice(&[0, 0, 0, 0]);
         tga_file.extend_from_slice(&(tex.width as u16).to_le_bytes());
         tga_file.extend_from_slice(&(tex.height as u16).to_le_bytes());
-        tga_file.push(32); // 32 bits per pixel
-        tga_file.push(8); // 8 bits of alpha
+        tga_file.push(32);
+        tga_file.push(8);
 
         let row_len = (tex.width * 4) as usize;
         for y in (0..tex.height as usize).rev() {
@@ -288,7 +266,6 @@ pub fn export_to_dds(data: &[u8]) -> Result<Vec<u8>> {
                 tga_file.extend_from_slice(&tex.pixel_data[row_start..row_end]);
             }
         }
-
         return Ok(tga_file);
     }
 
@@ -305,16 +282,11 @@ pub fn export_to_dds(data: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Injects a new DDS or TGA image into an existing Overlord texture chunk.
-/// Accurately reconstructs the exact 3-level container hierarchy expected by the engine:
-/// - Level 0: Root Typed Container (0x0041003D) [Element 20, Element 21, Element 19, Element 1]
-/// - Level 1: Subcontainer Wrapper (Element 1) [ID 20: Mip Container, ID 21: [0, 0, 0, 0]]
-/// - Level 2: Mipmap List Container [0x01, 0x01, 0x00 magic, IDs 0..N-1]
-/// - Level 3: Individual Mipmap Typed Containers (0x00410024) [20: W, 21: H, 23: Fmt, 22: Pixels]
 pub fn replace_texture_in_chunk(chunk_data: &[u8], input_image: &[u8]) -> Result<Vec<u8>> {
     // =========================================================================
     // 1. TGA Interface Image Replacement
     // =========================================================================
-    if chunk_data.starts_with(b"\x98\x00\x41\x00") {
+    if chunk_data.starts_with(magic::TEX_INTERFACE) {
         let (width, height, is_top_left, pixel_data) =
             if input_image.starts_with(b"DDS ") && input_image.len() >= 128 {
                 let mut c = Cursor::new(input_image);
@@ -373,10 +345,12 @@ pub fn replace_texture_in_chunk(chunk_data: &[u8], input_image: &[u8]) -> Result
         return Ok(out);
     }
 
+    let is_cubemap_target = chunk_data.starts_with(magic::TEX_CUBEMAP);
+
     // =========================================================================
-    // 2. Mipmapped 3D Texture (0x0041003D) or Cubemap (0x00410099)
+    // 2. Mipmapped 2D/3D Texture (0x0041003D) or Cubemap (0x00410099)
     // =========================================================================
-    if chunk_data.starts_with(b"\x3D\x00\x41\x00") || chunk_data.starts_with(b"\x99\x00\x41\x00") {
+    if chunk_data.starts_with(magic::TEX_3D) || is_cubemap_target {
         if input_image.len() < 128 || &input_image[0..4] != b"DDS " {
             bail!("Invalid DDS file selected (must begin with 'DDS ').");
         }
@@ -403,56 +377,53 @@ pub fn replace_texture_in_chunk(chunk_data: &[u8], input_image: &[u8]) -> Result
             _ => (5u32, 4usize),
         };
 
-        // Step 1: Safely parse root typed container (TypeID: 0x0041003D / 0x00410099).
-        // Preserves Element 20 (internal string), Element 21 (filename), and Element 19 byte-for-byte.
         let (root_type_id, mut root_elements) = parse_typed_container(chunk_data)?;
 
-        // Step 2: Build each individual mipmap as a valid Level 3 typed container (TypeID: 0x00410024)
+        // Support full 6-face cubemaps by packing all faces sequentially
+        let num_faces = if is_cubemap_target { 6 } else { 1 };
         let mut mip_blocks = Vec::new();
         let mut pixel_pos = 128usize;
-        let mut w = new_width;
-        let mut h = new_height;
 
-        for mip_idx in 0..mip_count {
-            let mip_size = if new_format == 5 {
-                (w * h * 4) as usize
-            } else {
-                (w.div_ceil(4) * h.div_ceil(4) * block_size as u32) as usize
-            };
+        let mut block_counter = 0;
+        for _face in 0..num_faces {
+            let mut w = new_width;
+            let mut h = new_height;
 
-            if pixel_pos + mip_size > input_image.len() {
-                break;
+            for _mip_idx in 0..mip_count {
+                let mip_size = if new_format == 5 {
+                    (w * h * 4) as usize
+                } else {
+                    (w.div_ceil(4) * h.div_ceil(4) * block_size as u32) as usize
+                };
+
+                if pixel_pos + mip_size > input_image.len() {
+                    break;
+                }
+
+                let mip_pixels = &input_image[pixel_pos..pixel_pos + mip_size];
+                let mip_chunk = build_typed_container(
+                    0x00410024,
+                    &[
+                        (20, w.to_le_bytes().to_vec()),
+                        (21, h.to_le_bytes().to_vec()),
+                        (23, new_format.to_le_bytes().to_vec()),
+                        (22, mip_pixels.to_vec()),
+                    ],
+                );
+
+                mip_blocks.push((block_counter, mip_chunk));
+                block_counter += 1;
+
+                pixel_pos += mip_size;
+                w = (w / 2).max(1);
+                h = (h / 2).max(1);
             }
-
-            let mip_pixels = &input_image[pixel_pos..pixel_pos + mip_size];
-
-            let mip_chunk = build_typed_container(
-                0x00410024,
-                &[
-                    (20, w.to_le_bytes().to_vec()),
-                    (21, h.to_le_bytes().to_vec()),
-                    (23, new_format.to_le_bytes().to_vec()),
-                    (22, mip_pixels.to_vec()),
-                ],
-            );
-
-            mip_blocks.push((mip_idx, mip_chunk));
-
-            pixel_pos += mip_size;
-            w = (w / 2).max(1);
-            h = (h / 2).max(1);
         }
 
-        // Step 3: Build Level 2 Mipmap Container with mandatory CONTAINER_MAGIC (\x01\x01\x00)
         let level_2_mip_container = build_chunk_from_elements(true, &mip_blocks);
-
-        // Step 4: Build Level 1 Wrapper Container
-        // Element ID 20 = Level 2 Mipmap List Container
-        // Element ID 21 = 4 zero bytes (engine trailer / LOD metadata)
         let level_1_elements = vec![(20, level_2_mip_container), (21, vec![0u8, 0, 0, 0])];
         let level_1_container = build_chunk_from_elements(false, &level_1_elements);
 
-        // Step 5: Update Element 1 in the Root Container and assemble final binary
         let mut replaced = false;
         for (id, data) in root_elements.iter_mut() {
             if *id == 1 {

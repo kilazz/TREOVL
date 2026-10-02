@@ -3,4 +3,6 @@ pub mod dds_encoder;
 pub mod diff;
 pub mod gltf_builder;
 pub mod logger;
+pub mod renderer;
+pub mod tangents;
 pub mod zlib;

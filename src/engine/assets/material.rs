@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 
 use super::{build_typed_container, parse_typed_container};
+use crate::engine::common::read_length_prefixed_string;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MaterialJson {
@@ -168,16 +169,10 @@ pub fn export_material_to_json(chunk_data: &[u8]) -> Result<String> {
         let mut ptr = None;
         let mut name = None;
 
-        // Check if block is a length-prefixed ASCII string
-        if chunk.len() >= 4 {
-            let mut cur = Cursor::new(&chunk[0..4]);
-            let str_len = cur.read_u32::<LittleEndian>()? as usize;
-            if (str_len == chunk.len() - 4 || str_len == chunk.len() - 5)
-                && let Ok(s) = std::str::from_utf8(&chunk[4..4 + str_len])
-            {
-                btype = "string".to_string();
-                value = Some(s.trim_matches(char::from(0)).to_string());
-            }
+        // Check if block is a length-prefixed ASCII string using the safe helper
+        if let Some(s) = read_length_prefixed_string(&chunk) {
+            btype = "string".to_string();
+            value = Some(s);
         }
 
         // Check if block is a texture link container
@@ -194,37 +189,20 @@ pub fn export_material_to_json(chunk_data: &[u8]) -> Result<String> {
                 let t_base = p;
                 let s1_start = t_base + str_offsets[0];
 
-                if s1_start + 4 <= chunk.len() {
-                    let s1_len = Cursor::new(&chunk[s1_start..s1_start + 4])
-                        .read_u32::<LittleEndian>()? as usize;
-
-                    if s1_start + 4 + s1_len <= chunk.len() {
-                        ptr = Some(
-                            String::from_utf8_lossy(&chunk[s1_start + 4..s1_start + 4 + s1_len])
-                                .trim_matches(char::from(0))
-                                .to_string(),
-                        );
-                        btype = "texture_link".to_string();
-                        value = None;
-                    }
+                if s1_start < chunk.len()
+                    && let Some(s) = read_length_prefixed_string(&chunk[s1_start..])
+                {
+                    ptr = Some(s);
+                    btype = "texture_link".to_string();
+                    value = None;
                 }
 
                 if num_offsets == 2 && btype == "texture_link" {
                     let s2_start = t_base + str_offsets[1];
-                    if s2_start + 4 <= chunk.len() {
-                        let s2_len = Cursor::new(&chunk[s2_start..s2_start + 4])
-                            .read_u32::<LittleEndian>()?
-                            as usize;
-
-                        if s2_start + 4 + s2_len <= chunk.len() {
-                            name = Some(
-                                String::from_utf8_lossy(
-                                    &chunk[s2_start + 4..s2_start + 4 + s2_len],
-                                )
-                                .trim_matches(char::from(0))
-                                .to_string(),
-                            );
-                        }
+                    if s2_start < chunk.len()
+                        && let Some(s) = read_length_prefixed_string(&chunk[s2_start..])
+                    {
+                        name = Some(s);
                     }
                 }
             }

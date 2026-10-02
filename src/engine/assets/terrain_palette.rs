@@ -1,10 +1,12 @@
 use anyhow::{Context, Result, bail};
-use byteorder::{LittleEndian, ReadBytesExt};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Cursor;
 
-use super::{build_typed_container, parse_chunk_elements, parse_typed_container};
+use super::{
+    build_chunk_from_elements, build_typed_container, parse_chunk_elements, parse_typed_container,
+};
 use crate::engine::common::{read_length_prefixed_string, write_length_prefixed_string};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -216,6 +218,20 @@ pub fn import_terrain_palette_from_json(json_str: &str) -> Result<Vec<u8>> {
                 23 => {
                     raw_bytes = vec![parsed.sub_layer_counter];
                 }
+                40..=53 => {
+                    if let Some(tex) = parsed.textures.iter().find(|t| t.slot_id == comp.id) {
+                        raw_bytes = build_texture_link(&tex.pointer_tag, &tex.filename);
+                    }
+                }
+                54 => {
+                    // Rebuild splat and foliage layers from edited JSON instead of blindly copying old hex
+                    if let Ok(rebuilt) = rebuild_splat_and_foliage_container(
+                        &parsed.terrain_splat_layers,
+                        &parsed.foliage_scatter_groups,
+                    ) {
+                        raw_bytes = rebuilt;
+                    }
+                }
                 62 => {
                     if let Some(ref thumb) = parsed.thumbnail {
                         raw_bytes = write_length_prefixed_string(thumb);
@@ -231,9 +247,13 @@ pub fn import_terrain_palette_from_json(json_str: &str) -> Result<Vec<u8>> {
     Ok(build_typed_container(type_id, &elements))
 }
 
-// -----------------------------------------------------------------------------
-// Internal Parsers for Sub-container ID 54
-// -----------------------------------------------------------------------------
+fn build_texture_link(pointer_tag: &str, filename: &str) -> Vec<u8> {
+    let sub_elements = vec![
+        (20, write_length_prefixed_string(pointer_tag)),
+        (21, write_length_prefixed_string(filename)),
+    ];
+    build_chunk_from_elements(false, &sub_elements)
+}
 
 fn decode_splat_and_foliage_container(
     container_bytes: &[u8],
@@ -255,7 +275,6 @@ fn decode_splat_and_foliage_container(
             let mut brush_idx = layer_id_counter;
 
             for (pid, pdata) in &sub_elems {
-                // Soilcover group names are stored under ID 10, terrain layers under ID 20
                 if (*pid == 20 || *pid == 10)
                     && let Some(s) = read_length_prefixed_string(pdata)
                 {
@@ -297,6 +316,51 @@ fn decode_splat_and_foliage_container(
             }
         }
     }
+}
+
+fn rebuild_splat_and_foliage_container(
+    layers: &[SplatLayerJson],
+    foliage: &HashMap<String, Vec<FoliageMeshJson>>,
+) -> Result<Vec<u8>> {
+    let mut entries = Vec::new();
+
+    for layer in layers {
+        let mut sub_elems = vec![
+            (20, write_length_prefixed_string(&layer.name)),
+            (26, layer.brush_index.to_le_bytes().to_vec()),
+        ];
+
+        if let Some(ref fg) = layer.foliage_group
+            && let Some(meshes) = foliage.get(fg)
+        {
+            let mut mesh_chunks = Vec::new();
+            for (idx, m) in meshes.iter().enumerate() {
+                let mut float_bytes = Vec::with_capacity(20);
+                let mut cur = Cursor::new(&mut float_bytes);
+                cur.write_f32::<LittleEndian>(m.density)?;
+                cur.write_f32::<LittleEndian>(m.height_min)?;
+                cur.write_f32::<LittleEndian>(m.height_max)?;
+                cur.write_f32::<LittleEndian>(m.width_scale)?;
+                cur.write_f32::<LittleEndian>(m.tint_variation)?;
+
+                let m_elems = vec![
+                    (20, write_length_prefixed_string(&m.mesh_slot)),
+                    (21, write_length_prefixed_string(&m.mesh_file)),
+                    (22, write_length_prefixed_string(&m.display_name)),
+                    (30, float_bytes),
+                ];
+                let m_blob = build_typed_container(0x04000079, &m_elems);
+                mesh_chunks.push((idx as u32, m_blob));
+            }
+            let foliage_container = build_chunk_from_elements(false, &mesh_chunks);
+            sub_elems.push((1, foliage_container));
+        }
+
+        let layer_blob = build_typed_container(0x04000080, &sub_elems);
+        entries.push((layer.id, layer_blob));
+    }
+
+    Ok(build_chunk_from_elements(false, &entries))
 }
 
 fn scan_foliage_meshes(data: &[u8], out: &mut Vec<FoliageMeshJson>) {

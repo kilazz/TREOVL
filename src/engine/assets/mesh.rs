@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use serde_json::json;
 use std::collections::HashMap;
-use std::io::Cursor;
+use std::io::{Cursor, Write};
 
 use super::animation::{ObjectBone, parse_object_bone_container};
 use super::{
@@ -11,6 +11,7 @@ use super::{
 use crate::engine::common::{chunk_id, magic};
 use crate::engine::math::{Vector2, Vector3, Vector4};
 use crate::utils::gltf_builder::GltfBuilder;
+use crate::utils::tangents::generate_tangents;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum VertexSemantic {
@@ -28,6 +29,7 @@ pub enum VertexSemantic {
 pub struct VertexAttribute {
     pub semantic: VertexSemantic,
     pub byte_size: usize,
+    pub raw_descriptor: u32,
 }
 
 impl VertexAttribute {
@@ -58,6 +60,7 @@ impl VertexAttribute {
         Self {
             semantic,
             byte_size,
+            raw_descriptor: desc,
         }
     }
 }
@@ -69,19 +72,30 @@ pub struct MeshStats {
     pub is_skinned: bool,
 }
 
-struct ParsedMeshData {
-    positions: Vec<Vector3>,
-    normals: Vec<Vector3>,
-    uvs: Vec<Vector2>,
-    weights: Vec<Vector4>,
-    joints: Vec<[u16; 4]>,
-    indices: Vec<u16>,
-    bones: Vec<ObjectBone>,
-    stride: usize,
-    is_skinned: bool,
+pub struct ParsedMeshData {
+    pub positions: Vec<Vector3>,
+    pub normals: Vec<Vector3>,
+    pub uvs: Vec<Vector2>,
+    pub weights: Vec<Vector4>,
+    pub joints: Vec<[u16; 4]>,
+    pub indices: Vec<u32>,
+    pub bones: Vec<ObjectBone>,
+    pub stride: usize,
+    pub is_skinned: bool,
+    pub attributes: Vec<VertexAttribute>,
+    pub raw_descriptors: Vec<u32>,
 }
 
-fn extract_mesh_geometry(chunk_data: &[u8]) -> Result<ParsedMeshData> {
+pub struct VertexStreams<'a> {
+    pub positions: &'a [Vector3],
+    pub normals: &'a [Vector3],
+    pub uvs: &'a [Vector2],
+    pub weights: &'a [Vector4],
+    pub joints: &'a [[u8; 4]],
+    pub tangents: &'a [Vector4],
+}
+
+pub fn extract_mesh_geometry(chunk_data: &[u8]) -> Result<ParsedMeshData> {
     let bones = parse_object_bone_container(chunk_data).unwrap_or_default();
 
     let mesh_data_bytes = if chunk_data.starts_with(magic::MESH) {
@@ -116,11 +130,48 @@ fn extract_mesh_geometry(chunk_data: &[u8]) -> Result<ParsedMeshData> {
         .map(|(_, data)| data)
         .context("Missing index buffer blob ID 22")?;
 
-    let mut indices = Vec::new();
-    let mut cur_ind = Cursor::new(raw_indices);
-    while (cur_ind.position() as usize) + 2 <= raw_indices.len() {
-        indices.push(cur_ind.read_u16::<LittleEndian>()?);
-    }
+    let flag_val = indice_elements
+        .iter()
+        .find(|(id, _)| *id == chunk_id::TAG_STRING)
+        .and_then(|(_, d)| d.first().copied())
+        .unwrap_or(0);
+
+    let declared_count = indice_elements
+        .iter()
+        .find(|(id, _)| *id == chunk_id::NAME_STRING)
+        .and_then(|(_, d)| Cursor::new(d).read_u32::<LittleEndian>().ok())
+        .unwrap_or(0) as usize;
+
+    let is_32bit = if declared_count > 0 {
+        raw_indices.len() == declared_count * 4
+    } else {
+        flag_val != 0 || (raw_indices.len().is_multiple_of(4) && raw_indices.len() > 131_072)
+    };
+
+    let indices: Vec<u32> = if is_32bit {
+        if (raw_indices.as_ptr() as usize).is_multiple_of(4) {
+            bytemuck::cast_slice::<u8, u32>(raw_indices).to_vec()
+        } else {
+            raw_indices
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&c| u32::from_le_bytes(c))
+                .collect()
+        }
+    } else if (raw_indices.as_ptr() as usize).is_multiple_of(2) {
+        bytemuck::cast_slice::<u8, u16>(raw_indices)
+            .iter()
+            .map(|&idx| idx as u32)
+            .collect()
+    } else {
+        raw_indices
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| u16::from_le_bytes(c) as u32)
+            .collect()
+    };
 
     let (_, vbuf_elements) = parse_chunk_elements(vertex_chunk)?;
     let info_chunk = vbuf_elements
@@ -151,8 +202,10 @@ fn extract_mesh_geometry(chunk_data: &[u8]) -> Result<ParsedMeshData> {
 
     let mut cur_decl = Cursor::new(decl_data);
     let mut attributes = Vec::new();
+    let mut raw_descriptors = Vec::new();
     while (cur_decl.position() as usize) + 4 <= decl_data.len() {
         let desc = cur_decl.read_u32::<LittleEndian>()?;
+        raw_descriptors.push(desc);
         attributes.push(VertexAttribute::from_descriptor(desc));
     }
 
@@ -174,7 +227,7 @@ fn extract_mesh_geometry(chunk_data: &[u8]) -> Result<ParsedMeshData> {
 
     for i in 0..vertex_count {
         let base = i * stride;
-        let mut cur = Cursor::new(&raw_vertices[base..base + stride]);
+        let vdata = &raw_vertices[base..base + stride];
 
         let mut pos = Vector3::default();
         let mut norm = Vector3::default();
@@ -184,36 +237,54 @@ fn extract_mesh_geometry(chunk_data: &[u8]) -> Result<ParsedMeshData> {
 
         let mut weight_slot = 0;
         let mut joint_slot = 0;
+        let mut offset = 0;
 
         for attr in &attributes {
             match attr.semantic {
                 VertexSemantic::Position => {
-                    pos.x = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-                    pos.y = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-                    pos.z = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+                    let val: [f32; 3] = bytemuck::pod_read_unaligned(&vdata[offset..offset + 12]);
+                    pos = Vector3 {
+                        x: val[0],
+                        y: val[1],
+                        z: val[2],
+                    };
                 }
                 VertexSemantic::Normal => {
-                    norm.x = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-                    norm.y = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-                    norm.z = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+                    let val: [f32; 3] = bytemuck::pod_read_unaligned(&vdata[offset..offset + 12]);
+                    norm = Vector3 {
+                        x: val[0],
+                        y: val[1],
+                        z: val[2],
+                    };
                 }
                 VertexSemantic::TexCoord => {
-                    uv.x = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-                    uv.y = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+                    let val: [f32; 2] = bytemuck::pod_read_unaligned(&vdata[offset..offset + 8]);
+                    uv = Vector2 {
+                        x: val[0],
+                        y: val[1],
+                    };
                 }
                 VertexSemantic::BlendWeights => {
                     if attr.byte_size == 16 {
-                        w_val.x = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-                        w_val.y = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-                        w_val.z = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-                        w_val.w = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+                        let val: [f32; 4] =
+                            bytemuck::pod_read_unaligned(&vdata[offset..offset + 16]);
+                        w_val = Vector4 {
+                            x: val[0],
+                            y: val[1],
+                            z: val[2],
+                            w: val[3],
+                        };
                     } else if attr.byte_size == 12 {
-                        w_val.x = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-                        w_val.y = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-                        w_val.z = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-                        w_val.w = (1.0 - (w_val.x + w_val.y + w_val.z)).max(0.0);
+                        let val: [f32; 3] =
+                            bytemuck::pod_read_unaligned(&vdata[offset..offset + 12]);
+                        w_val = Vector4 {
+                            x: val[0],
+                            y: val[1],
+                            z: val[2],
+                            w: (1.0 - (val[0] + val[1] + val[2])).max(0.0),
+                        };
                     } else if attr.byte_size == 1 {
-                        let w_norm = cur.read_u8().unwrap_or(0) as f32 / 255.0;
+                        let w_norm = vdata[offset] as f32 / 255.0;
                         match weight_slot {
                             0 => w_val.x = w_norm,
                             1 => w_val.y = w_norm,
@@ -222,43 +293,28 @@ fn extract_mesh_geometry(chunk_data: &[u8]) -> Result<ParsedMeshData> {
                             _ => {}
                         }
                         weight_slot += 1;
-                    } else {
-                        let p = cur.position();
-                        cur.set_position(p + attr.byte_size as u64);
                     }
                 }
                 VertexSemantic::BlendIndices => {
                     if attr.byte_size == 4 {
-                        j_val[0] = cur.read_u8().unwrap_or(0) as u16;
-                        j_val[1] = cur.read_u8().unwrap_or(0) as u16;
-                        j_val[2] = cur.read_u8().unwrap_or(0) as u16;
-                        j_val[3] = cur.read_u8().unwrap_or(0) as u16;
-                    } else if attr.byte_size == 1 {
-                        let j_byte = cur.read_u8().unwrap_or(0) as u16;
-                        if joint_slot < 4 {
-                            j_val[joint_slot] = j_byte;
-                            joint_slot += 1;
-                        }
-                    } else {
-                        let p = cur.position();
-                        cur.set_position(p + attr.byte_size as u64);
+                        let val: [u8; 4] = bytemuck::pod_read_unaligned(&vdata[offset..offset + 4]);
+                        j_val = [val[0] as u16, val[1] as u16, val[2] as u16, val[3] as u16];
+                    } else if attr.byte_size == 1 && joint_slot < 4 {
+                        j_val[joint_slot] = vdata[offset] as u16;
+                        joint_slot += 1;
                     }
                 }
-                _ => {
-                    let p = cur.position();
-                    cur.set_position(p + attr.byte_size as u64);
-                }
+                _ => {}
             }
+            offset += attr.byte_size;
         }
 
-        // В Overlord для 3 костей сохраняются 2 веса (3-й неявный: 1 - w0 - w1)
         if joint_slot == 3 && weight_slot == 2 {
             w_val.z = (1.0 - (w_val.x + w_val.y)).max(0.0);
         } else if joint_slot == 2 && weight_slot == 1 {
             w_val.y = (1.0 - w_val.x).max(0.0);
         }
 
-        // Нормализация весов скининга
         let weight_sum = w_val.x + w_val.y + w_val.z + w_val.w;
         if weight_sum > 0.001 {
             w_val.x /= weight_sum;
@@ -269,7 +325,6 @@ fn extract_mesh_geometry(chunk_data: &[u8]) -> Result<ParsedMeshData> {
             w_val.x = 1.0;
         }
 
-        // Защита от выхода индексов костей за границы скелета
         if num_bones > 0 {
             let max_bone_idx = (num_bones - 1) as u16;
             j_val[0] = j_val[0].min(max_bone_idx);
@@ -297,6 +352,8 @@ fn extract_mesh_geometry(chunk_data: &[u8]) -> Result<ParsedMeshData> {
         bones,
         stride,
         is_skinned,
+        attributes,
+        raw_descriptors,
     })
 }
 
@@ -323,11 +380,20 @@ pub fn export_mesh_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, MeshStats)> {
 
     let mut builder = GltfBuilder::new();
 
-    let mut ind_bytes = Vec::with_capacity(parsed.indices.len() * 2);
-    for idx in &parsed.indices {
-        ind_bytes.write_u16::<LittleEndian>(*idx)?;
-    }
-    let ind_view = builder.add_buffer_view(&ind_bytes, Some(34963));
+    let max_idx = parsed.indices.iter().copied().max().unwrap_or(0);
+    let (ind_view, comp_type) = if max_idx <= 0xFFFF {
+        let mut ind_bytes = Vec::with_capacity(parsed.indices.len() * 2);
+        for &idx in &parsed.indices {
+            ind_bytes.write_u16::<LittleEndian>(idx as u16)?;
+        }
+        (builder.add_buffer_view(&ind_bytes, Some(34963)), 5123)
+    } else {
+        let mut ind_bytes = Vec::with_capacity(parsed.indices.len() * 4);
+        for &idx in &parsed.indices {
+            ind_bytes.write_u32::<LittleEndian>(idx)?;
+        }
+        (builder.add_buffer_view(&ind_bytes, Some(34963)), 5125)
+    };
 
     let mut pos_bytes = Vec::with_capacity(vertex_count * 12);
     for p in &parsed.positions {
@@ -352,7 +418,14 @@ pub fn export_mesh_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, MeshStats)> {
     }
     let uv_view = builder.add_buffer_view(&uv_bytes, Some(34962));
 
-    let ind_acc = builder.add_accessor(ind_view, parsed.indices.len(), 5123, "SCALAR", None, None);
+    let ind_acc = builder.add_accessor(
+        ind_view,
+        parsed.indices.len(),
+        comp_type,
+        "SCALAR",
+        None,
+        None,
+    );
     let pos_acc = builder.add_accessor(
         pos_view,
         vertex_count,
@@ -492,6 +565,177 @@ pub fn export_mesh_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, MeshStats)> {
     Ok((glb, stats))
 }
 
+fn rebuild_mesh_container(
+    original_chunk: &[u8],
+    vertex_buffer: Vec<u8>,
+    index_buffer: &[u32],
+    pos_count: usize,
+    stride: u32,
+    raw_descriptors: &[u32],
+) -> Result<Vec<u8>> {
+    let max_idx = index_buffer.iter().copied().max().unwrap_or(0);
+    let use_32bit = max_idx > 0xFFFF || pos_count > 0xFFFF;
+
+    let (raw_indices_bytes, flag_val) = if use_32bit {
+        let mut raw = Vec::with_capacity(index_buffer.len() * 4);
+        let mut cur = Cursor::new(&mut raw);
+        for &idx in index_buffer {
+            cur.write_u32::<LittleEndian>(idx)?;
+        }
+        (raw, 1u8)
+    } else {
+        let mut raw = Vec::with_capacity(index_buffer.len() * 2);
+        let mut cur = Cursor::new(&mut raw);
+        for &idx in index_buffer {
+            cur.write_u16::<LittleEndian>(idx as u16)?;
+        }
+        (raw, 0u8)
+    };
+
+    let indice_elements = vec![
+        (20, vec![flag_val]),
+        (21, (index_buffer.len() as u32).to_le_bytes().to_vec()),
+        (22, raw_indices_bytes),
+    ];
+    let new_indice_chunk = build_chunk_from_elements(false, &indice_elements);
+
+    let mut attr_table = Vec::with_capacity(raw_descriptors.len() * 4);
+    let mut cur_attr = Cursor::new(&mut attr_table);
+    for &desc in raw_descriptors {
+        cur_attr.write_u32::<LittleEndian>(desc)?;
+    }
+
+    let info_elements = vec![
+        (20, vec![0u8]),
+        (21, stride.to_le_bytes().to_vec()),
+        (22, (raw_descriptors.len() as u32).to_le_bytes().to_vec()),
+        (23, attr_table),
+    ];
+    let new_info_chunk = build_chunk_from_elements(false, &info_elements);
+
+    let vbuf_elements = vec![
+        (20, new_info_chunk),
+        (21, (pos_count as u32).to_le_bytes().to_vec()),
+        (22, vertex_buffer),
+    ];
+    let new_vbuf_chunk = build_chunk_from_elements(false, &vbuf_elements);
+
+    let is_mesh_asset = original_chunk.starts_with(magic::MESH);
+    let mesh_data_bytes = if is_mesh_asset {
+        let (_, elements) = parse_typed_container(original_chunk)?;
+        elements
+            .into_iter()
+            .find(|(id, _)| *id == 1)
+            .map(|(_, data)| data)
+            .unwrap_or_default()
+    } else {
+        original_chunk.to_vec()
+    };
+
+    let (has_magic, mut mesh_elements) = parse_chunk_elements(&mesh_data_bytes)?;
+    mesh_elements.retain(|(id, _)| *id != 10 && *id != 11);
+    mesh_elements.push((10, new_indice_chunk));
+    mesh_elements.push((11, new_vbuf_chunk));
+    mesh_elements.sort_by_key(|&(id, _)| id);
+
+    let final_mesh_data = build_chunk_from_elements(has_magic, &mesh_elements);
+
+    if is_mesh_asset {
+        let (type_id, mut asset_elements) = parse_typed_container(original_chunk)?;
+        for (id, data) in asset_elements.iter_mut() {
+            if *id == 1 {
+                *data = final_mesh_data.clone();
+            }
+        }
+        Ok(build_typed_container(type_id, &asset_elements))
+    } else {
+        Ok(final_mesh_data)
+    }
+}
+
+fn pack_vertex_buffer_preserving_fvf(
+    pos_count: usize,
+    attributes: &[VertexAttribute],
+    stride: usize,
+    streams: &VertexStreams,
+) -> Result<Vec<u8>> {
+    let mut vertex_buffer = Vec::with_capacity(pos_count * stride);
+    let mut cur_vbuf = Cursor::new(&mut vertex_buffer);
+
+    for i in 0..pos_count {
+        for attr in attributes {
+            match attr.semantic {
+                VertexSemantic::Position => {
+                    let p = streams.positions.get(i).copied().unwrap_or_default();
+                    cur_vbuf.write_f32::<LittleEndian>(p.x)?;
+                    cur_vbuf.write_f32::<LittleEndian>(p.y)?;
+                    cur_vbuf.write_f32::<LittleEndian>(p.z)?;
+                }
+                VertexSemantic::Normal => {
+                    let n = streams.normals.get(i).copied().unwrap_or(Vector3 {
+                        x: 0.0,
+                        y: 1.0,
+                        z: 0.0,
+                    });
+                    cur_vbuf.write_f32::<LittleEndian>(n.x)?;
+                    cur_vbuf.write_f32::<LittleEndian>(n.y)?;
+                    cur_vbuf.write_f32::<LittleEndian>(n.z)?;
+                }
+                VertexSemantic::TexCoord => {
+                    let uv = streams.uvs.get(i).copied().unwrap_or_default();
+                    cur_vbuf.write_f32::<LittleEndian>(uv.x)?;
+                    cur_vbuf.write_f32::<LittleEndian>(uv.y)?;
+                }
+                VertexSemantic::TangentQuat => {
+                    let t = streams.tangents.get(i).copied().unwrap_or(Vector4 {
+                        x: 0.0,
+                        y: 0.0,
+                        z: 0.0,
+                        w: 1.0,
+                    });
+                    cur_vbuf.write_f32::<LittleEndian>(t.x)?;
+                    cur_vbuf.write_f32::<LittleEndian>(t.y)?;
+                    cur_vbuf.write_f32::<LittleEndian>(t.z)?;
+                    cur_vbuf.write_f32::<LittleEndian>(t.w)?;
+                }
+                VertexSemantic::Color => {
+                    cur_vbuf.write_u32::<LittleEndian>(0xFFFFFFFF)?;
+                }
+                VertexSemantic::BlendWeights => {
+                    let w = streams.weights.get(i).copied().unwrap_or(Vector4 {
+                        x: 1.0,
+                        y: 0.0,
+                        z: 0.0,
+                        w: 0.0,
+                    });
+                    if attr.byte_size == 16 {
+                        cur_vbuf.write_f32::<LittleEndian>(w.x)?;
+                        cur_vbuf.write_f32::<LittleEndian>(w.y)?;
+                        cur_vbuf.write_f32::<LittleEndian>(w.z)?;
+                        cur_vbuf.write_f32::<LittleEndian>(w.w)?;
+                    } else if attr.byte_size == 12 {
+                        cur_vbuf.write_f32::<LittleEndian>(w.x)?;
+                        cur_vbuf.write_f32::<LittleEndian>(w.y)?;
+                        cur_vbuf.write_f32::<LittleEndian>(w.z)?;
+                    } else {
+                        cur_vbuf.write_all(&[255, 0, 0, 0][..attr.byte_size])?;
+                    }
+                }
+                VertexSemantic::BlendIndices => {
+                    let j = streams.joints.get(i).copied().unwrap_or([0, 0, 0, 0]);
+                    cur_vbuf.write_all(&j[..attr.byte_size.min(4)])?;
+                }
+                VertexSemantic::Unknown => {
+                    let zeroes = vec![0u8; attr.byte_size];
+                    cur_vbuf.write_all(&zeroes)?;
+                }
+            }
+        }
+    }
+
+    Ok(vertex_buffer)
+}
+
 pub fn import_glb_to_mesh(original_chunk: &[u8], glb_bytes: &[u8]) -> Result<Vec<u8>> {
     if glb_bytes.len() < 20 || &glb_bytes[0..4] != b"glTF" {
         bail!("Invalid .glb file format (missing 'glTF' signature)");
@@ -577,7 +821,7 @@ pub fn import_glb_to_mesh(original_chunk: &[u8], glb_bytes: &[u8]) -> Result<Vec
         Vector3 {
             x: 0.0,
             y: 1.0,
-            z: 0.0
+            z: 0.0,
         };
         pos_count
     ];
@@ -618,7 +862,7 @@ pub fn import_glb_to_mesh(original_chunk: &[u8], glb_bytes: &[u8]) -> Result<Vec
             x: 1.0,
             y: 0.0,
             z: 0.0,
-            w: 0.0
+            w: 0.0,
         };
         pos_count
     ];
@@ -678,122 +922,69 @@ pub fn import_glb_to_mesh(original_chunk: &[u8], glb_bytes: &[u8]) -> Result<Vec
     let mut index_buffer = Vec::with_capacity(indices_count);
     for _ in 0..indices_count {
         let idx = if indices_comp == 5125 {
-            idx_cur.read_u32::<LittleEndian>().unwrap_or(0) as u16
+            idx_cur.read_u32::<LittleEndian>().unwrap_or(0)
+        } else if indices_comp == 5121 {
+            idx_cur.read_u8().unwrap_or(0) as u32
         } else {
-            idx_cur.read_u16::<LittleEndian>().unwrap_or(0)
+            idx_cur.read_u16::<LittleEndian>().unwrap_or(0) as u32
         };
         index_buffer.push(idx);
     }
 
-    let stride = if target_skinned { 52u32 } else { 32u32 };
-    let mut vertex_buffer = Vec::with_capacity(pos_count * stride as usize);
-    let mut cur_vbuf = Cursor::new(&mut vertex_buffer);
+    let (target_stride, target_attributes, target_descriptors) =
+        if let Some(ref orig) = original_parsed {
+            (
+                orig.stride,
+                orig.attributes.clone(),
+                orig.raw_descriptors.clone(),
+            )
+        } else if target_skinned {
+            (
+                52usize,
+                vec![
+                    VertexAttribute::from_descriptor(0x02010000),
+                    VertexAttribute::from_descriptor(0x02040000),
+                    VertexAttribute::from_descriptor(0x01050000),
+                    VertexAttribute::from_descriptor(0x030A0000),
+                    VertexAttribute::from_descriptor(0x0F0B0000),
+                ],
+                vec![0x02010000, 0x02040000, 0x01050000, 0x030A0000, 0x0F0B0000],
+            )
+        } else {
+            (
+                32usize,
+                vec![
+                    VertexAttribute::from_descriptor(0x02010000),
+                    VertexAttribute::from_descriptor(0x02040000),
+                    VertexAttribute::from_descriptor(0x01050000),
+                ],
+                vec![0x02010000, 0x02040000, 0x01050000],
+            )
+        };
 
-    for i in 0..pos_count {
-        let p = raw_positions[i];
-        let n = raw_normals[i];
-        let uv = raw_uvs[i];
+    let generated_tangents =
+        generate_tangents(&raw_positions, &raw_normals, &raw_uvs, &index_buffer);
 
-        cur_vbuf.write_f32::<LittleEndian>(p.x)?;
-        cur_vbuf.write_f32::<LittleEndian>(p.y)?;
-        cur_vbuf.write_f32::<LittleEndian>(p.z)?;
-
-        cur_vbuf.write_f32::<LittleEndian>(n.x)?;
-        cur_vbuf.write_f32::<LittleEndian>(n.y)?;
-        cur_vbuf.write_f32::<LittleEndian>(n.z)?;
-
-        cur_vbuf.write_f32::<LittleEndian>(uv.x)?;
-        cur_vbuf.write_f32::<LittleEndian>(uv.y)?;
-
-        if target_skinned {
-            let w = raw_weights[i];
-            let j = raw_joints[i];
-
-            cur_vbuf.write_f32::<LittleEndian>(w.x)?;
-            cur_vbuf.write_f32::<LittleEndian>(w.y)?;
-            cur_vbuf.write_f32::<LittleEndian>(w.z)?;
-            cur_vbuf.write_f32::<LittleEndian>(w.w)?;
-
-            cur_vbuf.write_u8(j[0])?;
-            cur_vbuf.write_u8(j[1])?;
-            cur_vbuf.write_u8(j[2])?;
-            cur_vbuf.write_u8(j[3])?;
-        }
-    }
-
-    let mut raw_indices_bytes = Vec::with_capacity(index_buffer.len() * 2);
-    let mut cur_idx = Cursor::new(&mut raw_indices_bytes);
-    for idx in &index_buffer {
-        cur_idx.write_u16::<LittleEndian>(*idx)?;
-    }
-
-    let indice_elements = vec![
-        (20, vec![0u8]),
-        (21, (index_buffer.len() as u32).to_le_bytes().to_vec()),
-        (22, raw_indices_bytes),
-    ];
-    let new_indice_chunk = build_chunk_from_elements(false, &indice_elements);
-
-    let mut attr_table = Vec::new();
-    let mut cur_attr = Cursor::new(&mut attr_table);
-    cur_attr.write_u32::<LittleEndian>(0x02010000)?; // Position
-    cur_attr.write_u32::<LittleEndian>(0x02040000)?; // Normal
-    cur_attr.write_u32::<LittleEndian>(0x01050000)?; // TexCoord
-
-    let attr_count = if target_skinned {
-        cur_attr.write_u32::<LittleEndian>(0x030A0000)?; // BlendWeights
-        cur_attr.write_u32::<LittleEndian>(0x0F0B0000)?; // BlendIndices
-        5u32
-    } else {
-        3u32
+    let streams = VertexStreams {
+        positions: &raw_positions,
+        normals: &raw_normals,
+        uvs: &raw_uvs,
+        weights: &raw_weights,
+        joints: &raw_joints,
+        tangents: &generated_tangents,
     };
 
-    let info_elements = vec![
-        (20, vec![0u8]),
-        (21, stride.to_le_bytes().to_vec()),
-        (22, attr_count.to_le_bytes().to_vec()),
-        (23, attr_table),
-    ];
-    let new_info_chunk = build_chunk_from_elements(false, &info_elements);
+    let vertex_buffer =
+        pack_vertex_buffer_preserving_fvf(pos_count, &target_attributes, target_stride, &streams)?;
 
-    let vbuf_elements = vec![
-        (20, new_info_chunk),
-        (21, (pos_count as u32).to_le_bytes().to_vec()),
-        (22, vertex_buffer),
-    ];
-    let new_vbuf_chunk = build_chunk_from_elements(false, &vbuf_elements);
-
-    let is_mesh_asset = original_chunk.starts_with(magic::MESH);
-    let mesh_data_bytes = if is_mesh_asset {
-        let (_, elements) = parse_typed_container(original_chunk)?;
-        elements
-            .into_iter()
-            .find(|(id, _)| *id == 1)
-            .map(|(_, data)| data)
-            .unwrap_or_default()
-    } else {
-        original_chunk.to_vec()
-    };
-
-    let (has_magic, mut mesh_elements) = parse_chunk_elements(&mesh_data_bytes)?;
-    mesh_elements.retain(|(id, _)| *id != 10 && *id != 11);
-    mesh_elements.push((10, new_indice_chunk));
-    mesh_elements.push((11, new_vbuf_chunk));
-    mesh_elements.sort_by_key(|&(id, _)| id);
-
-    let final_mesh_data = build_chunk_from_elements(has_magic, &mesh_elements);
-
-    if is_mesh_asset {
-        let (type_id, mut asset_elements) = parse_typed_container(original_chunk)?;
-        for (id, data) in asset_elements.iter_mut() {
-            if *id == 1 {
-                *data = final_mesh_data.clone();
-            }
-        }
-        Ok(build_typed_container(type_id, &asset_elements))
-    } else {
-        Ok(final_mesh_data)
-    }
+    rebuild_mesh_container(
+        original_chunk,
+        vertex_buffer,
+        &index_buffer,
+        pos_count,
+        target_stride as u32,
+        &target_descriptors,
+    )
 }
 
 pub fn export_mesh_to_obj(chunk_data: &[u8]) -> Result<(String, MeshStats)> {
@@ -817,16 +1008,14 @@ pub fn export_mesh_to_obj(chunk_data: &[u8]) -> Result<(String, MeshStats)> {
     }
 
     obj.push_str("\ns 1\n");
-    for tri in parsed.indices.chunks(3) {
-        if tri.len() == 3 {
-            let i1 = tri[0] as usize + 1;
-            let i2 = tri[1] as usize + 1;
-            let i3 = tri[2] as usize + 1;
-            obj.push_str(&format!(
-                "f {0}/{0}/{0} {1}/{1}/{1} {2}/{2}/{2}\n",
-                i1, i2, i3
-            ));
-        }
+    for tri in parsed.indices.as_chunks::<3>().0 {
+        let i1 = tri[0] as usize + 1;
+        let i2 = tri[1] as usize + 1;
+        let i3 = tri[2] as usize + 1;
+        obj.push_str(&format!(
+            "f {0}/{0}/{0} {1}/{1}/{1} {2}/{2}/{2}\n",
+            i1, i2, i3
+        ));
     }
 
     let stats = MeshStats {
@@ -891,8 +1080,10 @@ pub fn import_obj_to_mesh(original_chunk: &[u8], obj_content: &str) -> Result<Ve
         bail!("OBJ file contains no vertex positions ('v').");
     }
 
-    let mut unique_vertices = HashMap::new();
-    let mut vertex_buffer = Vec::new();
+    let mut unique_vertices: HashMap<(usize, usize, usize), u32> = HashMap::new();
+    let mut ordered_positions = Vec::new();
+    let mut ordered_normals = Vec::new();
+    let mut ordered_uvs = Vec::new();
     let mut index_buffer = Vec::new();
 
     let parse_face_token = |token: &str| -> (usize, usize, usize) {
@@ -921,118 +1112,89 @@ pub fn import_obj_to_mesh(original_chunk: &[u8], obj_content: &str) -> Result<Ve
             if let Some(&existing_idx) = unique_vertices.get(&key) {
                 index_buffer.push(existing_idx);
             } else {
-                let new_idx = unique_vertices.len() as u16;
+                let new_idx = unique_vertices.len() as u32;
                 unique_vertices.insert(key, new_idx);
                 index_buffer.push(new_idx);
 
-                let pos = raw_positions.get(key.0).cloned().unwrap_or_default();
-                let norm = raw_normals.get(key.2).cloned().unwrap_or(Vector3 {
+                ordered_positions.push(raw_positions.get(key.0).cloned().unwrap_or_default());
+                ordered_normals.push(raw_normals.get(key.2).cloned().unwrap_or(Vector3 {
                     x: 0.0,
                     y: 1.0,
                     z: 0.0,
-                });
-                let uv = raw_uvs.get(key.1).cloned().unwrap_or_default();
-
-                let mut cur = Cursor::new(&mut vertex_buffer);
-                cur.set_position(cur.get_ref().len() as u64);
-                cur.write_f32::<LittleEndian>(pos.x)?;
-                cur.write_f32::<LittleEndian>(pos.y)?;
-                cur.write_f32::<LittleEndian>(pos.z)?;
-                cur.write_f32::<LittleEndian>(norm.x)?;
-                cur.write_f32::<LittleEndian>(norm.y)?;
-                cur.write_f32::<LittleEndian>(norm.z)?;
-                cur.write_f32::<LittleEndian>(uv.x)?;
-                cur.write_f32::<LittleEndian>(uv.y)?;
-
-                if target_skinned {
-                    cur.write_f32::<LittleEndian>(1.0)?;
-                    cur.write_f32::<LittleEndian>(0.0)?;
-                    cur.write_f32::<LittleEndian>(0.0)?;
-                    cur.write_f32::<LittleEndian>(0.0)?;
-
-                    cur.write_u8(0)?;
-                    cur.write_u8(0)?;
-                    cur.write_u8(0)?;
-                    cur.write_u8(0)?;
-                }
+                }));
+                ordered_uvs.push(raw_uvs.get(key.1).cloned().unwrap_or_default());
             }
         }
     }
 
     let pos_count = unique_vertices.len();
-    let stride = if target_skinned { 52u32 } else { 32u32 };
-
-    let mut raw_indices_bytes = Vec::new();
-    let mut cur_idx = Cursor::new(&mut raw_indices_bytes);
-    for idx in &index_buffer {
-        cur_idx.write_u16::<LittleEndian>(*idx)?;
-    }
-
-    let indice_elements = vec![
-        (20, vec![0u8]),
-        (21, (index_buffer.len() as u32).to_le_bytes().to_vec()),
-        (22, raw_indices_bytes),
+    let raw_weights = vec![
+        Vector4 {
+            x: 1.0,
+            y: 0.0,
+            z: 0.0,
+            w: 0.0,
+        };
+        pos_count
     ];
-    let new_indice_chunk = build_chunk_from_elements(false, &indice_elements);
+    let raw_joints = vec![[0u8; 4]; pos_count];
 
-    let mut attr_table = Vec::new();
-    let mut cur_attr = Cursor::new(&mut attr_table);
-    cur_attr.write_u32::<LittleEndian>(0x02010000)?;
-    cur_attr.write_u32::<LittleEndian>(0x02040000)?;
-    cur_attr.write_u32::<LittleEndian>(0x01050000)?;
+    let (target_stride, target_attributes, target_descriptors) =
+        if let Some(ref orig) = original_parsed {
+            (
+                orig.stride,
+                orig.attributes.clone(),
+                orig.raw_descriptors.clone(),
+            )
+        } else if target_skinned {
+            (
+                52usize,
+                vec![
+                    VertexAttribute::from_descriptor(0x02010000),
+                    VertexAttribute::from_descriptor(0x02040000),
+                    VertexAttribute::from_descriptor(0x01050000),
+                    VertexAttribute::from_descriptor(0x030A0000),
+                    VertexAttribute::from_descriptor(0x0F0B0000),
+                ],
+                vec![0x02010000, 0x02040000, 0x01050000, 0x030A0000, 0x0F0B0000],
+            )
+        } else {
+            (
+                32usize,
+                vec![
+                    VertexAttribute::from_descriptor(0x02010000),
+                    VertexAttribute::from_descriptor(0x02040000),
+                    VertexAttribute::from_descriptor(0x01050000),
+                ],
+                vec![0x02010000, 0x02040000, 0x01050000],
+            )
+        };
 
-    let attr_count = if target_skinned {
-        cur_attr.write_u32::<LittleEndian>(0x030A0000)?;
-        cur_attr.write_u32::<LittleEndian>(0x0F0B0000)?;
-        5u32
-    } else {
-        3u32
+    let generated_tangents = generate_tangents(
+        &ordered_positions,
+        &ordered_normals,
+        &ordered_uvs,
+        &index_buffer,
+    );
+
+    let streams = VertexStreams {
+        positions: &ordered_positions,
+        normals: &ordered_normals,
+        uvs: &ordered_uvs,
+        weights: &raw_weights,
+        joints: &raw_joints,
+        tangents: &generated_tangents,
     };
 
-    let info_elements = vec![
-        (20, vec![0u8]),
-        (21, stride.to_le_bytes().to_vec()),
-        (22, attr_count.to_le_bytes().to_vec()),
-        (23, attr_table),
-    ];
-    let new_info_chunk = build_chunk_from_elements(false, &info_elements);
+    let vertex_buffer =
+        pack_vertex_buffer_preserving_fvf(pos_count, &target_attributes, target_stride, &streams)?;
 
-    let vbuf_elements = vec![
-        (20, new_info_chunk),
-        (21, (pos_count as u32).to_le_bytes().to_vec()),
-        (22, vertex_buffer),
-    ];
-    let new_vbuf_chunk = build_chunk_from_elements(false, &vbuf_elements);
-
-    let is_mesh_asset = original_chunk.starts_with(magic::MESH);
-    let mesh_data_bytes = if is_mesh_asset {
-        let (_, elements) = parse_typed_container(original_chunk)?;
-        elements
-            .into_iter()
-            .find(|(id, _)| *id == 1)
-            .map(|(_, data)| data)
-            .unwrap_or_default()
-    } else {
-        original_chunk.to_vec()
-    };
-
-    let (has_magic, mut mesh_elements) = parse_chunk_elements(&mesh_data_bytes)?;
-    mesh_elements.retain(|(id, _)| *id != 10 && *id != 11);
-    mesh_elements.push((10, new_indice_chunk));
-    mesh_elements.push((11, new_vbuf_chunk));
-    mesh_elements.sort_by_key(|&(id, _)| id);
-
-    let final_mesh_data = build_chunk_from_elements(has_magic, &mesh_elements);
-
-    if is_mesh_asset {
-        let (type_id, mut asset_elements) = parse_typed_container(original_chunk)?;
-        for (id, data) in asset_elements.iter_mut() {
-            if *id == 1 {
-                *data = final_mesh_data.clone();
-            }
-        }
-        Ok(build_typed_container(type_id, &asset_elements))
-    } else {
-        Ok(final_mesh_data)
-    }
+    rebuild_mesh_container(
+        original_chunk,
+        vertex_buffer,
+        &index_buffer,
+        pos_count,
+        target_stride as u32,
+        &target_descriptors,
+    )
 }

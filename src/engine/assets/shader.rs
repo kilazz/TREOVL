@@ -1,7 +1,6 @@
 use super::parse_typed_container;
+use crate::engine::common::read_length_prefixed_string;
 use anyhow::{Result, bail};
-use byteorder::{LittleEndian, ReadBytesExt};
-use std::io::Cursor;
 
 #[derive(Debug, PartialEq)]
 pub enum ShaderType {
@@ -28,18 +27,11 @@ pub fn export_shader(chunk_data: &[u8]) -> Result<(Vec<u8>, ShaderType, String)>
             largest_chunk = chunk.clone();
         }
 
-        if chunk.len() >= 4 {
-            let mut cur = Cursor::new(&chunk[0..4]);
-            let len = cur.read_u32::<LittleEndian>()? as usize;
-
-            if len == chunk.len() - 4
-                && let Ok(s) = std::str::from_utf8(&chunk[4..])
-            {
-                let clean = s.trim_matches(char::from(0));
-                if !clean.starts_with("[SHADERS]") && clean.len() > 2 {
-                    shader_name = clean.to_string();
-                }
-            }
+        if let Some(s) = read_length_prefixed_string(&chunk)
+            && !s.starts_with("[SHADERS]")
+            && s.len() > 2
+        {
+            shader_name = s;
         }
     }
 

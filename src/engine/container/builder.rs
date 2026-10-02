@@ -1,5 +1,5 @@
 use super::node::PrpNode;
-use crate::engine::common::serialize_container_payload;
+use crate::engine::common::{magic, serialize_container_payload};
 use crate::utils::zlib::{compress, decompress, is_zlib_compressed};
 use anyhow::{Context, Result, bail};
 use std::fs;
@@ -27,7 +27,7 @@ pub fn build_node(node: &PrpNode, project_dir: &Path, compression_level: u32) ->
             return Ok(recompressed);
         }
 
-        let is_audio = raw_data.starts_with(b"RIFF") || raw_data.starts_with(b"\x00\x00\xA1\x00");
+        let is_audio = raw_data.starts_with(b"RIFF") || raw_data.starts_with(magic::AUDIO_WAV);
         if !is_audio
             && raw_data.len() > 128
             && let Ok(compressed) = compress(&raw_data, compression_level)

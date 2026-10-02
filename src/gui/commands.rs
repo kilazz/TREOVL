@@ -1,3 +1,4 @@
+use crate::engine::assets::sniffer::AssetKind;
 use std::path::PathBuf;
 
 pub enum WorkerCommand {
@@ -27,6 +28,17 @@ pub enum WorkerCommand {
     ApplyPatch {
         target_dir: PathBuf,
         patch_file: PathBuf,
+    },
+
+    // Interactive UI & Asynchronous Asset Inspection
+    SelectAsset {
+        filtered_index: i32,
+        path: PathBuf,
+        kind: AssetKind,
+    },
+    RotateMeshViewport {
+        delta_yaw: f32,
+        delta_pitch: f32,
     },
 
     // Asset Export Operations

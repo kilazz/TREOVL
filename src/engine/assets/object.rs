@@ -4,10 +4,12 @@ use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 use std::path::Path;
 
+use super::animation::{ObjectBone, RawObjectBone};
 use super::{
     build_chunk_from_elements, build_typed_container, parse_chunk_elements, parse_typed_container,
 };
 use crate::engine::common::{read_length_prefixed_string, write_length_prefixed_string};
+use crate::engine::math::{Vector3, Vector4};
 
 #[inline]
 fn is_empty_container(chunk: &[u8]) -> bool {
@@ -116,14 +118,64 @@ pub struct FullObjectBoneJson {
     pub id: usize,
     pub name: String,
     pub bone_id: i32,
-    pub skin_id: i32,
     pub parent_index: i32,
-    pub next_sibling_index: i32,
     pub first_child_index: i32,
+    pub next_sibling_index: i32,
+    pub aux_id: i32,
     pub translation: [f32; 3],
     pub rotation_quat: [f32; 4],
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transform_matrix: Option<[f32; 16]>,
+}
+
+impl FullObjectBoneJson {
+    pub fn from_object_bone(b: &ObjectBone, id: usize) -> Self {
+        Self {
+            id,
+            name: b.name.clone(),
+            bone_id: b.bone_id,
+            parent_index: b.parent_index,
+            first_child_index: b.first_child_index,
+            next_sibling_index: b.next_sibling_index,
+            aux_id: b.aux_id,
+            translation: [b.translation.x, b.translation.y, b.translation.z],
+            rotation_quat: [b.rotation.x, b.rotation.y, b.rotation.z, b.rotation.w],
+            transform_matrix: Some(b.matrix),
+        }
+    }
+
+    pub fn to_object_bone(&self) -> ObjectBone {
+        ObjectBone {
+            name: self.name.clone(),
+            matrix: self.transform_matrix.unwrap_or_else(|| {
+                let mut m = [0.0f32; 16];
+                m[0] = 1.0;
+                m[5] = 1.0;
+                m[10] = 1.0;
+                m[15] = 1.0;
+                m[12] = self.translation[0];
+                m[13] = self.translation[1];
+                m[14] = self.translation[2];
+                m
+            }),
+            rotation: Vector4 {
+                x: self.rotation_quat[0],
+                y: self.rotation_quat[1],
+                z: self.rotation_quat[2],
+                w: self.rotation_quat[3],
+            },
+            translation: Vector3 {
+                x: self.translation[0],
+                y: self.translation[1],
+                z: self.translation[2],
+            },
+            bone_id: self.bone_id,
+            parent_index: self.parent_index,
+            first_child_index: self.first_child_index,
+            next_sibling_index: self.next_sibling_index,
+            aux_id: self.aux_id,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -131,10 +183,6 @@ pub struct AttachmentSlotJson {
     pub slot_id: u32,
     pub data_hex: String,
 }
-
-// =========================================================================
-// PUBLIC API: EXPORT & IMPORT (FAIL-SAFE)
-// =========================================================================
 
 pub fn export_object_to_json(data: &[u8], output_dir: Option<&Path>) -> Result<String> {
     if data.len() < 5 {
@@ -428,10 +476,6 @@ pub fn import_object_from_json(json_str: &str) -> Result<Vec<u8>> {
     Ok(build_typed_container(type_id, &elements))
 }
 
-// =========================================================================
-// INTERNAL HELPERS
-// =========================================================================
-
 fn parse_full_bones_container(chunk: &[u8]) -> Vec<FullObjectBoneJson> {
     let mut out = Vec::new();
     let records_blob = if let Ok((_, sub_elems)) = parse_chunk_elements(chunk) {
@@ -445,94 +489,47 @@ fn parse_full_bones_container(chunk: &[u8]) -> Vec<FullObjectBoneJson> {
     };
 
     let count = records_blob.len() / 144;
-    let mut cur = Cursor::new(&records_blob);
-
     for i in 0..count {
-        let mut name_buf = [0u8; 32];
-        if std::io::Read::read_exact(&mut cur, &mut name_buf).is_err() {
-            break;
-        }
-        let name = String::from_utf8_lossy(&name_buf)
+        let b_chunk = &records_blob[i * 144..(i + 1) * 144];
+        let raw: RawObjectBone = bytemuck::pod_read_unaligned(b_chunk);
+
+        let clean_name = String::from_utf8_lossy(&raw.name)
             .trim_matches(char::from(0))
             .trim()
             .to_string();
 
-        let mut matrix = [0.0f32; 16];
-        for val in &mut matrix {
-            *val = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-        }
+        let bone = ObjectBone {
+            name: clean_name,
+            matrix: raw.matrix,
+            rotation: Vector4 {
+                x: raw.rotation[0],
+                y: raw.rotation[1],
+                z: raw.rotation[2],
+                w: raw.rotation[3],
+            },
+            translation: Vector3 {
+                x: raw.translation[0],
+                y: raw.translation[1],
+                z: raw.translation[2],
+            },
+            bone_id: raw.bone_id,
+            parent_index: raw.parent_index,
+            first_child_index: raw.first_child_index,
+            next_sibling_index: raw.next_sibling_index,
+            aux_id: raw.aux_id,
+        };
 
-        let qx = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-        let qy = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-        let qz = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-        let qw = cur.read_f32::<LittleEndian>().unwrap_or(1.0);
-
-        let tx = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-        let ty = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-        let tz = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-
-        let bone_id = cur.read_i32::<LittleEndian>().unwrap_or(i as i32);
-        let skin_id = cur.read_i32::<LittleEndian>().unwrap_or(-1);
-        let parent_index = cur.read_i32::<LittleEndian>().unwrap_or(-1);
-        let next_sibling_index = cur.read_i32::<LittleEndian>().unwrap_or(-1);
-        let first_child_index = cur.read_i32::<LittleEndian>().unwrap_or(-1);
-
-        out.push(FullObjectBoneJson {
-            id: i,
-            name,
-            bone_id,
-            skin_id,
-            parent_index,
-            next_sibling_index,
-            first_child_index,
-            translation: [tx, ty, tz],
-            rotation_quat: [qx, qy, qz, qw],
-            transform_matrix: Some(matrix),
-        });
+        out.push(FullObjectBoneJson::from_object_bone(&bone, i));
     }
     out
 }
 
 fn rebuild_full_bones_container(bones: &[FullObjectBoneJson]) -> Result<Vec<u8>> {
     let mut raw_records = Vec::with_capacity(bones.len() * 144);
-    let mut cur = Cursor::new(&mut raw_records);
 
     for b in bones {
-        let mut name_buf = [0u8; 32];
-        let bs = b.name.as_bytes();
-        let copy_len = bs.len().min(31);
-        name_buf[..copy_len].copy_from_slice(&bs[..copy_len]);
-        std::io::Write::write_all(&mut cur, &name_buf)?;
-
-        let mat = b.transform_matrix.unwrap_or_else(|| {
-            let mut id = [0.0f32; 16];
-            id[0] = 1.0;
-            id[5] = 1.0;
-            id[10] = 1.0;
-            id[15] = 1.0;
-            id[12] = b.translation[0];
-            id[13] = b.translation[1];
-            id[14] = b.translation[2];
-            id
-        });
-        for val in mat {
-            cur.write_f32::<LittleEndian>(val)?;
-        }
-
-        cur.write_f32::<LittleEndian>(b.rotation_quat[0])?;
-        cur.write_f32::<LittleEndian>(b.rotation_quat[1])?;
-        cur.write_f32::<LittleEndian>(b.rotation_quat[2])?;
-        cur.write_f32::<LittleEndian>(b.rotation_quat[3])?;
-
-        cur.write_f32::<LittleEndian>(b.translation[0])?;
-        cur.write_f32::<LittleEndian>(b.translation[1])?;
-        cur.write_f32::<LittleEndian>(b.translation[2])?;
-
-        cur.write_i32::<LittleEndian>(b.bone_id)?;
-        cur.write_i32::<LittleEndian>(b.skin_id)?;
-        cur.write_i32::<LittleEndian>(b.parent_index)?;
-        cur.write_i32::<LittleEndian>(b.next_sibling_index)?;
-        cur.write_i32::<LittleEndian>(b.first_child_index)?;
+        let bone = b.to_object_bone();
+        raw_records.extend_from_slice(&bone.to_raw_bytes());
     }
 
     let sub_elements = vec![
@@ -940,29 +937,6 @@ fn write_scale_vector(s: [f32; 3]) -> Vec<u8> {
 }
 
 fn export_skeleton_from_json(bones: &[FullObjectBoneJson], rig_name: &str) -> Result<Vec<u8>> {
-    let object_bones: Vec<super::animation::ObjectBone> = bones
-        .iter()
-        .map(|b| super::animation::ObjectBone {
-            name: b.name.clone(),
-            matrix: b.transform_matrix.unwrap_or([0.0; 16]),
-            rotation: crate::engine::math::Vector4 {
-                x: b.rotation_quat[0],
-                y: b.rotation_quat[1],
-                z: b.rotation_quat[2],
-                w: b.rotation_quat[3],
-            },
-            translation: crate::engine::math::Vector3 {
-                x: b.translation[0],
-                y: b.translation[1],
-                z: b.translation[2],
-            },
-            bone_id: b.bone_id,
-            skin_id: b.skin_id,
-            parent_index: b.parent_index,
-            next_sibling_index: b.next_sibling_index,
-            first_child_index: b.first_child_index,
-        })
-        .collect();
-
+    let object_bones: Vec<ObjectBone> = bones.iter().map(|b| b.to_object_bone()).collect();
     super::animation::export_skeleton_to_glb(&object_bones, rig_name)
 }

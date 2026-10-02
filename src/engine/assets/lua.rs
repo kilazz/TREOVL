@@ -65,7 +65,7 @@ pub enum LuaConstant {
     String(String),
 }
 
-/// Searches for luac50.exe in bin/, bin/win32/, next to exe, or in PATH
+/// Searches for the Lua 5.0 compiler (luac50.exe or luac.exe)
 pub fn find_luac_executable() -> Option<PathBuf> {
     let candidates = [
         PathBuf::from("bin/luac50.exe"),
@@ -97,6 +97,43 @@ pub fn find_luac_executable() -> Option<PathBuf> {
     }
     if Command::new("luac").arg("-v").output().is_ok() {
         return Some(PathBuf::from("luac"));
+    }
+
+    None
+}
+
+/// Searches for the Lua 5.0 decompiler (luadec50.exe or luadec.exe based on LuaDec 0.7 for Lua 5.0.2)
+pub fn find_luadec_executable() -> Option<PathBuf> {
+    let candidates = [
+        PathBuf::from("bin/luadec50.exe"),
+        PathBuf::from("bin/win32/luadec50.exe"),
+        PathBuf::from("bin/luadec.exe"),
+        PathBuf::from("luadec50.exe"),
+        PathBuf::from("luadec.exe"),
+    ];
+
+    for c in &candidates {
+        if c.exists() {
+            return Some(c.clone());
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        for c in &candidates {
+            let p = parent.join(c);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+
+    if Command::new("luadec50").output().is_ok() {
+        return Some(PathBuf::from("luadec50"));
+    }
+    if Command::new("luadec").output().is_ok() {
+        return Some(PathBuf::from("luadec"));
     }
 
     None
@@ -173,9 +210,35 @@ fn read_lua_string(cur: &mut Cursor<&[u8]>) -> Result<Option<String>> {
 
 pub fn decompile_lua_bytecode(bytecode: &[u8]) -> Result<String> {
     validate_lua_50_header(bytecode)?;
-    // In standard Lua 5.0, header is exactly 22 bytes
+
+    // 1. Attempt decompilation through external LuaDec 5.0 if installed
+    if let Some(luadec) = find_luadec_executable() {
+        let temp_in =
+            std::env::temp_dir().join(format!("ovl_lua_decomp_{}.luac", std::process::id()));
+        if fs::write(&temp_in, bytecode).is_ok() {
+            let output = Command::new(&luadec).arg(&temp_in).output();
+            let _ = fs::remove_file(&temp_in);
+            if let Ok(out) = output
+                && out.status.success()
+            {
+                let code = String::from_utf8_lossy(&out.stdout).to_string();
+                if !code.trim().is_empty() {
+                    return Ok(code);
+                }
+            }
+        }
+    }
+
+    // 2. Built-in AST-less pseudocode generator with warning header
     let mut cur = Cursor::new(&bytecode[22..]);
     let mut out = String::new();
+    out.push_str("-- [WARNING: Built-in AST-less pseudocode generator]\n");
+    out.push_str(
+        "-- [Branch instructions (JMP/IF) are marked with comments and will NOT recompile directly]\n",
+    );
+    out.push_str(
+        "-- [To enable full reversible decompilation, place 'luadec50.exe' into the 'bin/' folder]\n\n",
+    );
     decompile_scope(&mut cur, &mut out, 0)?;
     Ok(out)
 }
@@ -184,7 +247,7 @@ fn decompile_scope(cur: &mut Cursor<&[u8]>, out: &mut String, level: usize) -> R
     let indent = "    ".repeat(level);
     let source = read_lua_string(cur)?.unwrap_or_default();
     let _line = cur.read_u32::<LittleEndian>()?;
-    let _nups = cur.read_u8()?; // <-- Fixed: Lua 5.0 nups field
+    let _nups = cur.read_u8()?;
     let num_params = cur.read_u8()?;
     let _is_vararg = cur.read_u8()?;
     let _max_stack = cur.read_u8()?;
@@ -235,7 +298,7 @@ fn decompile_scope(cur: &mut Cursor<&[u8]>, out: &mut String, level: usize) -> R
         nested_functions.push(nested_out);
     }
 
-    // 6. Code / Bytecode instructions
+    // 6. Bytecode instructions
     let num_code = cur.read_u32::<LittleEndian>()? as usize;
     let mut code_instructions = Vec::with_capacity(num_code);
     for _ in 0..num_code {
@@ -275,7 +338,6 @@ fn decompile_scope(cur: &mut Cursor<&[u8]>, out: &mut String, level: usize) -> R
     }
 
     for (pc, &inst) in code_instructions.iter().enumerate() {
-        // Exact bit decoding for Triumph Overlord Lua 5.0
         let opcode = (inst & 0x3F) as usize;
         let c = ((inst >> 6) & 0x1FF) as usize;
         let b = ((inst >> 15) & 0x1FF) as usize;
@@ -371,7 +433,6 @@ fn decompile_scope(cur: &mut Cursor<&[u8]>, out: &mut String, level: usize) -> R
                 let num_results = c.saturating_sub(1);
                 let call_str = format!("{}({})", func, call_args.join(", "));
 
-                // Check if result is assigned to a local variable at this instruction
                 if let Some((vname, _, _)) = locvars.iter().find(|(_, start, _)| {
                     let s = *start as usize;
                     pc + 1 == s || pc == s
@@ -432,7 +493,7 @@ fn disassemble_function_prototype(
     let indent = "  ".repeat(level);
     let source = read_lua_string(cur)?.unwrap_or_else(|| "N/A".into());
     let line_defined = cur.read_u32::<LittleEndian>()?;
-    let nups = cur.read_u8()?; // <-- Fixed: Lua 5.0 nups field
+    let nups = cur.read_u8()?;
     let num_params = cur.read_u8()?;
     let is_vararg = cur.read_u8()?;
     let max_stack = cur.read_u8()?;
@@ -571,7 +632,6 @@ pub fn inspect_lua_bytecode(bytecode: &[u8]) -> Result<LuaInfo> {
     })
 }
 
-/// Extractor: Extracts Lua bytecode from standalone chunks or wrapped inside containers
 pub fn extract_lua_bytecode(chunk_data: &[u8]) -> Result<Vec<u8>> {
     if chunk_data.starts_with(LUA_MAGIC) {
         validate_lua_50_header(chunk_data)?;
@@ -607,7 +667,6 @@ pub fn extract_lua_bytecode(chunk_data: &[u8]) -> Result<Vec<u8>> {
     bail!("No valid Lua 5.0.2 bytecode found in this chunk.")
 }
 
-/// Injector: Replaces Lua bytecode inside any container format surgically
 pub fn replace_lua_bytecode(chunk_data: &[u8], new_bytecode: &[u8]) -> Result<Vec<u8>> {
     validate_lua_50_header(new_bytecode)?;
 

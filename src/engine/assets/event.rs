@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, bail};
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use serde::{Deserialize, Serialize};
-use std::io::Cursor;
 
-use super::{build_chunk_from_elements, build_typed_container, parse_chunk_elements, parse_typed_container};
+use super::{
+    build_chunk_from_elements, build_typed_container, parse_chunk_elements, parse_typed_container,
+};
 use crate::engine::common::{read_length_prefixed_string, write_length_prefixed_string};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -45,8 +45,8 @@ pub fn export_event_to_json(chunk_data: &[u8]) -> Result<String> {
         bail!("Chunk data too short for Sound Event table.");
     }
 
-    let (type_id, elements) = parse_typed_container(chunk_data)
-        .context("Failed to parse Sound Event root container")?;
+    let (type_id, elements) =
+        parse_typed_container(chunk_data).context("Failed to parse Sound Event root container")?;
 
     let mut group_path = String::new();
     let mut event_name = String::new();
@@ -99,8 +99,8 @@ pub fn export_event_to_json(chunk_data: &[u8]) -> Result<String> {
 
 pub fn import_event_from_json(json_str: &str) -> Result<Vec<u8>> {
     let parsed: SoundEventJson = serde_json::from_str(json_str)?;
-    let type_id = u32::from_str_radix(&parsed.type_id_hex, 16)
-        .context("Invalid TypeID hex in Event JSON")?;
+    let type_id =
+        u32::from_str_radix(&parsed.type_id_hex, 16).context("Invalid TypeID hex in Event JSON")?;
 
     let mut elements = Vec::new();
     elements.push((20, write_length_prefixed_string(&parsed.group_path)));
@@ -146,7 +146,9 @@ fn parse_sound_cue_variations(data: &[u8]) -> Vec<SoundCueVariation> {
             let mut sound_resource = String::new();
 
             for (pid, pdata) in props {
-                if (pid == 20 || pid == 21) && let Some(s) = read_length_prefixed_string(&pdata) {
+                if (pid == 20 || pid == 21)
+                    && let Some(s) = read_length_prefixed_string(&pdata)
+                {
                     if s.contains(']') || s.contains('\\') {
                         sound_resource = s;
                     } else {

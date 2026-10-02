@@ -221,7 +221,7 @@ pub fn export_terrain_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, usize, usize
     Ok((glb, geom.vertex_count, geom.triangle_count))
 }
 
-pub fn export_terrain_to_obj(chunk_data: &[u8]) -> Result<String> {
+pub fn export_terrain_to_obj(chunk_data: &[u8]) -> Result<(String, usize, usize)> {
     let geom = parse_terrain_geometry(chunk_data)?;
     let mut obj = String::new();
     obj.push_str("# Exported Overlord Terrain Heightmap\n");
@@ -232,9 +232,10 @@ pub fn export_terrain_to_obj(chunk_data: &[u8]) -> Result<String> {
     }
 
     obj.push_str("\ns 1\n");
+    // Clippy idiomatic chunking with as_chunks::<3>().0
     for tri in geom.indices.as_chunks::<3>().0 {
         obj.push_str(&format!("f {} {} {}\n", tri[0] + 1, tri[1] + 1, tri[2] + 1));
     }
 
-    Ok(obj)
+    Ok((obj, geom.vertex_count, geom.triangle_count))
 }

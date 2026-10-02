@@ -1,9 +1,9 @@
 use super::parse_chunk_elements;
-use crate::engine::common::magic;
+use crate::engine::common::{magic, read_length_prefixed_string};
 use crate::engine::math::{BoneRotation, Vector3, Vector4};
 use crate::utils::gltf_builder::GltfBuilder;
 use anyhow::Result;
-use binrw::{BinRead, BinReaderExt, BinWrite};
+use bytemuck::{Pod, Zeroable};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -14,30 +14,62 @@ fn sanitize_f32(v: f32, fallback: f32) -> f32 {
     if v.is_finite() { v } else { fallback }
 }
 
-#[derive(Debug, Clone, BinRead, BinWrite)]
-#[brw(little)]
-pub struct ObjectBone {
-    #[br(map = |b: [u8; 32]| {
-        let s = String::from_utf8_lossy(&b);
-        s.split('\0').next().unwrap_or("").trim().to_string()
-    })]
-    #[bw(map = |s: &String| {
-        let mut b = [0u8; 32];
-        let bs = s.as_bytes();
-        b[..bs.len().min(32)].copy_from_slice(&bs[..bs.len().min(32)]);
-        b
-    })]
-    pub name: String,
+/// Zero-copy C-representation for an Overlord bone (exactly 144 bytes).
+/// Reflects the true Left-Child Right-Sibling (LCRS) tree layout of Triumph Engine.
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+#[repr(C)]
+pub struct RawObjectBone {
+    pub name: [u8; 32],
+    pub matrix: [f32; 16],
+    pub rotation: [f32; 4],
+    pub translation: [f32; 3],
+    pub bone_id: i32,
+    pub parent_index: i32,       // True parent bone index (-1 for Root)
+    pub first_child_index: i32,  // Pointer to the first child bone
+    pub next_sibling_index: i32, // Pointer to the next sibling bone sharing the same parent
+    pub aux_id: i32,             // Auxiliary ID or flags
+}
 
+const _: () = assert!(std::mem::size_of::<RawObjectBone>() == 144);
+
+#[derive(Debug, Clone)]
+pub struct ObjectBone {
+    pub name: String,
     pub matrix: [f32; 16],
     pub rotation: Vector4,
     pub translation: Vector3,
-
     pub bone_id: i32,
-    pub skin_id: i32,
     pub parent_index: i32,
-    pub next_sibling_index: i32,
     pub first_child_index: i32,
+    pub next_sibling_index: i32,
+    pub aux_id: i32,
+}
+
+impl ObjectBone {
+    pub fn to_raw_bytes(&self) -> [u8; 144] {
+        let mut name_buf = [0u8; 32];
+        let bytes = self.name.as_bytes();
+        let copy_len = bytes.len().min(31);
+        name_buf[..copy_len].copy_from_slice(&bytes[..copy_len]);
+
+        let raw = RawObjectBone {
+            name: name_buf,
+            matrix: self.matrix,
+            rotation: [
+                self.rotation.x,
+                self.rotation.y,
+                self.rotation.z,
+                self.rotation.w,
+            ],
+            translation: [self.translation.x, self.translation.y, self.translation.z],
+            bone_id: self.bone_id,
+            parent_index: self.parent_index,
+            first_child_index: self.first_child_index,
+            next_sibling_index: self.next_sibling_index,
+            aux_id: self.aux_id,
+        };
+        bytemuck::cast::<RawObjectBone, [u8; 144]>(raw)
+    }
 }
 
 pub fn parse_object_bone_container(data: &[u8]) -> Result<Vec<ObjectBone>> {
@@ -75,40 +107,53 @@ pub fn parse_object_bone_container(data: &[u8]) -> Result<Vec<ObjectBone>> {
 
     for start_off in candidate_offsets {
         let slice = &data[start_off..];
-        let mut cur = Cursor::new(slice);
         let mut bones = Vec::new();
+        let count = slice.len() / 144;
 
-        while (cur.position() as usize) + 144 <= slice.len() {
-            if let Ok(bone) = cur.read_le::<ObjectBone>() {
-                let clean_name = bone
-                    .name
-                    .chars()
-                    .filter(|c| c.is_ascii_graphic() || *c == ' ' || *c == '_')
-                    .collect::<String>();
+        for i in 0..count {
+            let chunk = &slice[i * 144..(i + 1) * 144];
+            let raw: RawObjectBone = bytemuck::pod_read_unaligned(chunk);
 
-                let is_valid_name = !clean_name.is_empty()
-                    && clean_name.len() >= 2
-                    && !clean_name.starts_with('[')
-                    && clean_name.is_ascii();
+            let clean_name = String::from_utf8_lossy(&raw.name)
+                .chars()
+                .filter(|c| c.is_ascii_graphic() || *c == ' ' || *c == '_')
+                .collect::<String>();
 
-                let is_valid_transform = bone.translation.x.is_finite()
-                    && bone.translation.y.is_finite()
-                    && bone.translation.z.is_finite()
-                    && bone.translation.x.abs() < 50_000.0
-                    && bone.translation.y.abs() < 50_000.0
-                    && bone.translation.z.abs() < 50_000.0
-                    && bone.rotation.w.is_finite()
-                    && bone.rotation.w.abs() <= 2.0;
+            let is_valid_name = !clean_name.is_empty()
+                && clean_name.len() >= 2
+                && !clean_name.starts_with('[')
+                && clean_name.is_ascii();
 
-                let is_valid_hierarchy = bone.parent_index >= -1 && bone.parent_index < 512;
+            let is_valid_transform = raw.translation[0].is_finite()
+                && raw.translation[1].is_finite()
+                && raw.translation[2].is_finite()
+                && raw.translation[0].abs() < 50_000.0
+                && raw.rotation[3].is_finite()
+                && raw.rotation[3].abs() <= 2.0;
 
-                if is_valid_name && is_valid_transform && is_valid_hierarchy {
-                    let mut valid_bone = bone;
-                    valid_bone.name = clean_name;
-                    bones.push(valid_bone);
-                } else {
-                    break;
-                }
+            let is_valid_hierarchy = raw.parent_index >= -1 && raw.parent_index < 512;
+
+            if is_valid_name && is_valid_transform && is_valid_hierarchy {
+                bones.push(ObjectBone {
+                    name: clean_name,
+                    matrix: raw.matrix,
+                    rotation: Vector4 {
+                        x: raw.rotation[0],
+                        y: raw.rotation[1],
+                        z: raw.rotation[2],
+                        w: raw.rotation[3],
+                    },
+                    translation: Vector3 {
+                        x: raw.translation[0],
+                        y: raw.translation[1],
+                        z: raw.translation[2],
+                    },
+                    bone_id: raw.bone_id,
+                    parent_index: raw.parent_index,
+                    first_child_index: raw.first_child_index,
+                    next_sibling_index: raw.next_sibling_index,
+                    aux_id: raw.aux_id,
+                });
             } else {
                 break;
             }
@@ -157,14 +202,25 @@ pub fn export_skeleton_to_glb(bones: &[ObjectBone], rig_name: &str) -> Result<Ve
         let ty = sanitize_f32(bone.translation.y, 0.0);
         let tz = sanitize_f32(bone.translation.z, 0.0);
 
-        let rx = sanitize_f32(bone.rotation.x, 0.0);
-        let ry = sanitize_f32(bone.rotation.y, 0.0);
-        let rz = sanitize_f32(bone.rotation.z, 0.0);
-        let rw = if bone.rotation.w.is_finite() && bone.rotation.w != 0.0 {
-            bone.rotation.w
+        let mut rx = sanitize_f32(bone.rotation.x, 0.0);
+        let mut ry = sanitize_f32(bone.rotation.y, 0.0);
+        let mut rz = sanitize_f32(bone.rotation.z, 0.0);
+        let mut rw = sanitize_f32(bone.rotation.w, 1.0);
+
+        // Mathematically correct quaternion normalization without destroying w = 0.0
+        let len_sq = rx * rx + ry * ry + rz * rz + rw * rw;
+        if len_sq > 1e-4 {
+            let inv_len = 1.0 / len_sq.sqrt();
+            rx *= inv_len;
+            ry *= inv_len;
+            rz *= inv_len;
+            rw *= inv_len;
         } else {
-            1.0
-        };
+            rx = 0.0;
+            ry = 0.0;
+            rz = 0.0;
+            rw = 1.0;
+        }
 
         let mut node = json!({
             "name": n,
@@ -247,24 +303,14 @@ pub fn parse_animation_clip(chunk_data: &[u8]) -> Result<AnimationClip> {
 
     for (id, chunk) in &elements {
         match *id {
-            20 if chunk.len() >= 4 => {
-                let len = Cursor::new(&chunk[0..4])
-                    .read_u32::<LittleEndian>()
-                    .unwrap_or(0) as usize;
-                if len + 4 <= chunk.len()
-                    && let Ok(s) = std::str::from_utf8(&chunk[4..4 + len])
-                {
-                    target_rig = s.trim_matches(char::from(0)).to_string();
+            20 => {
+                if let Some(s) = read_length_prefixed_string(chunk) {
+                    target_rig = s;
                 }
             }
-            21 if chunk.len() >= 4 => {
-                let len = Cursor::new(&chunk[0..4])
-                    .read_u32::<LittleEndian>()
-                    .unwrap_or(0) as usize;
-                if len + 4 <= chunk.len()
-                    && let Ok(s) = std::str::from_utf8(&chunk[4..4 + len])
-                {
-                    name = s.trim_matches(char::from(0)).to_string();
+            21 => {
+                if let Some(s) = read_length_prefixed_string(chunk) {
+                    name = s;
                 }
             }
             30 if chunk.len() >= 4 => {
@@ -325,39 +371,26 @@ fn parse_single_bone_track(data: &[u8], total_duration: f32) -> Result<BoneTrack
 
     for (id, chunk) in elements {
         match id {
-            20 if chunk.len() >= 4 => {
-                let len = Cursor::new(&chunk[0..4])
-                    .read_u32::<LittleEndian>()
-                    .unwrap_or(0) as usize;
-                if len + 4 <= chunk.len()
-                    && let Ok(s) = std::str::from_utf8(&chunk[4..4 + len])
-                {
-                    bone_name = s.trim_matches(char::from(0)).trim().to_string();
+            20 => {
+                if let Some(s) = read_length_prefixed_string(&chunk) {
+                    bone_name = s;
                 }
             }
             22 | 24 => {
+                // Translation container / stream
                 if let Ok((_, trans_sub)) = parse_chunk_elements(&chunk) {
-                    for (_, tchunk) in trans_sub {
-                        parse_translation_blob(&tchunk, total_duration, &mut translations);
+                    for (tid, tchunk) in trans_sub {
+                        if tid == 22 || tid == 21 || tid == 0 {
+                            parse_translation_blob(&tchunk, total_duration, &mut translations);
+                        }
                     }
                 } else {
                     parse_translation_blob(&chunk, total_duration, &mut translations);
                 }
             }
             23 | 25 => {
-                if let Ok((_, rot_sub)) = parse_chunk_elements(&chunk) {
-                    for (_, rchunk) in rot_sub {
-                        if let Ok((_, data_sub)) = parse_chunk_elements(&rchunk) {
-                            for (_, dchunk) in data_sub {
-                                parse_rotation_blob(&dchunk, total_duration, &mut rotations);
-                            }
-                        } else {
-                            parse_rotation_blob(&rchunk, total_duration, &mut rotations);
-                        }
-                    }
-                } else {
-                    parse_rotation_blob(&chunk, total_duration, &mut rotations);
-                }
+                // Rotation stream parsing with Triumph ID 21/23 hierarchy support
+                parse_rotation_container(&chunk, total_duration, &mut rotations);
             }
             _ => {}
         }
@@ -370,85 +403,242 @@ fn parse_single_bone_track(data: &[u8], total_duration: f32) -> Result<BoneTrack
     })
 }
 
+fn parse_rotation_container(
+    chunk: &[u8],
+    total_duration: f32,
+    rotations: &mut Vec<KeyframeRotation>,
+) {
+    if let Ok((_, rot_sub)) = parse_chunk_elements(chunk) {
+        for (rid, rchunk) in rot_sub {
+            match rid {
+                // Nested container with (ID 22: count, ID 23: data stream, ID 24: curves)
+                21 => {
+                    if let Ok((_, sub_parts)) = parse_chunk_elements(&rchunk) {
+                        let count = sub_parts
+                            .iter()
+                            .find(|(id, _)| *id == 22)
+                            .and_then(|(_, d)| Cursor::new(d).read_u32::<LittleEndian>().ok())
+                            .unwrap_or(0) as usize;
+
+                        if let Some((_, data_blob)) = sub_parts.iter().find(|(id, _)| *id == 23) {
+                            parse_rotation_stream(data_blob, count, total_duration, rotations);
+                            return;
+                        }
+                    }
+                    parse_rotation_blob(&rchunk, total_duration, rotations);
+                }
+                22 | 23 | 0 => {
+                    if let Ok((_, data_sub)) = parse_chunk_elements(&rchunk) {
+                        for (did, dchunk) in data_sub {
+                            if did == 23 || did == 22 || did == 0 {
+                                parse_rotation_blob(&dchunk, total_duration, rotations);
+                            }
+                        }
+                    } else {
+                        parse_rotation_blob(&rchunk, total_duration, rotations);
+                    }
+                }
+                _ => {}
+            }
+        }
+    } else {
+        parse_rotation_blob(chunk, total_duration, rotations);
+    }
+}
+
+fn parse_rotation_stream(
+    data: &[u8],
+    explicit_count: usize,
+    total_duration: f32,
+    rotations: &mut Vec<KeyframeRotation>,
+) {
+    let count = if explicit_count > 0 {
+        explicit_count
+    } else if data.len().is_multiple_of(6) {
+        data.len() / 6
+    } else {
+        data.len() / 8
+    };
+
+    if count == 0 {
+        return;
+    }
+
+    // 1. Uniform 6-byte Euler streams ([i16; 3])
+    if data.len() >= count * 6 && (data.len() == count * 6 || data.len().is_multiple_of(6)) {
+        for i in 0..count {
+            let chunk = &data[i * 6..(i + 1) * 6];
+            let raw: [i16; 3] = bytemuck::pod_read_unaligned(chunk);
+            let br = BoneRotation::from_raw_i16(raw[0], raw[1], raw[2]);
+            let q = br.to_quaternion();
+            let time_seconds = if count > 1 {
+                (i as f32 * total_duration) / (count - 1) as f32
+            } else {
+                0.0
+            };
+            rotations.push(KeyframeRotation {
+                time_seconds,
+                rotation_euler: br,
+                rotation_quat: Vector4 {
+                    x: q.x,
+                    y: q.y,
+                    z: q.z,
+                    w: q.w,
+                },
+            });
+        }
+    // 2. Uniform 8-byte compressed Quaternion streams ([i16; 4])
+    } else if data.len() >= count * 8 {
+        for i in 0..count {
+            let chunk = &data[i * 8..(i + 1) * 8];
+            let q: [i16; 4] = bytemuck::pod_read_unaligned(chunk);
+            let time_seconds = if count > 1 {
+                (i as f32 * total_duration) / (count - 1) as f32
+            } else {
+                0.0
+            };
+            rotations.push(KeyframeRotation {
+                time_seconds,
+                rotation_euler: BoneRotation {
+                    pitch: 0.0,
+                    yaw: 0.0,
+                    roll: 0.0,
+                },
+                rotation_quat: Vector4 {
+                    x: q[0] as f32 / 32767.0,
+                    y: q[1] as f32 / 32767.0,
+                    z: q[2] as f32 / 32767.0,
+                    w: q[3] as f32 / 32767.0,
+                },
+            });
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+#[repr(C)]
+struct RawTranslationKey {
+    micros: u32,
+    px: f32,
+    py: f32,
+    pz: f32,
+}
+
 fn parse_translation_blob(
     data: &[u8],
     total_duration: f32,
     translations: &mut Vec<KeyframeTranslation>,
 ) {
-    if data.len() < 12 {
+    let chunk_len = data.len();
+    if chunk_len < 12 {
         return;
     }
 
-    if data.len() >= 16 && data.len().is_multiple_of(16) {
-        let mut cur = Cursor::new(data);
-        while (cur.position() as usize) + 16 <= data.len() {
-            let micros = cur.read_u32::<LittleEndian>().unwrap_or(0);
-            let px = sanitize_f32(cur.read_f32::<LittleEndian>().unwrap_or(0.0), 0.0);
-            let py = sanitize_f32(cur.read_f32::<LittleEndian>().unwrap_or(0.0), 0.0);
-            let pz = sanitize_f32(cur.read_f32::<LittleEndian>().unwrap_or(0.0), 0.0);
-
-            let time_seconds = (micros as f32 / 1_000_000.0).min(total_duration);
+    if chunk_len >= 16 && chunk_len.is_multiple_of(16) {
+        let count = chunk_len / 16;
+        for i in 0..count {
+            let chunk = &data[i * 16..(i + 1) * 16];
+            let raw: RawTranslationKey = bytemuck::pod_read_unaligned(chunk);
+            let time_seconds = (raw.micros as f32 / 1_000_000.0).min(total_duration);
             translations.push(KeyframeTranslation {
                 time_seconds,
                 position: Vector3 {
-                    x: px,
-                    y: py,
-                    z: pz,
+                    x: sanitize_f32(raw.px, 0.0),
+                    y: sanitize_f32(raw.py, 0.0),
+                    z: sanitize_f32(raw.pz, 0.0),
                 },
             });
         }
-    } else if data.len() >= 12 {
-        let mut cur = Cursor::new(data);
-        let px = sanitize_f32(cur.read_f32::<LittleEndian>().unwrap_or(0.0), 0.0);
-        let py = sanitize_f32(cur.read_f32::<LittleEndian>().unwrap_or(0.0), 0.0);
-        let pz = sanitize_f32(cur.read_f32::<LittleEndian>().unwrap_or(0.0), 0.0);
+    } else if chunk_len >= 12 {
+        let raw: [f32; 3] = bytemuck::pod_read_unaligned(&data[0..12]);
         translations.push(KeyframeTranslation {
             time_seconds: 0.0,
             position: Vector3 {
-                x: px,
-                y: py,
-                z: pz,
+                x: sanitize_f32(raw[0], 0.0),
+                y: sanitize_f32(raw[1], 0.0),
+                z: sanitize_f32(raw[2], 0.0),
             },
         });
     }
 }
 
 fn parse_rotation_blob(data: &[u8], total_duration: f32, rotations: &mut Vec<KeyframeRotation>) {
-    if data.len() < 6 {
+    let chunk_len = data.len();
+    if chunk_len < 6 {
         return;
     }
 
-    let mut cur = Cursor::new(data);
-    let count = data.len() / 6;
-
-    for i in 0..count {
-        if let Ok(br) = BoneRotation::read(&mut cur) {
+    if chunk_len.is_multiple_of(16) {
+        let count = chunk_len / 16;
+        for i in 0..count {
+            let chunk = &data[i * 16..(i + 1) * 16];
+            let q: [f32; 4] = bytemuck::pod_read_unaligned(chunk);
             let time_seconds = if count > 1 {
                 i as f32 * total_duration / (count - 1) as f32
             } else {
                 0.0
             };
+            rotations.push(KeyframeRotation {
+                time_seconds,
+                rotation_euler: BoneRotation {
+                    pitch: 0.0,
+                    yaw: 0.0,
+                    roll: 0.0,
+                },
+                rotation_quat: Vector4 {
+                    x: sanitize_f32(q[0], 0.0),
+                    y: sanitize_f32(q[1], 0.0),
+                    z: sanitize_f32(q[2], 0.0),
+                    w: sanitize_f32(q[3], 1.0),
+                },
+            });
+        }
+    } else if chunk_len.is_multiple_of(10) {
+        let count = chunk_len / 10;
+        for i in 0..count {
+            let chunk = &data[i * 10..(i + 1) * 10];
+            let micros = u32::from_le_bytes(chunk[0..4].try_into().unwrap_or_default());
+            let raw: [i16; 3] = bytemuck::pod_read_unaligned(&chunk[4..10]);
+            let br = BoneRotation::from_raw_i16(raw[0], raw[1], raw[2]);
             let q = br.to_quaternion();
-            let qx = sanitize_f32(q.x, 0.0);
-            let qy = sanitize_f32(q.y, 0.0);
-            let qz = sanitize_f32(q.z, 0.0);
-            let qw = if q.w.is_finite() && q.w != 0.0 {
-                q.w
-            } else {
-                1.0
-            };
-
+            let time_seconds = (micros as f32 / 1_000_000.0).min(total_duration);
             rotations.push(KeyframeRotation {
                 time_seconds,
                 rotation_euler: br,
                 rotation_quat: Vector4 {
-                    x: qx,
-                    y: qy,
-                    z: qz,
-                    w: qw,
+                    x: q.x,
+                    y: q.y,
+                    z: q.z,
+                    w: q.w,
                 },
             });
         }
+    } else if chunk_len.is_multiple_of(12) {
+        let count = chunk_len / 12;
+        for i in 0..count {
+            let chunk = &data[i * 12..(i + 1) * 12];
+            let micros = u32::from_le_bytes(chunk[0..4].try_into().unwrap_or_default());
+            let q: [i16; 4] = bytemuck::pod_read_unaligned(&chunk[4..12]);
+            let time_seconds = (micros as f32 / 1_000_000.0).min(total_duration);
+            rotations.push(KeyframeRotation {
+                time_seconds,
+                rotation_euler: BoneRotation {
+                    pitch: 0.0,
+                    yaw: 0.0,
+                    roll: 0.0,
+                },
+                rotation_quat: Vector4 {
+                    x: q[0] as f32 / 32767.0,
+                    y: q[1] as f32 / 32767.0,
+                    z: q[2] as f32 / 32767.0,
+                    w: q[3] as f32 / 32767.0,
+                },
+            });
+        }
+    } else if chunk_len.is_multiple_of(8) {
+        parse_rotation_stream(data, chunk_len / 8, total_duration, rotations);
+    } else if chunk_len.is_multiple_of(6) {
+        parse_rotation_stream(data, chunk_len / 6, total_duration, rotations);
     }
 }
 
@@ -466,7 +656,7 @@ pub fn export_animation_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>> {
     let mut bone_indices = Vec::new();
 
     for (i, track) in clip.bone_tracks.iter().enumerate() {
-        let bone_node_id = i + 1; // 0 is reserved for Armature root
+        let bone_node_id = i + 1;
         bone_indices.push(bone_node_id);
 
         if !track.translations.is_empty() {

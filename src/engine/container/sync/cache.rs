@@ -1,4 +1,4 @@
-use crc32fast::Hasher;
+pub use crate::engine::common::calculate_crc32;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -14,12 +14,6 @@ pub struct AssetSyncEntry {
 #[derive(Serialize, Deserialize, Default, Debug)]
 pub struct AssetSyncCache {
     pub entries: HashMap<String, AssetSyncEntry>,
-}
-
-pub fn calculate_crc32(data: &[u8]) -> u32 {
-    let mut hasher = Hasher::new();
-    hasher.update(data);
-    hasher.finalize()
 }
 
 pub fn sanitize_filename(name: &str) -> String {
