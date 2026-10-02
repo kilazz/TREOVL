@@ -350,6 +350,86 @@ impl AssetProcessor for VfxProcessor {
     }
 }
 
+pub struct EventProcessor;
+impl AssetProcessor for EventProcessor {
+    fn process(
+        &self,
+        data: &[u8],
+        stem: &str,
+        sniffed: &SniffedAsset,
+        workspace: &ProjectWorkspace,
+    ) -> Result<Option<(String, AssetSyncEntry)>> {
+        if sniffed.kind != AssetKind::Event
+            && !data.starts_with(b"\xB0\x00\x00\x04")
+            && !data.starts_with(b"\x83\x00\x00\x04")
+        {
+            return Ok(None);
+        }
+
+        let out_name = build_asset_filename(&sniffed.display_name, stem, "json");
+        let abs_path = workspace.assets_dir.join("events").join(&out_name);
+
+        let json_val =
+            if let Ok((type_id, elements)) = crate::engine::assets::parse_typed_container(data) {
+                let mut props = Vec::new();
+                let mut group_path = None;
+                let mut event_name = None;
+
+                for (id, chunk) in elements {
+                    if id == 20 && chunk.len() >= 4 {
+                        let slen =
+                            u32::from_le_bytes(chunk[0..4].try_into().unwrap_or_default()) as usize;
+                        if slen + 4 <= chunk.len() {
+                            group_path = std::str::from_utf8(&chunk[4..4 + slen])
+                                .ok()
+                                .map(|s| s.trim_matches(char::from(0)).to_string());
+                        }
+                    } else if id == 21 && chunk.len() >= 4 {
+                        let slen =
+                            u32::from_le_bytes(chunk[0..4].try_into().unwrap_or_default()) as usize;
+                        if slen + 4 <= chunk.len() {
+                            event_name = std::str::from_utf8(&chunk[4..4 + slen])
+                                .ok()
+                                .map(|s| s.trim_matches(char::from(0)).to_string());
+                        }
+                    }
+
+                    props.push(json!({
+                        "id": id,
+                        "size": chunk.len(),
+                        "hex": hex::encode_upper(&chunk)
+                    }));
+                }
+
+                json!({
+                    "type": "event_table",
+                    "type_id_hex": format!("{:08X}", type_id),
+                    "group_path": group_path,
+                    "event_name": event_name,
+                    "properties": props
+                })
+            } else {
+                json!({
+                    "type": "raw_event",
+                    "hex": hex::encode_upper(data)
+                })
+            };
+
+        let json_str = serde_json::to_string_pretty(&json_val)?;
+        fs::write(&abs_path, json_str.as_bytes())?;
+
+        Ok(Some((
+            format!("assets/events/{}", out_name),
+            AssetSyncEntry {
+                chunk_rel_path: format!("chunks/{}.bin", stem),
+                asset_kind: "Event".into(),
+                vanilla_crc32: calculate_crc32(json_str.as_bytes()),
+                is_modified: false,
+            },
+        )))
+    }
+}
+
 pub struct XmlProcessor;
 impl AssetProcessor for XmlProcessor {
     fn process(
@@ -603,6 +683,7 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize> {
         "ui",
         "objects",
         "vfx",
+        "events",
     ];
     for dir in dirs {
         fs::create_dir_all(workspace.assets_dir.join(dir))?;
@@ -615,6 +696,7 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize> {
         Box::new(MeshProcessor),
         Box::new(AnimationProcessor),
         Box::new(VfxProcessor),
+        Box::new(EventProcessor),
         Box::new(LuaProcessor),
         Box::new(XmlProcessor),
         Box::new(ParameterProcessor),
@@ -760,6 +842,29 @@ pub fn sync_assets_to_chunks(project_dir: &Path) -> Result<usize> {
                         String::from_utf8(asset_bytes).context("VFX JSON is not valid UTF-8")?;
                     crate::engine::assets::vfx::import_vfx_from_json(&json_str)?
                 }
+                "Event" => {
+                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&asset_bytes) {
+                        if v["type"] == "event_table"
+                            && let Some(hex_str) = v["type_id_hex"].as_str()
+                            && let Ok(type_id) = u32::from_str_radix(hex_str, 16)
+                            && let Some(props) = v["properties"].as_array()
+                        {
+                            let mut elements = Vec::new();
+                            for p in props {
+                                let pid = p["id"].as_u64().unwrap_or(0) as u32;
+                                let phex = p["hex"].as_str().unwrap_or("");
+                                if let Ok(bytes) = hex::decode(phex) {
+                                    elements.push((pid, bytes));
+                                }
+                            }
+                            crate::engine::assets::build_typed_container(type_id, &elements)
+                        } else {
+                            baseline_chunk
+                        }
+                    } else {
+                        baseline_chunk
+                    }
+                }
                 "Animation" => baseline_chunk,
                 "Parameter" => {
                     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&asset_bytes) {
@@ -860,6 +965,7 @@ pub fn revert_single_asset(project_dir: &Path, chunk_path_str: &str) -> Result<(
         Box::new(MeshProcessor),
         Box::new(AnimationProcessor),
         Box::new(VfxProcessor),
+        Box::new(EventProcessor),
         Box::new(LuaProcessor),
         Box::new(XmlProcessor),
         Box::new(ParameterProcessor),
