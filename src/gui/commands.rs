@@ -91,4 +91,8 @@ pub enum WorkerCommand {
         chunk_path: PathBuf,
         json_data: String,
     },
+    SaveTerrainPalette {
+        chunk_path: PathBuf,
+        json_data: String,
+    },
 }

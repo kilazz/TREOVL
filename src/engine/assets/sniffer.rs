@@ -19,6 +19,7 @@ pub enum AssetKind {
     Parameter = 12,
     UI = 13,
     Vfx = 14,
+    TerrainPalette = 15,
 }
 
 pub struct SniffedAsset {
@@ -56,6 +57,8 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
         (AssetKind::Animation, "Skeletal Animation", "🎬")
     } else if magic_bytes == magic::OBJECT {
         (AssetKind::Object, "3D Object Entity", "🧊")
+    } else if magic_bytes == b"\x7E\x00\x00\x04" {
+        (AssetKind::TerrainPalette, "Terrain Texture Palette", "🗺️")
     } else if data.len() >= 4 && data[2] == 0x73 && data[3] == 0x00 {
         // Triumph Particle / VFX System: 0x0073xxxx
         (AssetKind::Vfx, "Particle System / VFX", "🔥")

@@ -318,6 +318,43 @@ impl AssetProcessor for AnimationProcessor {
     }
 }
 
+pub struct TerrainPaletteProcessor;
+impl AssetProcessor for TerrainPaletteProcessor {
+    fn process(
+        &self,
+        data: &[u8],
+        stem: &str,
+        sniffed: &SniffedAsset,
+        workspace: &ProjectWorkspace,
+    ) -> Result<Option<(String, AssetSyncEntry)>> {
+        if sniffed.kind != AssetKind::TerrainPalette && !data.starts_with(b"\x7E\x00\x00\x04") {
+            return Ok(None);
+        }
+
+        let json_str =
+            crate::engine::assets::terrain_palette::export_terrain_palette_to_json(data)?;
+        let out_name = build_asset_filename(&sniffed.display_name, stem, "json");
+
+        fs::write(
+            workspace
+                .assets_dir
+                .join("terrain_palettes")
+                .join(&out_name),
+            json_str.as_bytes(),
+        )?;
+
+        Ok(Some((
+            format!("assets/terrain_palettes/{}", out_name),
+            AssetSyncEntry {
+                chunk_rel_path: format!("chunks/{}.bin", stem),
+                asset_kind: "TerrainPalette".into(),
+                vanilla_crc32: calculate_crc32(json_str.as_bytes()),
+                is_modified: false,
+            },
+        )))
+    }
+}
+
 pub struct VfxProcessor;
 impl AssetProcessor for VfxProcessor {
     fn process(
@@ -684,6 +721,7 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize> {
         "objects",
         "vfx",
         "events",
+        "terrain_palettes",
     ];
     for dir in dirs {
         fs::create_dir_all(workspace.assets_dir.join(dir))?;
@@ -695,6 +733,7 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize> {
         Box::new(MaterialProcessor),
         Box::new(MeshProcessor),
         Box::new(AnimationProcessor),
+        Box::new(TerrainPaletteProcessor),
         Box::new(VfxProcessor),
         Box::new(EventProcessor),
         Box::new(LuaProcessor),
@@ -837,6 +876,13 @@ pub fn sync_assets_to_chunks(project_dir: &Path) -> Result<usize> {
                         String::from_utf8(asset_bytes).context("Object JSON is not valid UTF-8")?;
                     crate::engine::assets::object::import_object_from_json(&json_str)?
                 }
+                "TerrainPalette" => {
+                    let json_str = String::from_utf8(asset_bytes)
+                        .context("Terrain Palette JSON is not valid UTF-8")?;
+                    crate::engine::assets::terrain_palette::import_terrain_palette_from_json(
+                        &json_str,
+                    )?
+                }
                 "Vfx" => {
                     let json_str =
                         String::from_utf8(asset_bytes).context("VFX JSON is not valid UTF-8")?;
@@ -964,6 +1010,7 @@ pub fn revert_single_asset(project_dir: &Path, chunk_path_str: &str) -> Result<(
         Box::new(MaterialProcessor),
         Box::new(MeshProcessor),
         Box::new(AnimationProcessor),
+        Box::new(TerrainPaletteProcessor),
         Box::new(VfxProcessor),
         Box::new(EventProcessor),
         Box::new(LuaProcessor),

@@ -134,6 +134,16 @@ pub fn register(
                                 ui.set_mat_json_text(json_str.into());
                             }
                         }
+                        AssetKind::TerrainPalette => {
+                            ui.set_active_kind_id(9);
+                            if let Ok(json) =
+                                crate::engine::assets::terrain_palette::export_terrain_palette_to_json(
+                                    &bytes,
+                                )
+                            {
+                                ui.set_mat_json_text(json.into());
+                            }
+                        }
                         _ => ui.set_active_kind_id(5),
                     }
                 }
@@ -195,6 +205,14 @@ pub fn register(
     let tx_obj = tx.clone();
     ui.on_save_object(move |chunk_str, json_str| {
         let _ = tx_obj.send(WorkerCommand::SaveObject {
+            chunk_path: PathBuf::from(chunk_str.as_str()),
+            json_data: json_str.to_string(),
+        });
+    });
+
+    let tx_tp = tx.clone();
+    ui.on_save_terrain_palette(move |chunk_str, json_str| {
+        let _ = tx_tp.send(WorkerCommand::SaveTerrainPalette {
             chunk_path: PathBuf::from(chunk_str.as_str()),
             json_data: json_str.to_string(),
         });

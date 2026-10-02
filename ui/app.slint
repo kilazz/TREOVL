@@ -8,7 +8,7 @@ export struct AssetItem {
     icon: string,
     file_path: string,
     size_str: string,
-    kind_id: int, // 0: Texture, 1: Audio, 2: Material, 3: Mesh, 4: Lua, 5: Generic, 6: UI, 7: Object, 8: Animation
+    kind_id: int, // 0: Texture, 1: Audio, 2: Material, 3: Mesh, 4: Lua, 5: Generic, 6: UI, 7: Object, 8: Animation, 9: TerrainPalette
     is_modified: bool,
 }
 
@@ -67,6 +67,7 @@ export component AppWindow inherits Window {
     callback save_material(string, string);
     callback save_ui(string, string);
     callback save_object(string, string);
+    callback save_terrain_palette(string, string);
     callback export_mesh_obj(string, string);
     callback import_mesh_obj(string, string);
     callback export_terrain_obj(string, string);
@@ -756,6 +757,42 @@ export component AppWindow inherits Window {
                                 TextEdit {
                                     text <=> root.mat_json_text;
                                     read-only: true;
+                                    font-family: "Consolas";
+                                    font-size: 11px;
+                                }
+                            }
+                        }
+
+                        // CONTEXT 9: TERRAIN TEXTURE PALETTE & BIOME
+                        if root.active_kind_id == 9: VerticalLayout {
+                            spacing: 8px;
+                            vertical-stretch: 1;
+
+                            SectionTitle {
+                                text: "TERRAIN TEXTURE PALETTE & BIOME EDITOR";
+                                text-color: #f0b132;
+                            }
+
+                            HorizontalLayout {
+                                spacing: 10px;
+                                CustomButton {
+                                    icon: "💾";
+                                    text: "Save Changes to Terrain Palette";
+                                    primary-color: #23a55a;
+                                    min-w: 220px;
+                                    clicked => { root.save_terrain_palette(root.active_file_path, root.mat_json_text); }
+                                }
+                            }
+
+                            Rectangle {
+                                background: #111214;
+                                border-radius: 4px;
+                                border-width: 1px;
+                                border-color: #353535;
+                                vertical-stretch: 1;
+
+                                TextEdit {
+                                    text <=> root.mat_json_text;
                                     font-family: "Consolas";
                                     font-size: 11px;
                                 }

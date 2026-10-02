@@ -82,6 +82,7 @@ pub fn scan_project_folder(project_dir: &Path) -> (Vec<AssetItem>, Vec<CachedAss
                     AssetKind::UI => 6,
                     AssetKind::Object => 7,
                     AssetKind::Animation => 8,
+                    AssetKind::TerrainPalette => 9,
                     _ => 5,
                 };
 
@@ -690,6 +691,25 @@ pub fn run_gui() -> Result<(), slint::PlatformError> {
                     }
                     Err(e) => worker_logger.log(&format!("[!] Object save error: {}", e)),
                 },
+                WorkerCommand::SaveTerrainPalette {
+                    chunk_path,
+                    json_data,
+                } => {
+                    match crate::engine::assets::terrain_palette::import_terrain_palette_from_json(
+                        &json_data,
+                    ) {
+                        Ok(bin) => {
+                            let _ = fs::write(&chunk_path, bin);
+                            worker_logger.log(&format!(
+                                "[+] Terrain Palette chunk {:?} updated.",
+                                chunk_path
+                            ));
+                        }
+                        Err(e) => {
+                            worker_logger.log(&format!("[!] Terrain Palette save error: {}", e))
+                        }
+                    }
+                }
             }
         }
     });

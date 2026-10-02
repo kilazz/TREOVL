@@ -13,6 +13,7 @@ pub mod object;
 pub mod shader;
 pub mod sniffer;
 pub mod terrain;
+pub mod terrain_palette;
 pub mod texture;
 pub mod ui;
 pub mod vfx;
