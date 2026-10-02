@@ -254,7 +254,8 @@ fn decode_splat_and_foliage_container(
             let mut brush_idx = layer_id_counter;
 
             for (pid, pdata) in &sub_elems {
-                if *pid == 20
+                // Soilcover group names are stored under ID 10, terrain layers under ID 20
+                if (*pid == 20 || *pid == 10)
                     && let Some(s) = read_length_prefixed_string(pdata)
                 {
                     name = s;
