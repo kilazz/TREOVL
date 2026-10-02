@@ -4,11 +4,15 @@ use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 use std::path::Path;
 
-use super::animation::parse_object_bone_container;
 use super::{
     build_chunk_from_elements, build_typed_container, parse_chunk_elements, parse_typed_container,
 };
 use crate::engine::common::{read_length_prefixed_string, write_length_prefixed_string};
+
+#[inline]
+fn is_empty_container(chunk: &[u8]) -> bool {
+    chunk.is_empty() || chunk == [0u8]
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ObjectEntityJson {
@@ -19,13 +23,66 @@ pub struct ObjectEntityJson {
     pub entity_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scale: Option<[f32; 3]>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub mesh_bindings: Vec<MeshMaterialBindingJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bounding_box: Option<BoundingBoxJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_animation: Option<DefaultAnimationLinkJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub physics_state: Option<EntityPhysicsStateJson>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub bones: Vec<ObjectBoneSummaryJson>,
-    pub components: Vec<ObjectComponentBlockJson>,
+    pub ragdoll_bone_groups: Vec<BoneGroupJson>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub mesh_bindings: Vec<MeshMaterialBindingJson>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub bones: Vec<FullObjectBoneJson>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub attachments: Vec<AttachmentSlotJson>,
+    #[serde(default = "default_true")]
+    pub has_sentinel_terminator: bool,
+    /// FAIL-SAFE: Any components that failed to parse into structured JSON
+    /// are preserved here as raw hex to prevent ANY data loss during round-trip.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub raw_fallbacks: Vec<RawFallbackComponentJson>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RawFallbackComponentJson {
+    pub id: u32,
+    pub reason: String,
+    pub hex: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct BoundingBoxJson {
+    pub center: [f32; 3],
+    pub half_extents: [f32; 3],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orientation_matrix: Option<[[f32; 3]; 3]>,
+}
+
+/// Official Triumph Schema: "4f" (16-byte Vector4)
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct EntityPhysicsStateJson {
+    pub offset: [f32; 3],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub w_param: Option<f32>,
+    pub flags_hex: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_parameters: Option<[u32; 4]>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct BoneGroupJson {
+    pub group_id: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub bone_ids: Vec<u32>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub bone_names: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -45,26 +102,30 @@ pub struct DefaultAnimationLinkJson {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ObjectBoneSummaryJson {
+pub struct FullObjectBoneJson {
     pub id: usize,
     pub name: String,
+    pub bone_id: i32,
+    pub skin_id: i32,
     pub parent_index: i32,
+    pub next_sibling_index: i32,
+    pub first_child_index: i32,
     pub translation: [f32; 3],
     pub rotation_quat: [f32; 4],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transform_matrix: Option<[f32; 16]>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ObjectComponentBlockJson {
-    pub id: u32,
-    pub role: String,
-    pub hex: String,
+pub struct AttachmentSlotJson {
+    pub slot_id: u32,
+    pub data_hex: String,
 }
 
 // =========================================================================
-// PUBLIC API: EXPORT & IMPORT
+// PUBLIC API: EXPORT & IMPORT (FAIL-SAFE)
 // =========================================================================
 
-/// Exports Object Entity to JSON and optionally extracts the Master Rig into a GLB file.
 pub fn export_object_to_json(data: &[u8], output_dir: Option<&Path>) -> Result<String> {
     if data.len() < 5 {
         bail!("Chunk data too short to be an Object Entity container.");
@@ -76,53 +137,159 @@ pub fn export_object_to_json(data: &[u8], output_dir: Option<&Path>) -> Result<S
     let mut group_tag = None;
     let mut entity_name = None;
     let mut scale = None;
-    let mut mesh_bindings = Vec::new();
+    let mut bounding_box = None;
     let mut default_animation = None;
+    let mut physics_state = None;
+    let mut mesh_bindings = Vec::new();
     let mut bones = Vec::new();
-    let mut raw_bones_struct = Vec::new(); // Store raw parsed bones for GLB export
-    let mut components = Vec::new();
+    let mut ragdoll_bone_groups = Vec::new();
+    let mut attachments = Vec::new();
+    let mut has_sentinel_terminator = false;
+    let mut raw_fallbacks = Vec::new();
 
+    // Pass 1: Extract basic identity and bones
     for (id, chunk) in &elements {
         match *id {
             20 => {
-                group_tag = read_length_prefixed_string(chunk);
-            }
-            21 => {
-                entity_name = read_length_prefixed_string(chunk);
-            }
-            30 => {
-                mesh_bindings = parse_mesh_material_bindings(chunk);
-            }
-            32 => {
-                scale = read_scale_vector(chunk);
-            }
-            33 => {
-                if let Ok(parsed_bones) = parse_object_bone_container(chunk) {
-                    raw_bones_struct = parsed_bones.clone();
-                    bones = parsed_bones
-                        .into_iter()
-                        .enumerate()
-                        .map(|(idx, b)| ObjectBoneSummaryJson {
-                            id: idx,
-                            name: b.name,
-                            parent_index: b.parent_index,
-                            translation: [b.translation.x, b.translation.y, b.translation.z],
-                            rotation_quat: [b.rotation.x, b.rotation.y, b.rotation.z, b.rotation.w],
-                        })
-                        .collect();
+                if let Some(s) = read_length_prefixed_string(chunk) {
+                    group_tag = Some(s);
+                } else {
+                    raw_fallbacks.push(RawFallbackComponentJson {
+                        id: *id,
+                        reason: "Corrupted string format".into(),
+                        hex: hex::encode_upper(chunk),
+                    });
                 }
             }
-            37 => {
-                default_animation = parse_animation_linkage(chunk);
+            21 => {
+                if let Some(s) = read_length_prefixed_string(chunk) {
+                    entity_name = Some(s);
+                } else {
+                    raw_fallbacks.push(RawFallbackComponentJson {
+                        id: *id,
+                        reason: "Corrupted string format".into(),
+                        hex: hex::encode_upper(chunk),
+                    });
+                }
+            }
+            32 => {
+                if let Some(s) = read_scale_vector(chunk) {
+                    scale = Some(s);
+                } else {
+                    raw_fallbacks.push(RawFallbackComponentJson {
+                        id: *id,
+                        reason: "Invalid scale vector (expected 12 bytes / 3 floats)".into(),
+                        hex: hex::encode_upper(chunk),
+                    });
+                }
+            }
+            33 => {
+                // Empty container (0x00) is valid for static equipment/items
+                if !is_empty_container(chunk) {
+                    let parsed_bones = parse_full_bones_container(chunk);
+                    if !parsed_bones.is_empty() {
+                        bones = parsed_bones;
+                    } else {
+                        raw_fallbacks.push(RawFallbackComponentJson {
+                            id: *id,
+                            reason: "Non-standard bone container format".into(),
+                            hex: hex::encode_upper(chunk),
+                        });
+                    }
+                }
+            }
+            19 => {
+                has_sentinel_terminator = true;
             }
             _ => {}
         }
+    }
 
-        components.push(ObjectComponentBlockJson {
-            id: *id,
-            role: get_component_role(*id).to_string(),
-            hex: hex::encode_upper(chunk),
-        });
+    // Pass 2: Extract complex structures with fail-safe fallback
+    for (id, chunk) in &elements {
+        match *id {
+            30 => {
+                let bindings = parse_mesh_material_bindings(chunk);
+                if !bindings.is_empty() || is_empty_container(chunk) {
+                    mesh_bindings = bindings;
+                } else {
+                    raw_fallbacks.push(RawFallbackComponentJson {
+                        id: *id,
+                        reason: "Failed to parse mesh-material bindings table".into(),
+                        hex: hex::encode_upper(chunk),
+                    });
+                }
+            }
+            34 => {
+                if let Some(bbox) = parse_bounding_box(chunk) {
+                    bounding_box = Some(bbox);
+                } else {
+                    raw_fallbacks.push(RawFallbackComponentJson {
+                        id: *id,
+                        reason:
+                            "Non-standard bounding box format (expected 60 bytes / schema '15f')"
+                                .into(),
+                        hex: hex::encode_upper(chunk),
+                    });
+                }
+            }
+            35 => {
+                // Parse ragdoll bone groups (including empty groups in items)
+                if !is_empty_container(chunk) {
+                    let groups = parse_ragdoll_bone_groups(chunk, &bones);
+                    if !groups.is_empty() {
+                        ragdoll_bone_groups = groups;
+                    } else {
+                        raw_fallbacks.push(RawFallbackComponentJson {
+                            id: *id,
+                            reason: "Failed to decode ragdoll bone groups container".into(),
+                            hex: hex::encode_upper(chunk),
+                        });
+                    }
+                }
+            }
+            36 => {
+                // Empty container (0x00) is valid for static items without animation
+                if !is_empty_container(chunk) {
+                    if let Some(anim) = parse_animation_linkage(chunk) {
+                        default_animation = Some(anim);
+                    } else {
+                        raw_fallbacks.push(RawFallbackComponentJson {
+                            id: *id,
+                            reason: "Unrecognized animation linkage format".into(),
+                            hex: hex::encode_upper(chunk),
+                        });
+                    }
+                }
+            }
+            37 => {
+                if chunk.len() == 16 {
+                    physics_state = parse_physics_state(chunk);
+                } else if let Some(anim) = parse_animation_linkage(chunk) {
+                    default_animation = Some(anim);
+                } else if !chunk.is_empty() {
+                    raw_fallbacks.push(RawFallbackComponentJson {
+                        id: *id,
+                        reason:
+                            "Non-standard physics/state component (expected 16 bytes / schema '4f')"
+                                .into(),
+                        hex: hex::encode_upper(chunk),
+                    });
+                }
+            }
+            1 => {
+                attachments = parse_attachment_slots(chunk);
+            }
+            // Already parsed in pass 1
+            20 | 21 | 32 | 33 | 19 => {}
+            _ => {
+                raw_fallbacks.push(RawFallbackComponentJson {
+                    id: *id,
+                    reason: "Unmapped / unknown engine component".into(),
+                    hex: hex::encode_upper(chunk),
+                });
+            }
+        }
     }
 
     let entity_json = ObjectEntityJson {
@@ -130,20 +297,22 @@ pub fn export_object_to_json(data: &[u8], output_dir: Option<&Path>) -> Result<S
         group_tag,
         entity_name: entity_name.clone(),
         scale,
-        mesh_bindings,
+        bounding_box,
         default_animation,
-        bones,
-        components,
+        physics_state,
+        ragdoll_bone_groups,
+        mesh_bindings,
+        bones: bones.clone(),
+        attachments,
+        has_sentinel_terminator,
+        raw_fallbacks,
     };
 
-    // Automatically export Master Skeleton to .glb if an output directory is provided
     if let Some(dir) = output_dir
-        && !raw_bones_struct.is_empty()
+        && !bones.is_empty()
     {
         let rig_name = entity_name.unwrap_or_else(|| "Unknown_Rig".to_string());
-        if let Ok(glb_bytes) =
-            super::animation::export_skeleton_to_glb(&raw_bones_struct, &rig_name)
-        {
+        if let Ok(glb_bytes) = export_skeleton_from_json(&bones, &rig_name) {
             let glb_path = dir.join(format!("{}_MASTER_RIG.glb", rig_name));
             let _ = std::fs::write(glb_path, glb_bytes);
         }
@@ -159,87 +328,415 @@ pub fn import_object_from_json(json_str: &str) -> Result<Vec<u8>> {
 
     let mut elements = Vec::new();
 
-    for comp in parsed.components {
-        let mut raw_bytes = hex::decode(&comp.hex)
-            .with_context(|| format!("Invalid hex payload in component ID {}", comp.id))?;
+    let get_fallback = |id: u32| -> Option<Vec<u8>> {
+        parsed
+            .raw_fallbacks
+            .iter()
+            .find(|fb| fb.id == id)
+            .and_then(|fb| hex::decode(&fb.hex).ok())
+    };
 
-        // Re-inject edited high-level properties into the component payload
-        match comp.id {
-            20 => {
-                if let Some(ref tag) = parsed.group_tag {
-                    raw_bytes = write_length_prefixed_string(tag);
-                }
-            }
-            21 => {
-                if let Some(ref name) = parsed.entity_name {
-                    raw_bytes = write_length_prefixed_string(name);
-                }
-            }
-            32 => {
-                if let Some(s) = parsed.scale {
-                    raw_bytes = write_scale_vector(s);
-                }
-            }
-            30 if !parsed.mesh_bindings.is_empty() => {
-                if let Ok(rebuilt) = rebuild_mesh_material_bindings(&parsed.mesh_bindings) {
-                    raw_bytes = rebuilt;
-                }
-            }
-            _ => {}
+    // ID 20: Group Tag
+    if let Some(ref tag) = parsed.group_tag {
+        elements.push((20, write_length_prefixed_string(tag)));
+    } else if let Some(raw) = get_fallback(20) {
+        elements.push((20, raw));
+    }
+
+    // ID 21: Entity Name
+    if let Some(ref name) = parsed.entity_name {
+        elements.push((21, write_length_prefixed_string(name)));
+    } else if let Some(raw) = get_fallback(21) {
+        elements.push((21, raw));
+    }
+
+    // ID 30: Mesh Bindings
+    if !parsed.mesh_bindings.is_empty() {
+        let chunk_30 = rebuild_mesh_material_bindings(&parsed.mesh_bindings)?;
+        elements.push((30, chunk_30));
+    } else if let Some(raw) = get_fallback(30) {
+        elements.push((30, raw));
+    }
+
+    // ID 32: Scale Vector
+    if let Some(s) = parsed.scale {
+        elements.push((32, write_scale_vector(s)));
+    } else if let Some(raw) = get_fallback(32) {
+        elements.push((32, raw));
+    }
+
+    // ID 33: Full Bones Container
+    if !parsed.bones.is_empty() {
+        let chunk_33 = rebuild_full_bones_container(&parsed.bones)?;
+        elements.push((33, chunk_33));
+    } else if let Some(raw) = get_fallback(33) {
+        elements.push((33, raw));
+    } else {
+        elements.push((33, vec![0u8]));
+    }
+
+    // ID 34: Bounding Box ("15f")
+    if let Some(ref bbox) = parsed.bounding_box {
+        elements.push((34, rebuild_bounding_box(bbox)));
+    } else if let Some(raw) = get_fallback(34) {
+        elements.push((34, raw));
+    }
+
+    // ID 35: Ragdoll Groups
+    if !parsed.ragdoll_bone_groups.is_empty() {
+        let chunk_35 = rebuild_ragdoll_bone_groups(&parsed.ragdoll_bone_groups)?;
+        elements.push((35, chunk_35));
+    } else if let Some(raw) = get_fallback(35) {
+        elements.push((35, raw));
+    }
+
+    // ID 36: Default Animation
+    if let Some(ref anim) = parsed.default_animation {
+        elements.push((36, rebuild_animation_linkage(anim)));
+    } else if let Some(raw) = get_fallback(36) {
+        elements.push((36, raw));
+    } else {
+        elements.push((36, vec![0u8]));
+    }
+
+    // ID 37: Physics State & Parameters ("4f")
+    if let Some(ref phys) = parsed.physics_state {
+        elements.push((37, rebuild_physics_state(phys)));
+    } else if let Some(raw) = get_fallback(37) {
+        elements.push((37, raw));
+    }
+
+    // ID 19: Sentinel Terminator
+    if parsed.has_sentinel_terminator {
+        elements.push((19, vec![0xFF, 0xFF, 0xFF, 0xFF]));
+    }
+
+    // ID 1: Attachments / Children
+    if !parsed.attachments.is_empty() {
+        elements.push((1, rebuild_attachment_slots(&parsed.attachments)));
+    } else if let Some(raw) = get_fallback(1) {
+        elements.push((1, raw));
+    } else {
+        elements.push((1, vec![0u8]));
+    }
+
+    // Rebuild any other unknown components from raw fallbacks
+    for fb in &parsed.raw_fallbacks {
+        if ![20, 21, 30, 32, 33, 34, 35, 36, 37, 19, 1].contains(&fb.id)
+            && let Ok(raw) = hex::decode(&fb.hex)
+        {
+            elements.push((fb.id, raw));
         }
-
-        elements.push((comp.id, raw_bytes));
     }
 
     Ok(build_typed_container(type_id, &elements))
 }
 
 // =========================================================================
-// INTERNAL PARSING HELPERS
+// INTERNAL HELPERS
 // =========================================================================
 
-fn get_component_role(id: u32) -> &'static str {
-    match id {
-        20 => "Object Group Tag (OBJ Path)",
-        21 => "Entity / Prefab Name",
-        30 => "Mesh & Material Bindings Table",
-        32 => "Entity Scale Vector (X, Y, Z)",
-        33 => "Skeletal Rig (Object Bones Array)",
-        34 => "Bounding Box & Collision Bounds",
-        35 => "Hitbox & Ragdoll Bone Groups",
-        36 => "Attachment Sockets Configuration",
-        37 => "Default Animation Linkage",
-        19 => "Sentinel Terminator",
-        1 => "Child Entity / Attachment Link",
-        _ => "Engine Parameter / Data Block",
+fn parse_full_bones_container(chunk: &[u8]) -> Vec<FullObjectBoneJson> {
+    let mut out = Vec::new();
+    let records_blob = if let Ok((_, sub_elems)) = parse_chunk_elements(chunk) {
+        sub_elems
+            .into_iter()
+            .find(|(id, _)| *id == 22)
+            .map(|(_, d)| d)
+            .unwrap_or_default()
+    } else {
+        chunk.to_vec()
+    };
+
+    let count = records_blob.len() / 144;
+    let mut cur = Cursor::new(&records_blob);
+
+    for i in 0..count {
+        let mut name_buf = [0u8; 32];
+        if std::io::Read::read_exact(&mut cur, &mut name_buf).is_err() {
+            break;
+        }
+        let name = String::from_utf8_lossy(&name_buf)
+            .trim_matches(char::from(0))
+            .trim()
+            .to_string();
+
+        let mut matrix = [0.0f32; 16];
+        for val in &mut matrix {
+            *val = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+        }
+
+        let qx = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+        let qy = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+        let qz = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+        let qw = cur.read_f32::<LittleEndian>().unwrap_or(1.0);
+
+        let tx = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+        let ty = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+        let tz = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+
+        let bone_id = cur.read_i32::<LittleEndian>().unwrap_or(i as i32);
+        let skin_id = cur.read_i32::<LittleEndian>().unwrap_or(-1);
+        let parent_index = cur.read_i32::<LittleEndian>().unwrap_or(-1);
+        let next_sibling_index = cur.read_i32::<LittleEndian>().unwrap_or(-1);
+        let first_child_index = cur.read_i32::<LittleEndian>().unwrap_or(-1);
+
+        out.push(FullObjectBoneJson {
+            id: i,
+            name,
+            bone_id,
+            skin_id,
+            parent_index,
+            next_sibling_index,
+            first_child_index,
+            translation: [tx, ty, tz],
+            rotation_quat: [qx, qy, qz, qw],
+            transform_matrix: Some(matrix),
+        });
     }
+
+    out
 }
 
-fn read_scale_vector(data: &[u8]) -> Option<[f32; 3]> {
-    if data.len() >= 12 {
-        let mut cur = Cursor::new(data);
-        let x = cur.read_f32::<LittleEndian>().ok()?;
-        let y = cur.read_f32::<LittleEndian>().ok()?;
-        let z = cur.read_f32::<LittleEndian>().ok()?;
-        if x.is_finite() && y.is_finite() && z.is_finite() {
-            return Some([x, y, z]);
+fn rebuild_full_bones_container(bones: &[FullObjectBoneJson]) -> Result<Vec<u8>> {
+    let mut raw_records = Vec::with_capacity(bones.len() * 144);
+    let mut cur = Cursor::new(&mut raw_records);
+
+    for b in bones {
+        let mut name_buf = [0u8; 32];
+        let bs = b.name.as_bytes();
+        let copy_len = bs.len().min(31);
+        name_buf[..copy_len].copy_from_slice(&bs[..copy_len]);
+        std::io::Write::write_all(&mut cur, &name_buf)?;
+
+        let mat = b.transform_matrix.unwrap_or_else(|| {
+            let mut id = [0.0f32; 16];
+            id[0] = 1.0;
+            id[5] = 1.0;
+            id[10] = 1.0;
+            id[15] = 1.0;
+            id[12] = b.translation[0];
+            id[13] = b.translation[1];
+            id[14] = b.translation[2];
+            id
+        });
+        for val in mat {
+            cur.write_f32::<LittleEndian>(val)?;
+        }
+
+        cur.write_f32::<LittleEndian>(b.rotation_quat[0])?;
+        cur.write_f32::<LittleEndian>(b.rotation_quat[1])?;
+        cur.write_f32::<LittleEndian>(b.rotation_quat[2])?;
+        cur.write_f32::<LittleEndian>(b.rotation_quat[3])?;
+
+        cur.write_f32::<LittleEndian>(b.translation[0])?;
+        cur.write_f32::<LittleEndian>(b.translation[1])?;
+        cur.write_f32::<LittleEndian>(b.translation[2])?;
+
+        cur.write_i32::<LittleEndian>(b.bone_id)?;
+        cur.write_i32::<LittleEndian>(b.skin_id)?;
+        cur.write_i32::<LittleEndian>(b.parent_index)?;
+        cur.write_i32::<LittleEndian>(b.next_sibling_index)?;
+        cur.write_i32::<LittleEndian>(b.first_child_index)?;
+    }
+
+    let sub_elements = vec![
+        (20, vec![0u8, 0, 0, 0]),
+        (21, (bones.len() as u32).to_le_bytes().to_vec()),
+        (22, raw_records),
+    ];
+
+    Ok(build_chunk_from_elements(false, &sub_elements))
+}
+
+fn parse_physics_state(chunk: &[u8]) -> Option<EntityPhysicsStateJson> {
+    if chunk.len() < 16 {
+        return None;
+    }
+    let mut cur = Cursor::new(chunk);
+    let ox = cur.read_f32::<LittleEndian>().ok()?;
+    let oy = cur.read_f32::<LittleEndian>().ok()?;
+    let oz = cur.read_f32::<LittleEndian>().ok()?;
+    let w_bytes = cur.read_u32::<LittleEndian>().ok()?;
+
+    let w_f32 = f32::from_bits(w_bytes);
+    let is_clean_float = w_f32.is_finite() && w_f32.abs() >= 1e-4 && w_f32.abs() <= 100_000.0;
+
+    let p0 = u32::from_le_bytes(chunk[0..4].try_into().unwrap_or_default());
+    let p1 = u32::from_le_bytes(chunk[4..8].try_into().unwrap_or_default());
+    let p2 = u32::from_le_bytes(chunk[8..12].try_into().unwrap_or_default());
+    let is_subnormal = (p0 != 0 && ox.is_subnormal()) || (p1 != 0 && oy.is_subnormal());
+
+    Some(EntityPhysicsStateJson {
+        offset: [ox, oy, oz],
+        w_param: if is_clean_float { Some(w_f32) } else { None },
+        flags_hex: format!("0x{:08X}", w_bytes),
+        raw_parameters: if is_subnormal {
+            Some([p0, p1, p2, w_bytes])
+        } else {
+            None
+        },
+    })
+}
+
+fn rebuild_physics_state(state: &EntityPhysicsStateJson) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16);
+    let mut cur = Cursor::new(&mut out);
+
+    if let Some(params) = state.raw_parameters {
+        for val in params {
+            let _ = cur.write_u32::<LittleEndian>(val);
+        }
+        return out;
+    }
+
+    let _ = cur.write_f32::<LittleEndian>(state.offset[0]);
+    let _ = cur.write_f32::<LittleEndian>(state.offset[1]);
+    let _ = cur.write_f32::<LittleEndian>(state.offset[2]);
+
+    let w_u32 = if let Some(hex_clean) = state.flags_hex.strip_prefix("0x") {
+        u32::from_str_radix(hex_clean, 16).unwrap_or(0)
+    } else if let Some(w) = state.w_param {
+        w.to_bits()
+    } else {
+        0
+    };
+
+    let _ = cur.write_u32::<LittleEndian>(w_u32);
+    out
+}
+
+fn parse_bounding_box(data: &[u8]) -> Option<BoundingBoxJson> {
+    if data.len() < 60 {
+        return None;
+    }
+    let mut cur = Cursor::new(data);
+    let mut matrix = [[0.0f32; 3]; 3];
+    for row in &mut matrix {
+        for val in row {
+            *val = cur.read_f32::<LittleEndian>().ok()?;
         }
     }
-    None
+    let mut half_extents = [0.0f32; 3];
+    for val in &mut half_extents {
+        *val = cur.read_f32::<LittleEndian>().ok()?;
+    }
+    let mut center = [0.0f32; 3];
+    for val in &mut center {
+        *val = cur.read_f32::<LittleEndian>().ok()?;
+    }
+    Some(BoundingBoxJson {
+        center,
+        half_extents,
+        orientation_matrix: Some(matrix),
+    })
 }
 
-fn write_scale_vector(s: [f32; 3]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(12);
+fn rebuild_bounding_box(bbox: &BoundingBoxJson) -> Vec<u8> {
+    let mut out = Vec::with_capacity(60);
     let mut cur = Cursor::new(&mut out);
-    let _ = cur.write_f32::<LittleEndian>(s[0]);
-    let _ = cur.write_f32::<LittleEndian>(s[1]);
-    let _ = cur.write_f32::<LittleEndian>(s[2]);
+    let matrix =
+        bbox.orientation_matrix
+            .unwrap_or([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+    for row in matrix {
+        for val in row {
+            let _ = cur.write_f32::<LittleEndian>(val);
+        }
+    }
+    for val in bbox.half_extents {
+        let _ = cur.write_f32::<LittleEndian>(val);
+    }
+    for val in bbox.center {
+        let _ = cur.write_f32::<LittleEndian>(val);
+    }
     out
+}
+
+fn parse_ragdoll_bone_groups(
+    chunk_data: &[u8],
+    bones: &[FullObjectBoneJson],
+) -> Vec<BoneGroupJson> {
+    let mut groups = Vec::new();
+    let elements = if let Ok((_, elems)) = parse_chunk_elements(chunk_data) {
+        elems
+    } else {
+        return groups;
+    };
+
+    for (group_idx, elem_data) in elements {
+        if elem_data.starts_with(b"\xA0\x00\x41\x00") {
+            let mut bone_ids = Vec::new();
+
+            // Groups with bone IDs are larger than 5 bytes (TypeID + control byte)
+            if elem_data.len() > 5
+                && let Ok((_, sub_parts)) = parse_typed_container(&elem_data)
+            {
+                for (part_id, part_data) in sub_parts {
+                    if part_id == 23 {
+                        let mut cur = Cursor::new(&part_data);
+                        while (cur.position() as usize) + 4 <= part_data.len() {
+                            if let Ok(b_id) = cur.read_u32::<LittleEndian>() {
+                                bone_ids.push(b_id);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let bone_names: Vec<String> = bone_ids
+                .iter()
+                .filter_map(|&id| bones.get(id as usize).map(|b| b.name.clone()))
+                .collect();
+
+            let name = match group_idx {
+                0 => Some("Upper_Torso_Arms".into()),
+                1 => Some("Pelvis_Legs".into()),
+                2 => Some("Head_Neck".into()),
+                3 => Some("Right_Arm_Impact".into()),
+                4 => Some("Left_Arm_Impact".into()),
+                _ => Some(format!("Physics_Group_{}", group_idx)),
+            };
+
+            groups.push(BoneGroupJson {
+                group_id: group_idx,
+                name,
+                bone_ids,
+                bone_names,
+            });
+        }
+    }
+    groups
+}
+
+fn rebuild_ragdoll_bone_groups(groups: &[BoneGroupJson]) -> Result<Vec<u8>> {
+    let mut group_chunks = Vec::new();
+
+    for g in groups {
+        let group_blob = if g.bone_ids.is_empty() {
+            // Empty 0x004100A0 typed container is 4 bytes TypeID + 1 byte control_byte (0x00)
+            let mut b = Vec::with_capacity(5);
+            b.extend_from_slice(&0x004100A0u32.to_le_bytes());
+            b.push(0);
+            b
+        } else {
+            let count_bytes = (g.bone_ids.len() as u32).to_le_bytes().to_vec();
+            let mut ids_bytes = Vec::with_capacity(g.bone_ids.len() * 4);
+            let mut cur = Cursor::new(&mut ids_bytes);
+            for &b_id in &g.bone_ids {
+                let _ = cur.write_u32::<LittleEndian>(b_id);
+            }
+
+            let sub_elements = vec![(22, count_bytes), (23, ids_bytes)];
+            build_typed_container(0x004100A0, &sub_elements)
+        };
+        group_chunks.push((g.group_id, group_blob));
+    }
+
+    Ok(build_chunk_from_elements(true, &group_chunks))
 }
 
 fn parse_mesh_material_bindings(chunk_data: &[u8]) -> Vec<MeshMaterialBindingJson> {
     let mut bindings = Vec::new();
-
     let elements = if let Ok((_, elems)) = parse_chunk_elements(chunk_data) {
         elems
     } else {
@@ -297,14 +794,12 @@ fn rebuild_mesh_material_bindings(bindings: &[MeshMaterialBindingJson]) -> Resul
     let mut binding_chunks = Vec::new();
 
     for (idx, b) in bindings.iter().enumerate() {
-        // Element 31: Mesh identifiers
         let mesh_elements = vec![
             (20, write_length_prefixed_string(&b.mesh_path)),
             (21, write_length_prefixed_string(&b.mesh_part_name)),
         ];
         let mesh_container = build_chunk_from_elements(false, &mesh_elements);
 
-        // Element 33: Material identifiers
         let mat_elements = vec![
             (20, write_length_prefixed_string(&b.material_path)),
             (21, write_length_prefixed_string(&b.material_name)),
@@ -312,7 +807,6 @@ fn rebuild_mesh_material_bindings(bindings: &[MeshMaterialBindingJson]) -> Resul
         let mat_container = build_chunk_from_elements(false, &mat_elements);
 
         let binding_sub = vec![(31, mesh_container), (33, mat_container)];
-
         let binding_chunk = build_typed_container(0x00410067, &binding_sub);
         binding_chunks.push((idx as u32, binding_chunk));
     }
@@ -357,4 +851,94 @@ fn parse_animation_linkage(chunk_data: &[u8]) -> Option<DefaultAnimationLinkJson
         }
     }
     None
+}
+
+fn rebuild_animation_linkage(anim: &DefaultAnimationLinkJson) -> Vec<u8> {
+    let mut elements = vec![
+        (20, write_length_prefixed_string(&anim.anim_group)),
+        (21, write_length_prefixed_string(&anim.clip_name)),
+    ];
+    if let Some(ref track) = anim.track_name {
+        elements.push((22, write_length_prefixed_string(track)));
+    }
+    build_chunk_from_elements(false, &elements)
+}
+
+fn parse_attachment_slots(chunk: &[u8]) -> Vec<AttachmentSlotJson> {
+    let mut out = Vec::new();
+    if is_empty_container(chunk) {
+        return out;
+    }
+    if let Ok((_, elements)) = parse_chunk_elements(chunk) {
+        for (id, data) in elements {
+            out.push(AttachmentSlotJson {
+                slot_id: id,
+                data_hex: hex::encode_upper(data),
+            });
+        }
+    }
+    out
+}
+
+fn rebuild_attachment_slots(slots: &[AttachmentSlotJson]) -> Vec<u8> {
+    if slots.is_empty() {
+        return vec![0u8];
+    }
+    let mut elements = Vec::new();
+    for s in slots {
+        if let Ok(b) = hex::decode(&s.data_hex) {
+            elements.push((s.slot_id, b));
+        }
+    }
+    build_chunk_from_elements(false, &elements)
+}
+
+fn read_scale_vector(data: &[u8]) -> Option<[f32; 3]> {
+    if data.len() >= 12 {
+        let mut cur = Cursor::new(data);
+        let x = cur.read_f32::<LittleEndian>().ok()?;
+        let y = cur.read_f32::<LittleEndian>().ok()?;
+        let z = cur.read_f32::<LittleEndian>().ok()?;
+        if x.is_finite() && y.is_finite() && z.is_finite() {
+            return Some([x, y, z]);
+        }
+    }
+    None
+}
+
+fn write_scale_vector(s: [f32; 3]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12);
+    let mut cur = Cursor::new(&mut out);
+    let _ = cur.write_f32::<LittleEndian>(s[0]);
+    let _ = cur.write_f32::<LittleEndian>(s[1]);
+    let _ = cur.write_f32::<LittleEndian>(s[2]);
+    out
+}
+
+fn export_skeleton_from_json(bones: &[FullObjectBoneJson], rig_name: &str) -> Result<Vec<u8>> {
+    let object_bones: Vec<super::animation::ObjectBone> = bones
+        .iter()
+        .map(|b| super::animation::ObjectBone {
+            name: b.name.clone(),
+            matrix: b.transform_matrix.unwrap_or([0.0; 16]),
+            rotation: crate::engine::math::Vector4 {
+                x: b.rotation_quat[0],
+                y: b.rotation_quat[1],
+                z: b.rotation_quat[2],
+                w: b.rotation_quat[3],
+            },
+            translation: crate::engine::math::Vector3 {
+                x: b.translation[0],
+                y: b.translation[1],
+                z: b.translation[2],
+            },
+            bone_id: b.bone_id,
+            skin_id: b.skin_id,
+            parent_index: b.parent_index,
+            next_sibling_index: b.next_sibling_index,
+            first_child_index: b.first_child_index,
+        })
+        .collect();
+
+    super::animation::export_skeleton_to_glb(&object_bones, rig_name)
 }
