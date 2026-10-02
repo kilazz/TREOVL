@@ -77,4 +77,10 @@ impl HashDictionary {
     }
 }
 
+impl Default for HashDictionary {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub static DICTIONARY: LazyLock<HashDictionary> = LazyLock::new(HashDictionary::new);

@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use byteorder::{LittleEndian, ReadBytesExt};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::Cursor;
 
 #[allow(dead_code)]
@@ -46,7 +46,7 @@ pub struct ParsedContainerTable {
     pub entries: Vec<ContainerTableEntry>,
 }
 
-/// Unified parser for Triumph Studios container offset tables (DRY implementation).
+/// Unified parser for Triumph Studios container offset tables.
 pub fn parse_raw_container_table(
     data: &[u8],
     mut pos: usize,
@@ -122,4 +122,75 @@ pub fn parse_raw_container_table(
         data_start,
         entries,
     })
+}
+
+/// Unified builder for Triumph container tables and data segments.
+pub fn serialize_container_payload<'a, I>(elements: I) -> Vec<u8>
+where
+    I: IntoIterator<Item = (u32, bool, &'a [u8])>,
+{
+    let mut small_entries = Vec::new();
+    let mut large_entries = Vec::new();
+    let mut current_offset = 0usize;
+    let mut data_segment = Vec::new();
+
+    for (id, force_large, data) in elements {
+        if !force_large && id <= 255 && current_offset <= 255 {
+            small_entries.push((id as u8, current_offset as u8));
+        } else {
+            large_entries.push((id, current_offset as u32));
+        }
+        data_segment.extend_from_slice(data);
+        current_offset += data.len();
+    }
+
+    let has_large = !large_entries.is_empty();
+    let mut control_byte = (small_entries.len() & 0x7F) as u8;
+    if has_large {
+        control_byte |= 0x80;
+    }
+
+    let mut out = Vec::with_capacity(
+        1 + 4 + small_entries.len() * 2 + large_entries.len() * 8 + data_segment.len(),
+    );
+    out.push(control_byte);
+
+    if has_large {
+        out.write_u32::<LittleEndian>(large_entries.len() as u32)
+            .unwrap();
+    }
+    for (id, offset) in small_entries {
+        out.write_u8(id).unwrap();
+        out.write_u8(offset).unwrap();
+    }
+    for (id, offset) in large_entries {
+        out.write_u32::<LittleEndian>(id).unwrap();
+        out.write_u32::<LittleEndian>(offset).unwrap();
+    }
+    out.extend_from_slice(&data_segment);
+    out
+}
+
+pub fn read_length_prefixed_string(data: &[u8]) -> Option<String> {
+    if data.len() < 4 {
+        return None;
+    }
+    let len = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
+    if len > 0 && len <= data.len() - 4 {
+        let slice = &data[4..4 + len];
+        let clean = slice.strip_suffix(&[0]).unwrap_or(slice);
+        std::str::from_utf8(clean)
+            .ok()
+            .map(|s| s.trim().to_string())
+    } else {
+        None
+    }
+}
+
+pub fn write_length_prefixed_string(s: &str) -> Vec<u8> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(4 + bytes.len());
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(bytes);
+    out
 }

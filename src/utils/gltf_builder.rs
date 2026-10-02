@@ -100,6 +100,12 @@ impl GltfBuilder {
         idx
     }
 
+    pub fn add_animation(&mut self, anim: Value) -> usize {
+        let idx = self.animations.len();
+        self.animations.push(anim);
+        idx
+    }
+
     pub fn add_scene(&mut self, root_nodes: Vec<usize>) {
         self.scenes.push(json!({ "nodes": root_nodes }));
     }
@@ -148,5 +154,11 @@ impl GltfBuilder {
         glb.extend_from_slice(&self.bin_data);
 
         Ok(glb)
+    }
+}
+
+impl Default for GltfBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }

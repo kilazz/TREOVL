@@ -1,9 +1,4 @@
-mod cli;
-mod engine;
-mod gui;
-mod utils;
-
-slint::include_modules!();
+use OVLTool::{cli, gui};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::args().len() > 1 {

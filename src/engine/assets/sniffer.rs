@@ -22,6 +22,26 @@ pub enum AssetKind {
     TerrainPalette = 15,
 }
 
+impl AssetKind {
+    /// Maps the asset kind to the Slint UI Inspector tab kind ID:
+    /// 0: Texture, 1: Audio, 2: Material, 3: Mesh, 4: Lua, 5: Generic,
+    /// 6: UI, 7: Object, 8: Animation, 9: TerrainPalette
+    pub fn to_ui_kind_id(&self) -> i32 {
+        match self {
+            Self::Texture => 0,
+            Self::Audio => 1,
+            Self::Material => 2,
+            Self::Mesh => 3,
+            Self::Lua => 4,
+            Self::UI => 6,
+            Self::Object => 7,
+            Self::Animation => 8,
+            Self::TerrainPalette => 9,
+            _ => 5,
+        }
+    }
+}
+
 pub struct SniffedAsset {
     pub kind: AssetKind,
     pub kind_name: &'static str,
@@ -42,7 +62,6 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
 
     let magic_bytes = &data[0..4];
 
-    // 1. High-Level Signature Check
     let (kind, kind_name, icon) = if magic_bytes == magic::TEX_3D {
         (AssetKind::Texture, "Texture (DDS)", "🎨")
     } else if magic_bytes == magic::TEX_CUBEMAP {
@@ -60,7 +79,6 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
     } else if magic_bytes == b"\x7E\x00\x00\x04" {
         (AssetKind::TerrainPalette, "Terrain Texture Palette", "🗺️")
     } else if data.len() >= 4 && data[2] == 0x73 && data[3] == 0x00 {
-        // Triumph Particle / VFX System: 0x0073xxxx
         (AssetKind::Vfx, "Particle System / VFX", "🔥")
     } else if magic_bytes == b"\x76\x00\x41\x00" {
         (AssetKind::UI, "UI Sprite Slice", "🖼️")

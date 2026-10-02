@@ -4,6 +4,14 @@ version = "1.0.0"
 edition = "2024"
 build = "build.rs"
 
+[lib]
+name = "OVLTool"
+path = "src/lib.rs"
+
+[[bin]]
+name = "OVLTool"
+path = "src/main.rs"
+
 [dependencies]
 slint = "1.18.1"
 byteorder = "1.5.0"

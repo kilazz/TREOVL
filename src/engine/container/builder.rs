@@ -1,10 +1,11 @@
 use super::node::PrpNode;
+use crate::engine::common::serialize_container_payload;
+use crate::utils::zlib::{compress, decompress, is_zlib_compressed};
 use anyhow::{Context, Result, bail};
-use byteorder::{LittleEndian, WriteBytesExt};
 use std::fs;
 use std::path::Path;
 
-pub fn build_node(node: &PrpNode, project_dir: &Path) -> Result<Vec<u8>> {
+pub fn build_node(node: &PrpNode, project_dir: &Path, compression_level: u32) -> Result<Vec<u8>> {
     if !node.is_container {
         let rel_path = match &node.file_path {
             Some(path) => path,
@@ -12,37 +13,36 @@ pub fn build_node(node: &PrpNode, project_dir: &Path) -> Result<Vec<u8>> {
         };
 
         let full_path = project_dir.join(rel_path);
-        // Leaf chunks in chunks/ are already pre-synchronized and verified.
-        // We pack directly from disk without redundant CPU-heavy recompression.
         let raw_data = fs::read(&full_path)
             .with_context(|| format!("Failed to read chunk file {:?}", full_path))?;
+
+        if compression_level == 0 {
+            return Ok(raw_data);
+        }
+
+        if is_zlib_compressed(&raw_data)
+            && let Ok(decompressed) = decompress(&raw_data)
+            && let Ok(recompressed) = compress(&decompressed, compression_level)
+        {
+            return Ok(recompressed);
+        }
+
+        let is_audio = raw_data.starts_with(b"RIFF") || raw_data.starts_with(b"\x00\x00\xA1\x00");
+        if !is_audio
+            && raw_data.len() > 128
+            && let Ok(compressed) = compress(&raw_data, compression_level)
+            && compressed.len() < raw_data.len()
+        {
+            return Ok(compressed);
+        }
 
         return Ok(raw_data);
     }
 
     let mut child_buffers = Vec::new();
     for child in &node.children {
-        let child_bin = build_node(child, project_dir)?;
+        let child_bin = build_node(child, project_dir, compression_level)?;
         child_buffers.push((child, child_bin));
-    }
-
-    let mut small_entries = Vec::new();
-    let mut large_entries = Vec::new();
-    let mut data_segment = Vec::new();
-    let mut current_offset = 0usize;
-
-    for (child, bin_data) in child_buffers {
-        let id = child.id;
-        let c_is_large = child.is_large;
-
-        if !c_is_large && id <= 255 && current_offset <= 255 {
-            small_entries.push((id as u8, current_offset as u8));
-        } else {
-            large_entries.push((id, current_offset as u32));
-        }
-
-        data_segment.extend_from_slice(&bin_data);
-        current_offset += bin_data.len();
     }
 
     let mut table = Vec::new();
@@ -50,27 +50,10 @@ pub fn build_node(node: &PrpNode, project_dir: &Path) -> Result<Vec<u8>> {
         table.extend_from_slice(b"\x01\x01\x00");
     }
 
-    let has_large = !large_entries.is_empty();
-    let mut control_byte = (small_entries.len() & 0x7F) as u8;
-    if has_large {
-        control_byte |= 0x80;
-    }
-    table.push(control_byte);
+    let entries = child_buffers
+        .iter()
+        .map(|(child, bin)| (child.id, child.is_large, bin.as_slice()));
+    table.extend(serialize_container_payload(entries));
 
-    if has_large {
-        table.write_u32::<LittleEndian>(large_entries.len() as u32)?;
-    }
-
-    for (id, offset) in small_entries {
-        table.write_u8(id)?;
-        table.write_u8(offset)?;
-    }
-
-    for (id, offset) in large_entries {
-        table.write_u32::<LittleEndian>(id)?;
-        table.write_u32::<LittleEndian>(offset)?;
-    }
-
-    table.extend(data_segment);
     Ok(table)
 }

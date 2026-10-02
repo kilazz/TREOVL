@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::io::Cursor;
 
 use super::{build_typed_container, parse_chunk_elements, parse_typed_container};
+use crate::engine::common::{read_length_prefixed_string, write_length_prefixed_string};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TerrainPaletteJson {
@@ -423,28 +424,4 @@ fn get_component_role(id: u32) -> &'static str {
         1 => "Root Container Terminator",
         _ => "Terrain Palette Parameter",
     }
-}
-
-fn read_length_prefixed_string(data: &[u8]) -> Option<String> {
-    if data.len() < 4 {
-        return None;
-    }
-    let len = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
-    if len > 0 && len <= data.len() - 4 {
-        let slice = &data[4..4 + len];
-        let clean = slice.strip_suffix(&[0]).unwrap_or(slice);
-        std::str::from_utf8(clean)
-            .ok()
-            .map(|s| s.trim().to_string())
-    } else {
-        None
-    }
-}
-
-fn write_length_prefixed_string(s: &str) -> Vec<u8> {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(4 + bytes.len());
-    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-    out.extend_from_slice(bytes);
-    out
 }

@@ -1,5 +1,6 @@
 use super::parse_chunk_elements;
 use crate::engine::common::chunk_id;
+use crate::utils::gltf_builder::GltfBuilder;
 use anyhow::{Context, Result, bail};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use serde_json::json;
@@ -38,24 +39,36 @@ impl TerrainPoint {
     }
 }
 
-pub fn export_terrain_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, usize, usize)> {
+pub struct TerrainGeometry {
+    pub width: usize,
+    pub height: usize,
+    pub vertex_count: usize,
+    pub triangle_count: usize,
+    pub positions: Vec<[f32; 3]>,
+    pub colors: Vec<[f32; 3]>,
+    pub indices: Vec<u32>,
+    pub min_pos: [f32; 3],
+    pub max_pos: [f32; 3],
+}
+
+pub fn parse_terrain_geometry(chunk_data: &[u8]) -> Result<TerrainGeometry> {
     let (_, elements) = parse_chunk_elements(chunk_data)?;
 
     let width_bytes = elements
         .iter()
         .find(|(id, _)| *id == chunk_id::WIDTH)
         .map(|(_, d)| d)
-        .context("Missing Width ID 30")?;
+        .context("Missing Width chunk (ID 30)")?;
     let height_bytes = elements
         .iter()
         .find(|(id, _)| *id == chunk_id::HEIGHT)
         .map(|(_, d)| d)
-        .context("Missing Height ID 31")?;
+        .context("Missing Height chunk (ID 31)")?;
     let raw_points = elements
         .iter()
         .find(|(id, _)| *id == 33)
         .map(|(_, d)| d)
-        .context("Missing TerrainPoints ID 33")?;
+        .context("Missing TerrainPoints chunk (ID 33)")?;
 
     let width = Cursor::new(width_bytes).read_u32::<LittleEndian>()? as usize;
     let height = Cursor::new(height_bytes).read_u32::<LittleEndian>()? as usize;
@@ -68,7 +81,7 @@ pub fn export_terrain_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, usize, usize
     }
 
     if points.len() < width * height {
-        bail!("Point count does not match grid dimensions.");
+        bail!("Point count does not match grid dimensions");
     }
 
     let vertex_count = width * height;
@@ -77,10 +90,7 @@ pub fn export_terrain_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, usize, usize
     let mut min_pos = [f32::INFINITY, f32::INFINITY, f32::INFINITY];
     let mut max_pos = [f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
 
-    let mut bin_data = Vec::new();
-
-    let indices_offset = bin_data.len();
-    let mut index_count = 0;
+    let mut indices = Vec::with_capacity((width - 1) * (height - 1) * 6);
     for y in 0..(height - 1) {
         for x in 0..(width - 1) {
             let p1 = (y * width + x) as u32;
@@ -88,23 +98,17 @@ pub fn export_terrain_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, usize, usize
             let p3 = ((y + 1) * width + x) as u32;
             let p4 = ((y + 1) * width + (x + 1)) as u32;
 
-            bin_data.write_u32::<LittleEndian>(p1)?;
-            bin_data.write_u32::<LittleEndian>(p3)?;
-            bin_data.write_u32::<LittleEndian>(p2)?;
+            indices.push(p1);
+            indices.push(p3);
+            indices.push(p2);
 
-            bin_data.write_u32::<LittleEndian>(p2)?;
-            bin_data.write_u32::<LittleEndian>(p3)?;
-            bin_data.write_u32::<LittleEndian>(p4)?;
-
-            index_count += 6;
+            indices.push(p2);
+            indices.push(p3);
+            indices.push(p4);
         }
     }
-    while !bin_data.len().is_multiple_of(4) {
-        bin_data.push(0);
-    }
-    let indices_length = index_count * 4;
 
-    let pos_offset = bin_data.len();
+    let mut positions = Vec::with_capacity(vertex_count);
     for y in 0..height {
         for x in 0..width {
             let pt = points[y * width + x];
@@ -119,146 +123,117 @@ pub fn export_terrain_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, usize, usize
             max_pos[1] = max_pos[1].max(py);
             max_pos[2] = max_pos[2].max(pz);
 
-            bin_data.write_f32::<LittleEndian>(px)?;
-            bin_data.write_f32::<LittleEndian>(py)?;
-            bin_data.write_f32::<LittleEndian>(pz)?;
+            positions.push([px, py, pz]);
         }
     }
-    let pos_length = vertex_count * 12;
 
-    let col_offset = bin_data.len();
+    if min_pos[0].is_infinite() {
+        min_pos = [0.0, 0.0, 0.0];
+        max_pos = [0.0, 0.0, 0.0];
+    }
+
+    let mut colors = Vec::with_capacity(vertex_count);
     for pt in &points {
         let r = pt.main_texture_idx as f32 / 15.0;
         let g = pt.foliage_value as f32 / 15.0;
         let b = pt.cliff_texture_idx as f32 / 15.0;
-
-        bin_data.write_f32::<LittleEndian>(r)?;
-        bin_data.write_f32::<LittleEndian>(g)?;
-        bin_data.write_f32::<LittleEndian>(b)?;
-    }
-    let col_length = vertex_count * 12;
-
-    while !bin_data.len().is_multiple_of(4) {
-        bin_data.push(0);
+        colors.push([r, g, b]);
     }
 
-    let gltf_json = json!({
-        "asset": {
-            "version": "2.0",
-            "generator": "Overlord Modding Studio Terrain Exporter"
-        },
-        "scene": 0,
-        "scenes": [{ "nodes": [0] }],
-        "nodes": [{ "name": "TerrainHeightmap", "mesh": 0 }],
-        "meshes": [{
-            "name": "TerrainMesh",
-            "primitives": [{
-                "attributes": {
-                    "POSITION": 1,
-                    "COLOR_0": 2
-                },
-                "indices": 0,
-                "mode": 4
-            }]
-        }],
-        "buffers": [{ "byteLength": bin_data.len() }],
-        "bufferViews": [
-            { "buffer": 0, "byteOffset": indices_offset, "byteLength": indices_length, "target": 34963 },
-            { "buffer": 0, "byteOffset": pos_offset, "byteLength": pos_length, "target": 34962 },
-            { "buffer": 0, "byteOffset": col_offset, "byteLength": col_length, "target": 34962 }
-        ],
-        "accessors": [
-            { "bufferView": 0, "byteOffset": 0, "componentType": 5125, "count": index_count, "type": "SCALAR" },
-            { "bufferView": 1, "byteOffset": 0, "componentType": 5126, "count": vertex_count, "type": "VEC3", "min": min_pos, "max": max_pos },
-            { "bufferView": 2, "byteOffset": 0, "componentType": 5126, "count": vertex_count, "type": "VEC3" }
-        ]
-    });
+    let triangle_count = indices.len() / 3;
 
-    let mut json_bytes = serde_json::to_vec(&gltf_json)?;
-    while !json_bytes.len().is_multiple_of(4) {
-        json_bytes.push(b' ');
+    Ok(TerrainGeometry {
+        width,
+        height,
+        vertex_count,
+        triangle_count,
+        positions,
+        colors,
+        indices,
+        min_pos,
+        max_pos,
+    })
+}
+
+pub fn add_terrain_to_builder(
+    builder: &mut GltfBuilder,
+    geom: &TerrainGeometry,
+    node_name: &str,
+) -> Result<usize> {
+    let mut idx_bytes = Vec::with_capacity(geom.indices.len() * 4);
+    for idx in &geom.indices {
+        idx_bytes.write_u32::<LittleEndian>(*idx)?;
     }
+    let idx_view = builder.add_buffer_view(&idx_bytes, Some(34963));
+    let idx_acc = builder.add_accessor(idx_view, geom.indices.len(), 5125, "SCALAR", None, None);
 
-    let total_length = 12 + 8 + json_bytes.len() + 8 + bin_data.len();
-    let mut glb = Vec::with_capacity(total_length);
+    let mut pos_bytes = Vec::with_capacity(geom.positions.len() * 12);
+    for p in &geom.positions {
+        pos_bytes.write_f32::<LittleEndian>(p[0])?;
+        pos_bytes.write_f32::<LittleEndian>(p[1])?;
+        pos_bytes.write_f32::<LittleEndian>(p[2])?;
+    }
+    let pos_view = builder.add_buffer_view(&pos_bytes, Some(34962));
+    let pos_acc = builder.add_accessor(
+        pos_view,
+        geom.vertex_count,
+        5126,
+        "VEC3",
+        Some(geom.min_pos.to_vec()),
+        Some(geom.max_pos.to_vec()),
+    );
 
-    glb.extend_from_slice(b"glTF");
-    glb.write_u32::<LittleEndian>(2)?;
-    glb.write_u32::<LittleEndian>(total_length as u32)?;
+    let mut col_bytes = Vec::with_capacity(geom.colors.len() * 12);
+    for c in &geom.colors {
+        col_bytes.write_f32::<LittleEndian>(c[0])?;
+        col_bytes.write_f32::<LittleEndian>(c[1])?;
+        col_bytes.write_f32::<LittleEndian>(c[2])?;
+    }
+    let col_view = builder.add_buffer_view(&col_bytes, Some(34962));
+    let col_acc = builder.add_accessor(col_view, geom.vertex_count, 5126, "VEC3", None, None);
 
-    glb.write_u32::<LittleEndian>(json_bytes.len() as u32)?;
-    glb.extend_from_slice(b"JSON");
-    glb.extend_from_slice(&json_bytes);
+    let mesh_idx = builder.add_mesh(json!({
+        "name": "TerrainMesh",
+        "primitives": [{
+            "attributes": {
+                "POSITION": pos_acc,
+                "COLOR_0": col_acc
+            },
+            "indices": idx_acc,
+            "mode": 4
+        }]
+    }));
 
-    glb.write_u32::<LittleEndian>(bin_data.len() as u32)?;
-    glb.extend_from_slice(b"BIN\0");
-    glb.extend_from_slice(&bin_data);
+    let node_idx = builder.add_node(json!({
+        "name": node_name,
+        "mesh": mesh_idx
+    }));
 
-    Ok((glb, vertex_count, index_count / 3))
+    Ok(node_idx)
+}
+
+pub fn export_terrain_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, usize, usize)> {
+    let geom = parse_terrain_geometry(chunk_data)?;
+    let mut builder = GltfBuilder::new();
+    let node_idx = add_terrain_to_builder(&mut builder, &geom, "TerrainHeightmap")?;
+    builder.add_scene(vec![node_idx]);
+    let glb = builder.build("Overlord Modding Studio Terrain Exporter")?;
+    Ok((glb, geom.vertex_count, geom.triangle_count))
 }
 
 pub fn export_terrain_to_obj(chunk_data: &[u8]) -> Result<String> {
-    let (_, elements) = parse_chunk_elements(chunk_data)?;
-
-    let width_bytes = elements
-        .iter()
-        .find(|(id, _)| *id == chunk_id::WIDTH)
-        .map(|(_, d)| d)
-        .context("Missing Width ID 30")?;
-    let height_bytes = elements
-        .iter()
-        .find(|(id, _)| *id == chunk_id::HEIGHT)
-        .map(|(_, d)| d)
-        .context("Missing Height ID 31")?;
-    let raw_points = elements
-        .iter()
-        .find(|(id, _)| *id == 33)
-        .map(|(_, d)| d)
-        .context("Missing TerrainPoints ID 33")?;
-
-    let width = Cursor::new(width_bytes).read_u32::<LittleEndian>()? as usize;
-    let height = Cursor::new(height_bytes).read_u32::<LittleEndian>()? as usize;
-
-    let mut points = Vec::with_capacity(width * height);
-    let mut cur = Cursor::new(raw_points);
-    while (cur.position() as usize) + 4 <= raw_points.len() {
-        let raw = cur.read_u32::<LittleEndian>()?;
-        points.push(TerrainPoint::from_u32(raw));
-    }
-
-    if points.len() < width * height {
-        bail!("Point count does not match grid dimensions.");
-    }
-
+    let geom = parse_terrain_geometry(chunk_data)?;
     let mut obj = String::new();
     obj.push_str("# Exported Overlord Terrain Heightmap\n");
     obj.push_str("o TerrainMesh\n\n");
 
-    let spacing = 2.0;
-
-    for y in 0..height {
-        for x in 0..width {
-            let pt = points[y * width + x];
-            obj.push_str(&format!(
-                "v {:.3} {:.3} {:.3}\n",
-                x as f32 * spacing,
-                pt.height,
-                y as f32 * spacing
-            ));
-        }
+    for p in &geom.positions {
+        obj.push_str(&format!("v {:.3} {:.3} {:.3}\n", p[0], p[1], p[2]));
     }
 
     obj.push_str("\ns 1\n");
-    for y in 0..(height - 1) {
-        for x in 0..(width - 1) {
-            let p1 = (y * width + x) + 1;
-            let p2 = (y * width + (x + 1)) + 1;
-            let p3 = ((y + 1) * width + x) + 1;
-            let p4 = ((y + 1) * width + (x + 1)) + 1;
-
-            obj.push_str(&format!("f {} {} {}\n", p1, p3, p2));
-            obj.push_str(&format!("f {} {} {}\n", p2, p3, p4));
-        }
+    for tri in geom.indices.as_chunks::<3>().0 {
+        obj.push_str(&format!("f {} {} {}\n", tri[0] + 1, tri[1] + 1, tri[2] + 1));
     }
 
     Ok(obj)

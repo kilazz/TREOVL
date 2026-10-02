@@ -44,7 +44,7 @@ pub fn unpack_archive(archive_path: &Path, output_dir: &Path) -> Result<(usize, 
         ));
     }
 
-    // Create both working chunks directory and read-only vanilla baseline directory
+    // Create both the working chunks directory and the pristine baseline directory
     fs::create_dir_all(output_dir.join("chunks"))?;
     fs::create_dir_all(output_dir.join("chunks_vanilla"))?;
 
@@ -87,7 +87,11 @@ pub fn unpack_archive(archive_path: &Path, output_dir: &Path) -> Result<(usize, 
     Ok((chunk_counter as usize, log))
 }
 
-pub fn pack_archive(project_dir: &Path, output_archive: &Path) -> Result<usize> {
+pub fn pack_archive(
+    project_dir: &Path,
+    output_archive: &Path,
+    compression_level: u32,
+) -> Result<usize> {
     let manifest_path = project_dir.join("project.json");
     if !manifest_path.exists() {
         bail!(
@@ -109,7 +113,7 @@ pub fn pack_archive(project_dir: &Path, output_archive: &Path) -> Result<usize> 
     let manifest_str = fs::read_to_string(&manifest_path)?;
     let manifest: ProjectManifest = serde_json::from_str(&manifest_str)?;
 
-    let payload = build_node(&manifest.root, project_dir)?;
+    let payload = build_node(&manifest.root, project_dir, compression_level)?;
 
     let mut header_bytes = vec![0u8; HEADER_SIZE];
     let mut cur = Cursor::new(&mut header_bytes);

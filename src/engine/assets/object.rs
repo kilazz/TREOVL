@@ -8,6 +8,7 @@ use super::animation::parse_object_bone_container;
 use super::{
     build_chunk_from_elements, build_typed_container, parse_chunk_elements, parse_typed_container,
 };
+use crate::engine::common::{read_length_prefixed_string, write_length_prefixed_string};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ObjectEntityJson {
@@ -135,7 +136,7 @@ pub fn export_object_to_json(data: &[u8], output_dir: Option<&Path>) -> Result<S
         components,
     };
 
-    // MAGIC: Automatically export Master Skeleton to .glb if an output directory is provided!
+    // Automatically export Master Skeleton to .glb if an output directory is provided
     if let Some(dir) = output_dir
         && !raw_bones_struct.is_empty()
     {
@@ -179,7 +180,6 @@ pub fn import_object_from_json(json_str: &str) -> Result<Vec<u8>> {
                     raw_bytes = write_scale_vector(s);
                 }
             }
-            // Fixed Clippy warning: collapsed if let into match guard!
             30 if !parsed.mesh_bindings.is_empty() => {
                 if let Ok(rebuilt) = rebuild_mesh_material_bindings(&parsed.mesh_bindings) {
                     raw_bytes = rebuilt;
@@ -215,30 +215,6 @@ fn get_component_role(id: u32) -> &'static str {
     }
 }
 
-fn read_length_prefixed_string(data: &[u8]) -> Option<String> {
-    if data.len() < 4 {
-        return None;
-    }
-    let len = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
-    if len > 0 && len <= data.len() - 4 {
-        let slice = &data[4..4 + len];
-        let clean = slice.strip_suffix(&[0]).unwrap_or(slice);
-        std::str::from_utf8(clean)
-            .ok()
-            .map(|s| s.trim().to_string())
-    } else {
-        None
-    }
-}
-
-fn write_length_prefixed_string(s: &str) -> Vec<u8> {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(4 + bytes.len());
-    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-    out.extend_from_slice(bytes);
-    out
-}
-
 fn read_scale_vector(data: &[u8]) -> Option<[f32; 3]> {
     if data.len() >= 12 {
         let mut cur = Cursor::new(data);
@@ -264,7 +240,6 @@ fn write_scale_vector(s: [f32; 3]) -> Vec<u8> {
 fn parse_mesh_material_bindings(chunk_data: &[u8]) -> Vec<MeshMaterialBindingJson> {
     let mut bindings = Vec::new();
 
-    // Payload can be wrapped in an untyped container with magic 0x01, 0x01, 0x00
     let elements = if let Ok((_, elems)) = parse_chunk_elements(chunk_data) {
         elems
     } else {

@@ -20,17 +20,44 @@ impl TextureFormat {
 
 /// Software decoder for raw Overlord DXT and uncompressed textures into a 32-bit RGBA pixel buffer.
 pub fn decode_to_rgba(width: u32, height: u32, format: TextureFormat, data: &[u8]) -> Vec<u8> {
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+
+    let expected_len = match (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|px| px.checked_mul(4))
+    {
+        Some(len) => len,
+        None => return Vec::new(),
+    };
+
     if format == TextureFormat::UncompressedRGBA {
         // Direct3D 9 and TGA store 32-bit uncompressed pixels in BGRA order.
         // Slint's Rgba8Pixel expects RGBA order. Swap Blue and Red.
-        let mut rgba = Vec::with_capacity(data.len());
-        for &[b, g, r, a] in data.as_chunks::<4>().0 {
-            rgba.extend_from_slice(&[r, g, b, a]);
+        let mut rgba = vec![0u8; expected_len];
+        let pixel_count = (width * height) as usize;
+
+        let src_chunks = data.as_chunks::<4>().0;
+        let to_copy = src_chunks.len().min(pixel_count);
+
+        for (i, &[b, g, r, a]) in src_chunks.iter().take(to_copy).enumerate() {
+            let out_idx = i * 4;
+            rgba[out_idx] = r;
+            rgba[out_idx + 1] = g;
+            rgba[out_idx + 2] = b;
+            rgba[out_idx + 3] = a;
         }
+
+        // Fill remaining alpha channel if source data was truncated
+        for i in to_copy..pixel_count {
+            rgba[i * 4 + 3] = 255;
+        }
+
         return rgba;
     }
 
-    let mut rgba = vec![0u8; (width * height * 4) as usize];
+    let mut rgba = vec![0u8; expected_len];
     let block_count_x = width.div_ceil(4);
     let block_count_y = height.div_ceil(4);
 
@@ -74,6 +101,10 @@ fn decode_dxt_block(
     out: &mut [u8],
 ) {
     let color_offset = if is_dxt1 { 0 } else { 8 };
+    if color_offset + 8 > block.len() {
+        return;
+    }
+
     let c0_raw = u16::from_le_bytes([block[color_offset], block[color_offset + 1]]);
     let c1_raw = u16::from_le_bytes([block[color_offset + 2], block[color_offset + 3]]);
 
@@ -169,7 +200,9 @@ fn decode_dxt_block(
             }
 
             let idx = ((py * img_w + px) * 4) as usize;
-            out[idx..idx + 4].copy_from_slice(&pixel);
+            if idx + 4 <= out.len() {
+                out[idx..idx + 4].copy_from_slice(&pixel);
+            }
         }
     }
 }

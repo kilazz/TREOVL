@@ -1,5 +1,5 @@
 use super::parse_chunk_elements;
-use super::terrain::export_terrain_to_glb;
+use super::terrain::{add_terrain_to_builder, parse_terrain_geometry};
 use crate::engine::math::Vector3;
 use crate::utils::gltf_builder::GltfBuilder;
 use anyhow::{Context, Result};
@@ -102,7 +102,7 @@ pub fn parse_omp_map(chunk_data: &[u8]) -> Result<MapInfo> {
 }
 
 // -------------------------------------------------------------
-// STANDARD LEVEL EXPORTER (WITH MARKER PYRAMIDS)
+// STANDARD LEVEL EXPORTER (CORRECT GLTF 2.0 SCENE)
 // -------------------------------------------------------------
 
 pub fn export_level_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>> {
@@ -120,10 +120,21 @@ pub fn export_level_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>> {
         .map(|(_, d)| d.as_slice())
         .context("Map does not contain Terrain chunk (ID 20)")?;
 
-    let (terrain_glb, _, _) = export_terrain_to_glb(terrain_chunk)?;
     let map_info = parse_omp_map(chunk_data)?;
+    let terrain_geom = parse_terrain_geometry(terrain_chunk)?;
 
-    let mut marker_bin = Vec::new();
+    let mut builder = GltfBuilder::new();
+    let mut scene_nodes = Vec::new();
+
+    // 1. Terrain Mesh
+    let terrain_node = add_terrain_to_builder(
+        &mut builder,
+        &terrain_geom,
+        &format!("Terrain_{}", map_info.map_name),
+    )?;
+    scene_nodes.push(terrain_node);
+
+    // 2. Geometry for Entity Locators (3D Pyramid)
     let marker_verts: [[f32; 3]; 5] = [
         [0.0, 3.0, 0.0],
         [-1.0, 0.0, -1.0],
@@ -133,124 +144,72 @@ pub fn export_level_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>> {
     ];
     let marker_indices: [u16; 18] = [0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 1, 1, 3, 2, 1, 4, 3];
 
-    let marker_idx_offset = marker_bin.len();
+    let mut marker_idx_bytes = Vec::with_capacity(marker_indices.len() * 2);
     for idx in marker_indices {
-        marker_bin.write_u16::<LittleEndian>(idx)?;
+        marker_idx_bytes.write_u16::<LittleEndian>(idx)?;
     }
-    while !marker_bin.len().is_multiple_of(4) {
-        marker_bin.push(0);
-    }
-    let marker_idx_len = marker_indices.len() * 2;
+    let m_idx_view = builder.add_buffer_view(&marker_idx_bytes, Some(34963));
+    let m_idx_acc =
+        builder.add_accessor(m_idx_view, marker_indices.len(), 5123, "SCALAR", None, None);
 
-    let marker_pos_offset = marker_bin.len();
+    let mut marker_pos_bytes = Vec::with_capacity(marker_verts.len() * 12);
     for v in marker_verts {
-        marker_bin.write_f32::<LittleEndian>(v[0])?;
-        marker_bin.write_f32::<LittleEndian>(v[1])?;
-        marker_bin.write_f32::<LittleEndian>(v[2])?;
+        marker_pos_bytes.write_f32::<LittleEndian>(v[0])?;
+        marker_pos_bytes.write_f32::<LittleEndian>(v[1])?;
+        marker_pos_bytes.write_f32::<LittleEndian>(v[2])?;
     }
-    while !marker_bin.len().is_multiple_of(4) {
-        marker_bin.push(0);
-    }
-    let marker_pos_len = marker_verts.len() * 12;
+    let m_pos_view = builder.add_buffer_view(&marker_pos_bytes, Some(34962));
+    let m_pos_acc = builder.add_accessor(
+        m_pos_view,
+        marker_verts.len(),
+        5126,
+        "VEC3",
+        Some(vec![-1.0, 0.0, -1.0]),
+        Some(vec![1.0, 3.0, 1.0]),
+    );
 
-    let mut nodes = Vec::new();
-    let mut scene_nodes = Vec::new();
-
-    scene_nodes.push(0);
-    nodes.push(json!({
-        "name": format!("Terrain_{}", map_info.map_name),
-        "mesh": 0
+    let marker_mesh = builder.add_mesh(json!({
+        "name": "EntityMarker",
+        "primitives": [{
+            "attributes": { "POSITION": m_pos_acc },
+            "indices": m_idx_acc,
+            "mode": 4
+        }]
     }));
 
+    // 3. Player Spawn Locator
     if let Some(spawn) = map_info.player_spawn {
-        let node_id = nodes.len();
-        scene_nodes.push(node_id);
-        nodes.push(json!({
+        let spawn_node = builder.add_node(json!({
             "name": "Player_Start_Location",
-            "mesh": 1,
+            "mesh": marker_mesh,
             "translation": [spawn.x, spawn.y, spawn.z]
         }));
+        scene_nodes.push(spawn_node);
     }
 
+    // 4. Placed Entities
     for (i, ent) in map_info.entities.iter().enumerate() {
-        let node_id = nodes.len();
-        scene_nodes.push(node_id);
-        nodes.push(json!({
+        let ent_node = builder.add_node(json!({
             "name": format!("{}_{}", ent.name, i + 1),
-            "mesh": 1,
+            "mesh": marker_mesh,
             "translation": [0.0, 5.0 + (i as f32 * 2.0), 0.0]
         }));
+        scene_nodes.push(ent_node);
     }
 
-    let level_gltf = json!({
-        "asset": {
-            "version": "2.0",
-            "generator": "Overlord Modding Studio Level Exporter"
-        },
-        "scene": 0,
-        "scenes": [{ "nodes": scene_nodes }],
-        "nodes": nodes,
-        "meshes": [
-            {
-                "name": "TerrainMesh",
-                "primitives": [{
-                    "attributes": { "POSITION": 1, "COLOR_0": 2 },
-                    "indices": 0,
-                    "mode": 4
-                }]
-            },
-            {
-                "name": "EntityMarker",
-                "primitives": [{
-                    "attributes": { "POSITION": 4 },
-                    "indices": 3,
-                    "mode": 4
-                }]
-            }
-        ],
-        "buffers": [{ "byteLength": terrain_glb.len() + marker_bin.len() }],
-        "bufferViews": [
-            { "buffer": 0, "byteOffset": marker_idx_offset, "byteLength": marker_idx_len, "target": 34963 },
-            { "buffer": 0, "byteOffset": marker_pos_offset, "byteLength": marker_pos_len, "target": 34962 }
-        ],
-        "accessors": [
-            { "bufferView": 0, "byteOffset": 0, "componentType": 5123, "count": 18, "type": "SCALAR" },
-            { "bufferView": 1, "byteOffset": 0, "componentType": 5126, "count": 5, "type": "VEC3", "min": [-1.0, 0.0, -1.0], "max": [1.0, 3.0, 1.0] }
-        ]
-    });
-
-    let mut json_bytes = serde_json::to_vec(&level_gltf)?;
-    while !json_bytes.len().is_multiple_of(4) {
-        json_bytes.push(b' ');
-    }
-
-    let total_length = 12 + 8 + json_bytes.len() + 8 + marker_bin.len();
-    let mut glb = Vec::with_capacity(total_length);
-
-    glb.extend_from_slice(b"glTF");
-    glb.write_u32::<LittleEndian>(2)?;
-    glb.write_u32::<LittleEndian>(total_length as u32)?;
-
-    glb.write_u32::<LittleEndian>(json_bytes.len() as u32)?;
-    glb.extend_from_slice(b"JSON");
-    glb.extend_from_slice(&json_bytes);
-
-    glb.write_u32::<LittleEndian>(marker_bin.len() as u32)?;
-    glb.extend_from_slice(b"BIN\0");
-    glb.extend_from_slice(&marker_bin);
-
-    Ok(glb)
+    builder.add_scene(scene_nodes);
+    builder.build("Overlord Modding Studio Level Exporter")
 }
 
 // -------------------------------------------------------------
-// FULL LEVEL SCENE ASSEMBLER (WITH REAL 3D MODEL INSTANCES)
+// FULL LEVEL SCENE ASSEMBLER
 // -------------------------------------------------------------
 
 pub fn assemble_level_scene_glb(omp_data: &[u8], assets_dir: &Path) -> Result<Vec<u8>> {
     let map_info = parse_omp_map(omp_data)?;
     let mut builder = GltfBuilder::new();
+    let mut scene_nodes = Vec::new();
 
-    // 1. Add Level Terrain Mesh
     let payload = if omp_data.starts_with(b"OMP") && omp_data.len() > 43 {
         &omp_data[43..]
     } else {
@@ -258,21 +217,22 @@ pub fn assemble_level_scene_glb(omp_data: &[u8], assets_dir: &Path) -> Result<Ve
     };
     let (_, elements) = parse_chunk_elements(payload)?;
 
-    if let Some((_, terr_data)) = elements.iter().find(|(id, _)| *id == 20) {
-        let (terr_glb, _, _) = crate::engine::assets::terrain::export_terrain_to_glb(terr_data)?;
-        let terr_view = builder.add_buffer_view(&terr_glb, None);
-        let _ = builder.add_accessor(terr_view, 1, 5126, "VEC3", None, None);
-        builder.add_node(json!({ "name": format!("Terrain_{}", map_info.map_name) }));
+    // 1. Correctly include terrain geometry
+    if let Some((_, terr_data)) = elements.iter().find(|(id, _)| *id == 20)
+        && let Ok(terrain_geom) = parse_terrain_geometry(terr_data)
+    {
+        let terr_node = add_terrain_to_builder(
+            &mut builder,
+            &terrain_geom,
+            &format!("Terrain_{}", map_info.map_name),
+        )?;
+        scene_nodes.push(terr_node);
     }
 
-    // 2. Scan and Instance Real 3D Entities from assets/meshes
+    // 2. Scan and Instance Entities from assets/meshes
     let meshes_dir = assets_dir.join("meshes");
-    let mut scene_nodes = vec![0];
 
     for (i, ent) in map_info.entities.iter().enumerate() {
-        let node_id = scene_nodes.len();
-        scene_nodes.push(node_id);
-
         let mut model_name = format!("{}_{}", ent.name, i + 1);
         if meshes_dir.exists()
             && let Ok(entries) = std::fs::read_dir(&meshes_dir)
@@ -288,10 +248,16 @@ pub fn assemble_level_scene_glb(omp_data: &[u8], assets_dir: &Path) -> Result<Ve
             }
         }
 
-        builder.add_node(json!({
+        let node_id = builder.add_node(json!({
             "name": model_name,
             "translation": [0.0, 5.0 + (i as f32 * 2.0), 0.0]
         }));
+        scene_nodes.push(node_id);
+    }
+
+    if scene_nodes.is_empty() {
+        let empty_node = builder.add_node(json!({ "name": "EmptyMap" }));
+        scene_nodes.push(empty_node);
     }
 
     builder.add_scene(scene_nodes);

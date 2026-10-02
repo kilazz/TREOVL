@@ -6,6 +6,7 @@ use std::io::Cursor;
 use super::{
     build_chunk_from_elements, build_typed_container, parse_chunk_elements, parse_typed_container,
 };
+use crate::engine::common::{read_length_prefixed_string, write_length_prefixed_string};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct VfxGraphJson {
@@ -268,7 +269,7 @@ fn parse_single_emitter(data: &[u8]) -> Result<VfxEmitterJson> {
             _ => {}
         }
 
-        // Автодекодирование 3D-векторов (12 байт = 3x f32)
+        // Auto-decode 3D vectors (12 bytes = 3x f32)
         if ptype == "hex" && chunk.len() == 12 {
             let mut cur = Cursor::new(&chunk);
             if let (Ok(x), Ok(y), Ok(z)) = (
@@ -288,7 +289,7 @@ fn parse_single_emitter(data: &[u8]) -> Result<VfxEmitterJson> {
             }
         }
 
-        // Автодекодирование 4D-векторов (16 байт = 4x f32)
+        // Auto-decode 4D vectors (16 bytes = 4x f32)
         if ptype == "hex" && chunk.len() == 16 {
             let mut cur = Cursor::new(&chunk);
             if let (Ok(x), Ok(y), Ok(z), Ok(w)) = (
@@ -310,7 +311,7 @@ fn parse_single_emitter(data: &[u8]) -> Result<VfxEmitterJson> {
             }
         }
 
-        // Автодекодирование 4-байтовых чисел (Float / Uint / Color)
+        // Auto-decode 4-byte numbers (Float / Uint / Color)
         if ptype == "hex" && chunk.len() == 4 {
             if (40..=48).contains(&id) {
                 color_hex = Some(hex::encode_upper(&chunk));
@@ -345,7 +346,7 @@ fn parse_single_emitter(data: &[u8]) -> Result<VfxEmitterJson> {
             }
         }
 
-        // Автодекодирование 1- и 2-байтовых целых чисел / флагов
+        // Auto-decode 1- and 2-byte integers / flags
         if ptype == "hex" && (chunk.len() == 1 || chunk.len() == 2) {
             let mut val = 0u32;
             for (b_i, &byte) in chunk.iter().enumerate() {
@@ -537,28 +538,4 @@ fn get_vfx_property_role(id: u32) -> &'static str {
         1 => "Nested Sub-Emitter Layers",
         _ => "Emitter Parameter",
     }
-}
-
-fn read_length_prefixed_string(data: &[u8]) -> Option<String> {
-    if data.len() < 4 {
-        return None;
-    }
-    let len = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
-    if len > 0 && len <= data.len() - 4 {
-        let slice = &data[4..4 + len];
-        let clean = slice.strip_suffix(&[0]).unwrap_or(slice);
-        std::str::from_utf8(clean)
-            .ok()
-            .map(|s| s.trim().to_string())
-    } else {
-        None
-    }
-}
-
-fn write_length_prefixed_string(s: &str) -> Vec<u8> {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(4 + bytes.len());
-    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-    out.extend_from_slice(bytes);
-    out
 }

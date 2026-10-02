@@ -33,7 +33,6 @@ pub struct ObjectBone {
     pub rotation: Vector4,
     pub translation: Vector3,
 
-    // Точная структура 20 байт иерархии кости Overlord
     pub bone_id: i32,
     pub skin_id: i32,
     pub parent_index: i32,
@@ -41,18 +40,15 @@ pub struct ObjectBone {
     pub first_child_index: i32,
 }
 
-/// Извлекает массив всех костей из любых чанков мешей (ID 13) и объектов (ID 33/22)
 pub fn parse_object_bone_container(data: &[u8]) -> Result<Vec<ObjectBone>> {
     let mut candidate_offsets = Vec::new();
 
-    // 1. Поиск по сигнатурам корневых костей (Root, Bip01) в бинарнике
     for (idx, window) in data.windows(5).enumerate() {
         if window == b"Root\0" || window == b"Root " || window == b"Bip01" {
             candidate_offsets.push(idx);
         }
     }
 
-    // 2. Поиск по подконтейнерам (ID 13, 33, 22)
     if let Ok((_, typed_elements)) = super::parse_typed_container(data) {
         for (id, chunk) in typed_elements {
             if id == 1
@@ -463,82 +459,51 @@ pub fn export_animation_to_json(chunk_data: &[u8]) -> Result<String> {
 
 pub fn export_animation_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>> {
     let clip = parse_animation_clip(chunk_data)?;
+    let mut builder = GltfBuilder::new();
 
-    let mut bin_data = Vec::new();
-    let mut nodes = Vec::new();
     let mut channels = Vec::new();
     let mut samplers = Vec::new();
-    let mut buffer_views = Vec::new();
-    let mut accessors = Vec::new();
-
-    let armature_node_id = 0;
     let mut bone_indices = Vec::new();
 
-    for track in &clip.bone_tracks {
-        let bone_node_id = nodes.len() + 1;
+    for (i, track) in clip.bone_tracks.iter().enumerate() {
+        let bone_node_id = i + 1; // 0 is reserved for Armature root
         bone_indices.push(bone_node_id);
 
-        nodes.push(json!({ "name": track.bone_name }));
-
         if !track.translations.is_empty() {
-            let time_offset = bin_data.len();
+            let mut time_bytes = Vec::with_capacity(track.translations.len() * 4);
             let mut min_time = f32::INFINITY;
             let mut max_time = f32::NEG_INFINITY;
 
             for t in &track.translations {
                 let ts = sanitize_f32(t.time_seconds, 0.0);
-                bin_data.write_f32::<LittleEndian>(ts)?;
+                time_bytes.write_f32::<LittleEndian>(ts)?;
                 min_time = min_time.min(ts);
                 max_time = max_time.max(ts);
             }
-            while !bin_data.len().is_multiple_of(4) {
-                bin_data.push(0);
-            }
-            let time_len = track.translations.len() * 4;
+            let time_view = builder.add_buffer_view(&time_bytes, None);
+            let time_acc = builder.add_accessor(
+                time_view,
+                track.translations.len(),
+                5126,
+                "SCALAR",
+                Some(vec![min_time]),
+                Some(vec![max_time]),
+            );
 
-            let val_offset = bin_data.len();
+            let mut val_bytes = Vec::with_capacity(track.translations.len() * 12);
             for t in &track.translations {
-                bin_data.write_f32::<LittleEndian>(sanitize_f32(t.position.x, 0.0))?;
-                bin_data.write_f32::<LittleEndian>(sanitize_f32(t.position.y, 0.0))?;
-                bin_data.write_f32::<LittleEndian>(sanitize_f32(t.position.z, 0.0))?;
+                val_bytes.write_f32::<LittleEndian>(sanitize_f32(t.position.x, 0.0))?;
+                val_bytes.write_f32::<LittleEndian>(sanitize_f32(t.position.y, 0.0))?;
+                val_bytes.write_f32::<LittleEndian>(sanitize_f32(t.position.z, 0.0))?;
             }
-            while !bin_data.len().is_multiple_of(4) {
-                bin_data.push(0);
-            }
-            let val_len = track.translations.len() * 12;
-
-            let time_bv_idx = buffer_views.len();
-            buffer_views
-                .push(json!({ "buffer": 0, "byteOffset": time_offset, "byteLength": time_len }));
-
-            let val_bv_idx = buffer_views.len();
-            buffer_views
-                .push(json!({ "buffer": 0, "byteOffset": val_offset, "byteLength": val_len }));
-
-            let time_acc_idx = accessors.len();
-            accessors.push(json!({
-                "bufferView": time_bv_idx,
-                "byteOffset": 0,
-                "componentType": 5126,
-                "count": track.translations.len(),
-                "type": "SCALAR",
-                "min": [min_time],
-                "max": [max_time]
-            }));
-
-            let val_acc_idx = accessors.len();
-            accessors.push(json!({
-                "bufferView": val_bv_idx,
-                "byteOffset": 0,
-                "componentType": 5126,
-                "count": track.translations.len(),
-                "type": "VEC3"
-            }));
+            let val_view = builder.add_buffer_view(&val_bytes, None);
+            let val_acc =
+                builder.add_accessor(val_view, track.translations.len(), 5126, "VEC3", None, None);
 
             let sampler_idx = samplers.len();
             samplers.push(json!({
-                "input": time_acc_idx,
-                "output": val_acc_idx,
+                "input": time_acc,
+                "output": val_acc,
                 "interpolation": "LINEAR"
             }));
 
@@ -552,70 +517,46 @@ pub fn export_animation_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>> {
         }
 
         if !track.rotations.is_empty() {
-            let time_offset = bin_data.len();
+            let mut time_bytes = Vec::with_capacity(track.rotations.len() * 4);
             let mut min_time = f32::INFINITY;
             let mut max_time = f32::NEG_INFINITY;
 
             for r in &track.rotations {
                 let ts = sanitize_f32(r.time_seconds, 0.0);
-                bin_data.write_f32::<LittleEndian>(ts)?;
+                time_bytes.write_f32::<LittleEndian>(ts)?;
                 min_time = min_time.min(ts);
                 max_time = max_time.max(ts);
             }
-            while !bin_data.len().is_multiple_of(4) {
-                bin_data.push(0);
-            }
-            let time_len = track.rotations.len() * 4;
+            let time_view = builder.add_buffer_view(&time_bytes, None);
+            let time_acc = builder.add_accessor(
+                time_view,
+                track.rotations.len(),
+                5126,
+                "SCALAR",
+                Some(vec![min_time]),
+                Some(vec![max_time]),
+            );
 
-            let val_offset = bin_data.len();
+            let mut val_bytes = Vec::with_capacity(track.rotations.len() * 16);
             for r in &track.rotations {
-                bin_data.write_f32::<LittleEndian>(sanitize_f32(r.rotation_quat.x, 0.0))?;
-                bin_data.write_f32::<LittleEndian>(sanitize_f32(r.rotation_quat.y, 0.0))?;
-                bin_data.write_f32::<LittleEndian>(sanitize_f32(r.rotation_quat.z, 0.0))?;
+                val_bytes.write_f32::<LittleEndian>(sanitize_f32(r.rotation_quat.x, 0.0))?;
+                val_bytes.write_f32::<LittleEndian>(sanitize_f32(r.rotation_quat.y, 0.0))?;
+                val_bytes.write_f32::<LittleEndian>(sanitize_f32(r.rotation_quat.z, 0.0))?;
                 let qw = if r.rotation_quat.w.is_finite() && r.rotation_quat.w != 0.0 {
                     r.rotation_quat.w
                 } else {
                     1.0
                 };
-                bin_data.write_f32::<LittleEndian>(qw)?;
+                val_bytes.write_f32::<LittleEndian>(qw)?;
             }
-            while !bin_data.len().is_multiple_of(4) {
-                bin_data.push(0);
-            }
-            let val_len = track.rotations.len() * 16;
-
-            let time_bv_idx = buffer_views.len();
-            buffer_views
-                .push(json!({ "buffer": 0, "byteOffset": time_offset, "byteLength": time_len }));
-
-            let val_bv_idx = buffer_views.len();
-            buffer_views
-                .push(json!({ "buffer": 0, "byteOffset": val_offset, "byteLength": val_len }));
-
-            let time_acc_idx = accessors.len();
-            accessors.push(json!({
-                "bufferView": time_bv_idx,
-                "byteOffset": 0,
-                "componentType": 5126,
-                "count": track.rotations.len(),
-                "type": "SCALAR",
-                "min": [min_time],
-                "max": [max_time]
-            }));
-
-            let val_acc_idx = accessors.len();
-            accessors.push(json!({
-                "bufferView": val_bv_idx,
-                "byteOffset": 0,
-                "componentType": 5126,
-                "count": track.rotations.len(),
-                "type": "VEC4"
-            }));
+            let val_view = builder.add_buffer_view(&val_bytes, None);
+            let val_acc =
+                builder.add_accessor(val_view, track.rotations.len(), 5126, "VEC4", None, None);
 
             let sampler_idx = samplers.len();
             samplers.push(json!({
-                "input": time_acc_idx,
-                "output": val_acc_idx,
+                "input": time_acc,
+                "output": val_acc,
                 "interpolation": "LINEAR"
             }));
 
@@ -629,53 +570,26 @@ pub fn export_animation_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>> {
         }
     }
 
-    let mut all_nodes = vec![json!({
+    builder.add_node(json!({
         "name": format!("{}_Armature", clip.name),
         "children": bone_indices
-    })];
-    all_nodes.extend(nodes);
+    }));
 
-    let gltf_json = json!({
-        "asset": {
-            "version": "2.0",
-            "generator": "Overlord Modding Studio Skeletal Animation Exporter"
-        },
-        "scene": 0,
-        "scenes": [{ "nodes": [armature_node_id] }],
-        "nodes": all_nodes,
-        "skins": [{
-            "name": format!("{}_Skin", clip.target_rig),
-            "joints": bone_indices
-        }],
-        "animations": [{
-            "name": clip.name,
-            "channels": channels,
-            "samplers": samplers
-        }],
-        "buffers": [{ "byteLength": bin_data.len() }],
-        "bufferViews": buffer_views,
-        "accessors": accessors
-    });
-
-    let mut json_bytes = serde_json::to_vec(&gltf_json)?;
-    while !json_bytes.len().is_multiple_of(4) {
-        json_bytes.push(b' ');
+    for track in &clip.bone_tracks {
+        builder.add_node(json!({ "name": track.bone_name }));
     }
 
-    let total_length = 12 + 8 + json_bytes.len() + 8 + bin_data.len();
-    let mut glb = Vec::with_capacity(total_length);
+    builder.add_skin(json!({
+        "name": format!("{}_Skin", clip.target_rig),
+        "joints": bone_indices
+    }));
 
-    glb.extend_from_slice(b"glTF");
-    glb.write_u32::<LittleEndian>(2)?;
-    glb.write_u32::<LittleEndian>(total_length as u32)?;
+    builder.add_animation(json!({
+        "name": clip.name,
+        "channels": channels,
+        "samplers": samplers
+    }));
 
-    glb.write_u32::<LittleEndian>(json_bytes.len() as u32)?;
-    glb.extend_from_slice(b"JSON");
-    glb.extend_from_slice(&json_bytes);
-
-    glb.write_u32::<LittleEndian>(bin_data.len() as u32)?;
-    glb.extend_from_slice(b"BIN\0");
-    glb.extend_from_slice(&bin_data);
-
-    Ok(glb)
+    builder.add_scene(vec![0]);
+    builder.build("Overlord Modding Studio Skeletal Animation Exporter")
 }

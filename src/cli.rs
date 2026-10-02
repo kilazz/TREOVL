@@ -3,21 +3,15 @@ use clap::{Parser, Subcommand};
 use std::fs;
 use std::path::PathBuf;
 
-use crate::engine::assets::animation::{
-    export_animation_to_glb, export_animation_to_json, parse_animation_clip,
-};
+use crate::engine::assets::animation::parse_animation_clip;
 use crate::engine::assets::lua::{disassemble_lua_bytecode, inspect_lua_bytecode};
 use crate::engine::assets::map::{assemble_level_scene_glb, export_level_to_glb, parse_omp_map};
-use crate::engine::assets::mesh::{
-    export_mesh_to_glb, export_mesh_to_obj, import_glb_to_mesh, import_obj_to_mesh,
-};
 use crate::engine::assets::shader::{ShaderType, export_shader};
-use crate::engine::assets::terrain::export_terrain_to_glb;
-use crate::engine::assets::texture::{export_to_dds, replace_texture_in_chunk};
 use crate::engine::container::project::{pack_archive, unpack_archive};
 use crate::engine::container::sync::{
     clean_rebuild_project, export_smart_assets, revert_single_asset, sync_assets_to_chunks,
 };
+use crate::engine::service;
 use crate::utils::diff::{apply_patch, create_diff};
 
 #[derive(Parser)]
@@ -47,6 +41,9 @@ pub enum Commands {
         project_dir: PathBuf,
         /// Output .prp archive file
         out_archive: PathBuf,
+        /// Zlib compression level: 0 = Store (Fastest, No compression), 1 = Fast, 6 = Balanced, 9 = Maximum
+        #[arg(short, long, default_value_t = 0)]
+        compression: u32,
     },
     /// Sync modified files from 'assets/' into 'chunks/' using vanilla baseline
     Sync {
@@ -211,9 +208,13 @@ pub fn handle_cli() -> Result<()> {
         Commands::Pack {
             project_dir,
             out_archive,
+            compression,
         } => {
-            let size = pack_archive(&project_dir, &out_archive)?;
-            println!("[+] Archive packed successfully ({} bytes).", size);
+            let size = pack_archive(&project_dir, &out_archive, compression)?;
+            println!(
+                "[+] Archive packed successfully ({} bytes, compression level: {}).",
+                size, compression
+            );
         }
         Commands::Sync { project_dir } => {
             let count = sync_assets_to_chunks(&project_dir)?;
@@ -235,41 +236,29 @@ pub fn handle_cli() -> Result<()> {
             println!("[+] Exported {} smart assets into 'assets/' folder.", count);
         }
         Commands::ExportGlb { mesh, output } => {
-            let data = fs::read(&mesh).with_context(|| format!("Failed to read {:?}", mesh))?;
-            let (glb, stats) = export_mesh_to_glb(&data)?;
-            fs::write(&output, glb)?;
+            let stats = service::export_mesh(&mesh, &output, true)?;
             println!(
                 "[+] glTF 2.0 Binary (.glb) exported ({} vertices, {} triangles, skinned: {}).",
                 stats.vertex_count, stats.triangle_count, stats.is_skinned
             );
         }
         Commands::ImportGlb { mesh, input } => {
-            let chunk = fs::read(&mesh)?;
-            let glb = fs::read(&input)?;
-            let new_bin = import_glb_to_mesh(&chunk, &glb)?;
-            fs::write(&mesh, new_bin)?;
+            service::import_mesh(&mesh, &input, true)?;
             println!("[+] Mesh chunk successfully updated from .glb (skinning preserved).");
         }
         Commands::ExportObj { mesh, output } => {
-            let data = fs::read(&mesh)?;
-            let (obj, stats) = export_mesh_to_obj(&data)?;
-            fs::write(&output, obj)?;
+            let stats = service::export_mesh(&mesh, &output, false)?;
             println!(
                 "[+] OBJ exported ({} vertices, {} triangles, stride: {} bytes).",
                 stats.vertex_count, stats.triangle_count, stats.stride
             );
         }
         Commands::ImportObj { mesh, input } => {
-            let chunk = fs::read(&mesh)?;
-            let obj = fs::read_to_string(&input)?;
-            let new_bin = import_obj_to_mesh(&chunk, &obj)?;
-            fs::write(&mesh, new_bin)?;
+            service::import_mesh(&mesh, &input, false)?;
             println!("[+] Mesh chunk successfully updated from OBJ.");
         }
         Commands::ExportTerrainGlb { terrain, output } => {
-            let data = fs::read(&terrain)?;
-            let (glb, v_count, tri_count) = export_terrain_to_glb(&data)?;
-            fs::write(&output, glb)?;
+            let (v_count, tri_count) = service::export_terrain(&terrain, &output, true)?;
             println!(
                 "[+] Terrain exported to .glb with Vertex Colors ({} vertices, {} triangles).",
                 v_count, tri_count
@@ -295,15 +284,11 @@ pub fn handle_cli() -> Result<()> {
             );
         }
         Commands::ExportAnim { anim, output } => {
-            let data = fs::read(&anim)?;
-            let glb = export_animation_to_glb(&data)?;
-            fs::write(&output, glb)?;
+            service::export_anim_glb(&anim, &output)?;
             println!("[+] Animation exported to glTF 2.0 (.glb) with timeline channels.");
         }
         Commands::ExportAnimJson { anim, output } => {
-            let data = fs::read(&anim)?;
-            let json_str = export_animation_to_json(&data)?;
-            fs::write(&output, json_str)?;
+            service::export_anim_json(&anim, &output)?;
             println!("[+] Animation keyframes exported to JSON.");
         }
         Commands::InspectAnim { anim } => {
@@ -363,16 +348,11 @@ pub fn handle_cli() -> Result<()> {
             }
         }
         Commands::ExportDds { texture, output } => {
-            let data = fs::read(&texture)?;
-            let dds = export_to_dds(&data)?;
-            fs::write(&output, dds)?;
+            service::export_texture(&texture, &output)?;
             println!("[+] Image exported to {:?}", output);
         }
         Commands::ImportDds { texture, input } => {
-            let chunk = fs::read(&texture)?;
-            let dds = fs::read(&input)?;
-            let new_bin = replace_texture_in_chunk(&chunk, &dds)?;
-            fs::write(&texture, new_bin)?;
+            service::import_texture(&texture, &input)?;
             println!("[+] Texture chunk successfully updated from DDS.");
         }
         Commands::ExportShader { shader, out_dir } => {
