@@ -23,7 +23,7 @@ impl UiLogger {
             if let Ok(mut file) = OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open("OVLTool.log")
+                .open("TREOVL.log")
             {
                 let _ = file.write_all(formatted.as_bytes());
             }

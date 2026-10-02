@@ -22,6 +22,7 @@ pub enum AssetKind {
     Attachment = 16,
     FaceFx = 17,
     Character = 18,
+    Collision = 19,
 }
 
 impl AssetKind {
@@ -36,6 +37,7 @@ impl AssetKind {
             Self::Object | Self::Character | Self::Attachment => 7,
             Self::Animation => 8,
             Self::TerrainPalette => 9,
+            Self::Collision => 10,
             _ => 5,
         }
     }
@@ -176,7 +178,14 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
         || (data.len() >= 4 && data[2] == 0x40 && (data[1] == 0x00 || data[1] == 0x59))
     {
         (AssetKind::Material, "Shader Material (TREMaterial)", "🛠️")
-    // Priority 16: Miscellaneous Engine Structures
+    // Priority 16: Collision Bounds (.clb)
+    } else if filename_hint.to_lowercase().ends_with(".clb")
+        || data[..data.len().min(1024)]
+            .windows(4)
+            .any(|w| w == b".clb")
+    {
+        (AssetKind::Collision, "Collision Boundary (.clb)", "🧱")
+    // Priority 17: Miscellaneous Engine Structures
     } else if magic_bytes == b"\x4E\x00\x41\x00" {
         (AssetKind::Generic, "Scene Node / Transform", "📍")
     } else if data[..data.len().min(1024)]
@@ -184,11 +193,6 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
         .any(|w| w == b"<?xml")
     {
         (AssetKind::Xml, "XML Document", "📋")
-    } else if data[..data.len().min(1024)]
-        .windows(4)
-        .any(|w| w == b".clb")
-    {
-        (AssetKind::Parameter, "Collision Bounds (.clb)", "🧱")
     } else if data.len() <= 64 {
         (AssetKind::Parameter, "Engine Parameter", "⚙️")
     } else {
@@ -215,7 +219,7 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
     }
 }
 
-/// Fast header metadata scanner that inspects the first 4 KB to prevent CPU stalls on large assets.
+/// Fast header metadata scanner inspecting the first 4 KB to prevent CPU stalls on large assets.
 fn extract_internal_strings(data: &[u8]) -> Option<String> {
     let scan_limit = data.len().min(4096);
     let header_slice = &data[..scan_limit];

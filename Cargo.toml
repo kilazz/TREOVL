@@ -1,15 +1,15 @@
 [package]
-name = "TREOLTool"
+name = "TREOVL"
 version = "1.0.0"
 edition = "2024"
 build = "build.rs"
 
 [lib]
-name = "OVLTool"
+name = "TREOVL"
 path = "src/lib.rs"
 
 [[bin]]
-name = "OVLTool"
+name = "TREOVL"
 path = "src/main.rs"
 
 [dependencies]

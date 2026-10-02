@@ -435,6 +435,70 @@ impl AssetProcessor for EventProcessor {
     }
 }
 
+pub struct CollisionProcessor;
+impl AssetProcessor for CollisionProcessor {
+    fn process(
+        &self,
+        data: &[u8],
+        stem: &str,
+        sniffed: &SniffedAsset,
+        workspace: &ProjectWorkspace,
+    ) -> Result<Option<(String, AssetSyncEntry)>> {
+        if sniffed.kind != AssetKind::Collision {
+            return Ok(None);
+        }
+
+        let json_str = crate::engine::assets::collision::export_collision_to_json(data, stem)?;
+        let out_name = build_asset_filename(&sniffed.display_name, stem, "json");
+
+        let col_dir = workspace.assets_dir.join("collisions");
+        fs::create_dir_all(&col_dir)?;
+        fs::write(col_dir.join(&out_name), json_str.as_bytes())?;
+
+        Ok(Some((
+            format!("assets/collisions/{}", out_name),
+            AssetSyncEntry {
+                chunk_rel_path: format!("chunks/{}.bin", stem),
+                asset_kind: "Collision".into(),
+                vanilla_crc32: calculate_crc32(json_str.as_bytes()),
+                is_modified: false,
+            },
+        )))
+    }
+}
+
+pub struct FontProcessor;
+impl AssetProcessor for FontProcessor {
+    fn process(
+        &self,
+        data: &[u8],
+        stem: &str,
+        sniffed: &SniffedAsset,
+        workspace: &ProjectWorkspace,
+    ) -> Result<Option<(String, AssetSyncEntry)>> {
+        if sniffed.kind != AssetKind::Font && !data.starts_with(b"\x72\x00\x41\x00") {
+            return Ok(None);
+        }
+
+        let json_str = crate::engine::assets::font::export_font_to_json(data)?;
+        let out_name = build_asset_filename(&sniffed.display_name, stem, "json");
+
+        let font_dir = workspace.assets_dir.join("fonts");
+        fs::create_dir_all(&font_dir)?;
+        fs::write(font_dir.join(&out_name), json_str.as_bytes())?;
+
+        Ok(Some((
+            format!("assets/fonts/{}", out_name),
+            AssetSyncEntry {
+                chunk_rel_path: format!("chunks/{}.bin", stem),
+                asset_kind: "Font".into(),
+                vanilla_crc32: calculate_crc32(json_str.as_bytes()),
+                is_modified: false,
+            },
+        )))
+    }
+}
+
 pub struct FaceFxProcessor;
 impl AssetProcessor for FaceFxProcessor {
     fn process(
@@ -637,6 +701,8 @@ pub fn get_standard_processors() -> Vec<Box<dyn AssetProcessor>> {
         Box::new(TerrainPaletteProcessor),
         Box::new(VfxProcessor),
         Box::new(EventProcessor),
+        Box::new(CollisionProcessor),
+        Box::new(FontProcessor),
         Box::new(FaceFxProcessor),
         Box::new(LuaProcessor),
         Box::new(XmlProcessor),

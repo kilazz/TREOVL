@@ -46,6 +46,8 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize> {
         "characters",
         "attachments",
         "terrain_palettes",
+        "collisions",
+        "fonts",
     ];
     for dir in dirs {
         fs::create_dir_all(workspace.assets_dir.join(dir))?;
@@ -230,6 +232,19 @@ pub fn sync_assets_to_chunks(project_dir: &Path) -> Result<usize> {
                     let json_str =
                         String::from_utf8(asset_bytes).context("Event JSON is not valid UTF-8")?;
                     crate::engine::assets::event::import_event_from_json(&json_str)?
+                }
+                "Collision" => {
+                    let json_str = String::from_utf8(asset_bytes)
+                        .context("Collision JSON is not valid UTF-8")?;
+                    crate::engine::assets::collision::import_collision_from_json(
+                        &json_str,
+                        &baseline_chunk,
+                    )?
+                }
+                "Font" => {
+                    let json_str =
+                        String::from_utf8(asset_bytes).context("Font JSON is not valid UTF-8")?;
+                    crate::engine::assets::font::import_font_from_json(&json_str, &baseline_chunk)?
                 }
                 "FaceFx" => {
                     let fxe_path = abs_asset_path.with_extension("fxe");

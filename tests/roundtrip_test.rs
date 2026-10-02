@@ -1,8 +1,8 @@
-use OVLTool::engine::assets::{build_chunk_from_elements, parse_chunk_elements};
-use OVLTool::engine::container::footer::{
+use TREOVL::engine::assets::{build_chunk_from_elements, parse_chunk_elements};
+use TREOVL::engine::container::footer::{
     MAGIC_FOOTER_1, MAGIC_FOOTER_2, calculate_triumph_crc32, check_footer,
 };
-use OVLTool::utils::gltf_builder::GltfBuilder;
+use TREOVL::utils::gltf_builder::GltfBuilder;
 
 #[test]
 fn test_triumph_crc32_and_footer() {

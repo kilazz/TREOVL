@@ -17,11 +17,18 @@ pub struct MapEntity {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct MapWaypoint {
+    pub name: String,
+    pub position: Vector3,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MapInfo {
     pub map_name: String,
     pub entity_count: usize,
     pub player_spawn: Option<Vector3>,
     pub entities: Vec<MapEntity>,
+    pub waypoints: Vec<MapWaypoint>,
 }
 
 pub fn parse_omp_map(chunk_data: &[u8]) -> Result<MapInfo> {
@@ -37,6 +44,7 @@ pub fn parse_omp_map(chunk_data: &[u8]) -> Result<MapInfo> {
     let mut entity_count = 0;
     let mut player_spawn = None;
     let mut entities = Vec::new();
+    let mut waypoints = Vec::new();
 
     for (id, chunk) in elements {
         match id {
@@ -73,6 +81,24 @@ pub fn parse_omp_map(chunk_data: &[u8]) -> Result<MapInfo> {
                     z: cur.read_f32::<LittleEndian>().unwrap_or(0.0),
                 });
             }
+            24 => {
+                if let Ok((_, wp_table)) = parse_chunk_elements(&chunk) {
+                    for (wid, wchunk) in wp_table {
+                        if wchunk.len() >= 12 {
+                            let mut cur = Cursor::new(&wchunk[0..12]);
+                            let pos = Vector3 {
+                                x: cur.read_f32::<LittleEndian>().unwrap_or(0.0),
+                                y: cur.read_f32::<LittleEndian>().unwrap_or(0.0),
+                                z: cur.read_f32::<LittleEndian>().unwrap_or(0.0),
+                            };
+                            waypoints.push(MapWaypoint {
+                                name: format!("Waypoint_{}", wid),
+                                position: pos,
+                            });
+                        }
+                    }
+                }
+            }
             34 => {
                 if let Some(s) = read_length_prefixed_string(&chunk) {
                     map_name = s;
@@ -87,6 +113,7 @@ pub fn parse_omp_map(chunk_data: &[u8]) -> Result<MapInfo> {
         entity_count,
         player_spawn,
         entities,
+        waypoints,
     })
 }
 
@@ -176,6 +203,15 @@ pub fn export_level_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>> {
             "translation": [0.0, 5.0 + (i as f32 * 2.0), 0.0]
         }));
         scene_nodes.push(ent_node);
+    }
+
+    for wp in &map_info.waypoints {
+        let wp_node = builder.add_node(json!({
+            "name": format!("AI_Path_{}", wp.name),
+            "mesh": marker_mesh,
+            "translation": [wp.position.x, wp.position.y, wp.position.z]
+        }));
+        scene_nodes.push(wp_node);
     }
 
     builder.add_scene(scene_nodes);

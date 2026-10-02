@@ -16,9 +16,9 @@ use crate::utils::diff::{apply_patch, create_diff};
 
 #[derive(Parser)]
 #[command(
-    name = "OVLTool",
+    name = "TREOVL",
     version = "1.0.0",
-    about = "Overlord Modding Studio CLI — Modern Reverse Engineering & Modding Toolkit",
+    about = "Triumph Engine Overlord Toolkit (TREOVL) — Modern Reverse Engineering & Modding Toolkit",
     long_about = None
 )]
 pub struct Cli {

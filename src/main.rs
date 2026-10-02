@@ -1,4 +1,4 @@
-use OVLTool::{cli, gui};
+use TREOVL::{cli, gui};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::args().len() > 1 {

@@ -4,6 +4,8 @@ use std::path::Path;
 
 use crate::engine::assets::animation::{export_animation_to_glb, export_animation_to_json};
 use crate::engine::assets::audio::{export_wav, replace_wav};
+use crate::engine::assets::collision::import_collision_from_json;
+use crate::engine::assets::font::import_font_from_json;
 use crate::engine::assets::lua::{compile_lua_script, extract_lua_bytecode, replace_lua_bytecode};
 use crate::engine::assets::material::import_material_from_json;
 use crate::engine::assets::mesh::{
@@ -137,6 +139,20 @@ pub fn save_object(chunk_path: &Path, json_data: &str) -> Result<()> {
 
 pub fn save_terrain_palette(chunk_path: &Path, json_data: &str) -> Result<()> {
     let bin = import_terrain_palette_from_json(json_data)?;
+    fs::write(chunk_path, bin)?;
+    Ok(())
+}
+
+pub fn save_collision(chunk_path: &Path, json_data: &str) -> Result<()> {
+    let baseline = fs::read(chunk_path)?;
+    let bin = import_collision_from_json(json_data, &baseline)?;
+    fs::write(chunk_path, bin)?;
+    Ok(())
+}
+
+pub fn save_font(chunk_path: &Path, json_data: &str) -> Result<()> {
+    let baseline = fs::read(chunk_path)?;
+    let bin = import_font_from_json(json_data, &baseline)?;
     fs::write(chunk_path, bin)?;
     Ok(())
 }
