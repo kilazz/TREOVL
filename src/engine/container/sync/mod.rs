@@ -170,7 +170,24 @@ pub fn sync_assets_to_chunks(project_dir: &Path) -> Result<usize> {
                     }
                 }
                 "Lua" => {
-                    crate::engine::assets::lua::replace_lua_bytecode(&baseline_chunk, &asset_bytes)?
+                    let bytecode = if rel_asset_path.ends_with(".lua") {
+                        // Auto-compile source code text to 32-bit bytecode using luac50.exe
+                        match crate::engine::assets::lua::compile_lua_script(&abs_asset_path) {
+                            Ok(compiled_bin) => compiled_bin,
+                            Err(e) => {
+                                eprintln!("[!] {}", e);
+                                let luac_path = abs_asset_path.with_extension("luac");
+                                if luac_path.exists() {
+                                    fs::read(luac_path)?
+                                } else {
+                                    bail!("Cannot sync Lua script: {}", e);
+                                }
+                            }
+                        }
+                    } else {
+                        asset_bytes
+                    };
+                    crate::engine::assets::lua::replace_lua_bytecode(&baseline_chunk, &bytecode)?
                 }
                 "UI" => {
                     let json_str =

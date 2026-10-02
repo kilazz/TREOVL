@@ -121,6 +121,7 @@ impl AssetProcessor for LuaProcessor {
         }
         let bytecode = crate::engine::assets::lua::extract_lua_bytecode(data)?;
         let out_name = build_asset_filename(&sniffed.display_name, stem, "luac");
+        let lua_source_name = build_asset_filename(&sniffed.display_name, stem, "lua");
 
         fs::write(
             workspace.assets_dir.join("scripts").join(&out_name),
@@ -137,22 +138,18 @@ impl AssetProcessor for LuaProcessor {
             );
         }
 
-        if let Ok(decompiled) = crate::engine::assets::lua::decompile_lua_bytecode(&bytecode) {
-            let _ = fs::write(
-                workspace
-                    .assets_dir
-                    .join("scripts")
-                    .join(format!("{}.decompiled.lua", out_name)),
-                decompiled,
-            );
-        }
+        let decompiled = crate::engine::assets::lua::decompile_lua_bytecode(&bytecode)
+            .unwrap_or_else(|_| "-- Decompilation failed, edit via bytecode disassembly".into());
+
+        let lua_path = workspace.assets_dir.join("scripts").join(&lua_source_name);
+        fs::write(&lua_path, decompiled.as_bytes())?;
 
         Ok(Some((
-            format!("assets/scripts/{}", out_name),
+            format!("assets/scripts/{}", lua_source_name),
             AssetSyncEntry {
                 chunk_rel_path: format!("chunks/{}.bin", stem),
                 asset_kind: "Lua".into(),
-                vanilla_crc32: calculate_crc32(&bytecode),
+                vanilla_crc32: calculate_crc32(decompiled.as_bytes()),
                 is_modified: false,
             },
         )))
@@ -418,6 +415,42 @@ impl AssetProcessor for EventProcessor {
     }
 }
 
+pub struct FaceFxProcessor;
+impl AssetProcessor for FaceFxProcessor {
+    fn process(
+        &self,
+        data: &[u8],
+        stem: &str,
+        sniffed: &SniffedAsset,
+        workspace: &ProjectWorkspace,
+    ) -> Result<Option<(String, AssetSyncEntry)>> {
+        if sniffed.kind != AssetKind::FaceFx {
+            return Ok(None);
+        }
+
+        let json_str = crate::engine::assets::facefx::export_facefx_to_json(
+            data,
+            &workspace.assets_dir,
+            stem,
+        )?;
+        let out_name = build_asset_filename(&sniffed.display_name, stem, "json");
+
+        let facefx_json_dir = workspace.assets_dir.join("facefx");
+        fs::create_dir_all(&facefx_json_dir)?;
+        fs::write(facefx_json_dir.join(&out_name), json_str.as_bytes())?;
+
+        Ok(Some((
+            format!("assets/facefx/{}", out_name),
+            AssetSyncEntry {
+                chunk_rel_path: format!("chunks/{}.bin", stem),
+                asset_kind: "FaceFx".into(),
+                vanilla_crc32: calculate_crc32(json_str.as_bytes()),
+                is_modified: false,
+            },
+        )))
+    }
+}
+
 pub struct XmlProcessor;
 impl AssetProcessor for XmlProcessor {
     fn process(
@@ -652,6 +685,7 @@ pub fn get_standard_processors() -> Vec<Box<dyn AssetProcessor>> {
         Box::new(TerrainPaletteProcessor),
         Box::new(VfxProcessor),
         Box::new(EventProcessor),
+        Box::new(FaceFxProcessor),
         Box::new(LuaProcessor),
         Box::new(XmlProcessor),
         Box::new(ParameterProcessor),

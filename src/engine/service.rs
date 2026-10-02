@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::engine::assets::animation::{export_animation_to_glb, export_animation_to_json};
 use crate::engine::assets::audio::{export_wav, replace_wav};
-use crate::engine::assets::lua::{extract_lua_bytecode, replace_lua_bytecode};
+use crate::engine::assets::lua::{compile_lua_script, extract_lua_bytecode, replace_lua_bytecode};
 use crate::engine::assets::material::import_material_from_json;
 use crate::engine::assets::mesh::{
     MeshStats, export_mesh_to_glb, export_mesh_to_obj, import_glb_to_mesh, import_obj_to_mesh,
@@ -93,8 +93,12 @@ pub fn export_lua(chunk_path: &Path, out_path: &Path) -> Result<()> {
 
 pub fn import_lua(chunk_path: &Path, in_path: &Path) -> Result<()> {
     let chunk_data = fs::read(chunk_path)?;
-    let luac_data = fs::read(in_path)?;
-    let new_chunk = replace_lua_bytecode(&chunk_data, &luac_data)?;
+    let bytecode = if in_path.extension().is_some_and(|ext| ext == "lua") {
+        compile_lua_script(in_path)?
+    } else {
+        fs::read(in_path)?
+    };
+    let new_chunk = replace_lua_bytecode(&chunk_data, &bytecode)?;
     fs::write(chunk_path, new_chunk)?;
     Ok(())
 }

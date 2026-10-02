@@ -5,6 +5,7 @@ use crate::engine::common::{magic, parse_raw_container_table, serialize_containe
 
 pub mod animation;
 pub mod audio;
+pub mod facefx;
 pub mod lua;
 pub mod map;
 pub mod material;

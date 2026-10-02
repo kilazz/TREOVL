@@ -18,6 +18,8 @@ fn is_empty_container(chunk: &[u8]) -> bool {
 pub struct ObjectEntityJson {
     pub type_id_hex: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub class_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub group_tag: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entity_name: Option<String>,
@@ -39,8 +41,6 @@ pub struct ObjectEntityJson {
     pub attachments: Vec<AttachmentSlotJson>,
     #[serde(default = "default_true")]
     pub has_sentinel_terminator: bool,
-    /// FAIL-SAFE: Any components that failed to parse into structured JSON
-    /// are preserved here as raw hex to prevent ANY data loss during round-trip.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub raw_fallbacks: Vec<RawFallbackComponentJson>,
 }
@@ -64,15 +64,25 @@ pub struct BoundingBoxJson {
     pub orientation_matrix: Option<[[f32; 3]; 3]>,
 }
 
-/// Official Triumph Schema: "4f" (16-byte Vector4)
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct EntityPhysicsStateJson {
     pub offset: [f32; 3],
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub w_param: Option<f32>,
-    pub flags_hex: String,
+    pub collision_radius: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logic_flags: Option<PhysicsFlagsJson>,
+    pub raw_w_hex: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_parameters: Option<[u32; 4]>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PhysicsFlagsJson {
+    pub is_equippable: bool,
+    pub cast_shadows: bool,
+    pub spatial_query_enabled: bool,
+    pub is_dynamic_actor: bool,
+    pub unmapped_bits_hex: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -134,6 +144,11 @@ pub fn export_object_to_json(data: &[u8], output_dir: Option<&Path>) -> Result<S
     let (type_id, elements) = parse_typed_container(data)
         .context("Failed to parse Object Entity root typed container")?;
 
+    let class_name = match type_id {
+        0x0041004B => Some("TREModelResource".to_string()),
+        _ => None,
+    };
+
     let mut group_tag = None;
     let mut entity_name = None;
     let mut scale = None;
@@ -147,7 +162,6 @@ pub fn export_object_to_json(data: &[u8], output_dir: Option<&Path>) -> Result<S
     let mut has_sentinel_terminator = false;
     let mut raw_fallbacks = Vec::new();
 
-    // Pass 1: Extract basic identity and bones
     for (id, chunk) in &elements {
         match *id {
             20 => {
@@ -184,7 +198,6 @@ pub fn export_object_to_json(data: &[u8], output_dir: Option<&Path>) -> Result<S
                 }
             }
             33 => {
-                // Empty container (0x00) is valid for static equipment/items
                 if !is_empty_container(chunk) {
                     let parsed_bones = parse_full_bones_container(chunk);
                     if !parsed_bones.is_empty() {
@@ -205,7 +218,6 @@ pub fn export_object_to_json(data: &[u8], output_dir: Option<&Path>) -> Result<S
         }
     }
 
-    // Pass 2: Extract complex structures with fail-safe fallback
     for (id, chunk) in &elements {
         match *id {
             30 => {
@@ -226,15 +238,12 @@ pub fn export_object_to_json(data: &[u8], output_dir: Option<&Path>) -> Result<S
                 } else {
                     raw_fallbacks.push(RawFallbackComponentJson {
                         id: *id,
-                        reason:
-                            "Non-standard bounding box format (expected 60 bytes / schema '15f')"
-                                .into(),
+                        reason: "Non-standard bounding box format (expected 60 bytes)".into(),
                         hex: hex::encode_upper(chunk),
                     });
                 }
             }
             35 => {
-                // Parse ragdoll bone groups (including empty groups in items)
                 if !is_empty_container(chunk) {
                     let groups = parse_ragdoll_bone_groups(chunk, &bones);
                     if !groups.is_empty() {
@@ -249,7 +258,6 @@ pub fn export_object_to_json(data: &[u8], output_dir: Option<&Path>) -> Result<S
                 }
             }
             36 => {
-                // Empty container (0x00) is valid for static items without animation
                 if !is_empty_container(chunk) {
                     if let Some(anim) = parse_animation_linkage(chunk) {
                         default_animation = Some(anim);
@@ -270,9 +278,7 @@ pub fn export_object_to_json(data: &[u8], output_dir: Option<&Path>) -> Result<S
                 } else if !chunk.is_empty() {
                     raw_fallbacks.push(RawFallbackComponentJson {
                         id: *id,
-                        reason:
-                            "Non-standard physics/state component (expected 16 bytes / schema '4f')"
-                                .into(),
+                        reason: "Non-standard physics/state component".into(),
                         hex: hex::encode_upper(chunk),
                     });
                 }
@@ -280,7 +286,6 @@ pub fn export_object_to_json(data: &[u8], output_dir: Option<&Path>) -> Result<S
             1 => {
                 attachments = parse_attachment_slots(chunk);
             }
-            // Already parsed in pass 1
             20 | 21 | 32 | 33 | 19 => {}
             _ => {
                 raw_fallbacks.push(RawFallbackComponentJson {
@@ -294,6 +299,7 @@ pub fn export_object_to_json(data: &[u8], output_dir: Option<&Path>) -> Result<S
 
     let entity_json = ObjectEntityJson {
         type_id_hex: format!("{:08X}", type_id),
+        class_name,
         group_tag,
         entity_name: entity_name.clone(),
         scale,
@@ -336,21 +342,18 @@ pub fn import_object_from_json(json_str: &str) -> Result<Vec<u8>> {
             .and_then(|fb| hex::decode(&fb.hex).ok())
     };
 
-    // ID 20: Group Tag
     if let Some(ref tag) = parsed.group_tag {
         elements.push((20, write_length_prefixed_string(tag)));
     } else if let Some(raw) = get_fallback(20) {
         elements.push((20, raw));
     }
 
-    // ID 21: Entity Name
     if let Some(ref name) = parsed.entity_name {
         elements.push((21, write_length_prefixed_string(name)));
     } else if let Some(raw) = get_fallback(21) {
         elements.push((21, raw));
     }
 
-    // ID 30: Mesh Bindings
     if !parsed.mesh_bindings.is_empty() {
         let chunk_30 = rebuild_mesh_material_bindings(&parsed.mesh_bindings)?;
         elements.push((30, chunk_30));
@@ -358,14 +361,12 @@ pub fn import_object_from_json(json_str: &str) -> Result<Vec<u8>> {
         elements.push((30, raw));
     }
 
-    // ID 32: Scale Vector
     if let Some(s) = parsed.scale {
         elements.push((32, write_scale_vector(s)));
     } else if let Some(raw) = get_fallback(32) {
         elements.push((32, raw));
     }
 
-    // ID 33: Full Bones Container
     if !parsed.bones.is_empty() {
         let chunk_33 = rebuild_full_bones_container(&parsed.bones)?;
         elements.push((33, chunk_33));
@@ -375,14 +376,12 @@ pub fn import_object_from_json(json_str: &str) -> Result<Vec<u8>> {
         elements.push((33, vec![0u8]));
     }
 
-    // ID 34: Bounding Box ("15f")
     if let Some(ref bbox) = parsed.bounding_box {
         elements.push((34, rebuild_bounding_box(bbox)));
     } else if let Some(raw) = get_fallback(34) {
         elements.push((34, raw));
     }
 
-    // ID 35: Ragdoll Groups
     if !parsed.ragdoll_bone_groups.is_empty() {
         let chunk_35 = rebuild_ragdoll_bone_groups(&parsed.ragdoll_bone_groups)?;
         elements.push((35, chunk_35));
@@ -390,7 +389,6 @@ pub fn import_object_from_json(json_str: &str) -> Result<Vec<u8>> {
         elements.push((35, raw));
     }
 
-    // ID 36: Default Animation
     if let Some(ref anim) = parsed.default_animation {
         elements.push((36, rebuild_animation_linkage(anim)));
     } else if let Some(raw) = get_fallback(36) {
@@ -399,19 +397,16 @@ pub fn import_object_from_json(json_str: &str) -> Result<Vec<u8>> {
         elements.push((36, vec![0u8]));
     }
 
-    // ID 37: Physics State & Parameters ("4f")
     if let Some(ref phys) = parsed.physics_state {
         elements.push((37, rebuild_physics_state(phys)));
     } else if let Some(raw) = get_fallback(37) {
         elements.push((37, raw));
     }
 
-    // ID 19: Sentinel Terminator
     if parsed.has_sentinel_terminator {
         elements.push((19, vec![0xFF, 0xFF, 0xFF, 0xFF]));
     }
 
-    // ID 1: Attachments / Children
     if !parsed.attachments.is_empty() {
         elements.push((1, rebuild_attachment_slots(&parsed.attachments)));
     } else if let Some(raw) = get_fallback(1) {
@@ -420,7 +415,6 @@ pub fn import_object_from_json(json_str: &str) -> Result<Vec<u8>> {
         elements.push((1, vec![0u8]));
     }
 
-    // Rebuild any other unknown components from raw fallbacks
     for fb in &parsed.raw_fallbacks {
         if ![20, 21, 30, 32, 33, 34, 35, 36, 37, 19, 1].contains(&fb.id)
             && let Ok(raw) = hex::decode(&fb.hex)
@@ -428,6 +422,8 @@ pub fn import_object_from_json(json_str: &str) -> Result<Vec<u8>> {
             elements.push((fb.id, raw));
         }
     }
+
+    elements.sort_by_key(|&(id, _)| id);
 
     Ok(build_typed_container(type_id, &elements))
 }
@@ -494,7 +490,6 @@ fn parse_full_bones_container(chunk: &[u8]) -> Vec<FullObjectBoneJson> {
             transform_matrix: Some(matrix),
         });
     }
-
     out
 }
 
@@ -545,7 +540,6 @@ fn rebuild_full_bones_container(bones: &[FullObjectBoneJson]) -> Result<Vec<u8>>
         (21, (bones.len() as u32).to_le_bytes().to_vec()),
         (22, raw_records),
     ];
-
     Ok(build_chunk_from_elements(false, &sub_elements))
 }
 
@@ -567,10 +561,24 @@ fn parse_physics_state(chunk: &[u8]) -> Option<EntityPhysicsStateJson> {
     let p2 = u32::from_le_bytes(chunk[8..12].try_into().unwrap_or_default());
     let is_subnormal = (p0 != 0 && ox.is_subnormal()) || (p1 != 0 && oy.is_subnormal());
 
+    let (collision_radius, logic_flags) = if is_clean_float {
+        (Some(w_f32), None)
+    } else {
+        let flags = PhysicsFlagsJson {
+            is_equippable: (w_bytes & 0x0002) != 0,
+            cast_shadows: (w_bytes & 0x0008) != 0,
+            spatial_query_enabled: (w_bytes & 0x0010) != 0,
+            is_dynamic_actor: (w_bytes & 0x0100) != 0,
+            unmapped_bits_hex: format!("0x{:08X}", w_bytes & !(0x0002 | 0x0008 | 0x0010 | 0x0100)),
+        };
+        (None, Some(flags))
+    };
+
     Some(EntityPhysicsStateJson {
         offset: [ox, oy, oz],
-        w_param: if is_clean_float { Some(w_f32) } else { None },
-        flags_hex: format!("0x{:08X}", w_bytes),
+        collision_radius,
+        logic_flags,
+        raw_w_hex: format!("0x{:08X}", w_bytes),
         raw_parameters: if is_subnormal {
             Some([p0, p1, p2, w_bytes])
         } else {
@@ -594,12 +602,30 @@ fn rebuild_physics_state(state: &EntityPhysicsStateJson) -> Vec<u8> {
     let _ = cur.write_f32::<LittleEndian>(state.offset[1]);
     let _ = cur.write_f32::<LittleEndian>(state.offset[2]);
 
-    let w_u32 = if let Some(hex_clean) = state.flags_hex.strip_prefix("0x") {
-        u32::from_str_radix(hex_clean, 16).unwrap_or(0)
-    } else if let Some(w) = state.w_param {
-        w.to_bits()
+    let w_u32 = if let Some(ref flags) = state.logic_flags {
+        let mut val = 0u32;
+        if flags.is_equippable {
+            val |= 0x0002;
+        }
+        if flags.cast_shadows {
+            val |= 0x0008;
+        }
+        if flags.spatial_query_enabled {
+            val |= 0x0010;
+        }
+        if flags.is_dynamic_actor {
+            val |= 0x0100;
+        }
+        if let Ok(unmapped) =
+            u32::from_str_radix(flags.unmapped_bits_hex.trim_start_matches("0x"), 16)
+        {
+            val |= unmapped;
+        }
+        val
+    } else if let Some(r) = state.collision_radius {
+        r.to_bits()
     } else {
-        0
+        u32::from_str_radix(state.raw_w_hex.trim_start_matches("0x"), 16).unwrap_or(0)
     };
 
     let _ = cur.write_u32::<LittleEndian>(w_u32);
@@ -667,7 +693,6 @@ fn parse_ragdoll_bone_groups(
         if elem_data.starts_with(b"\xA0\x00\x41\x00") {
             let mut bone_ids = Vec::new();
 
-            // Groups with bone IDs are larger than 5 bytes (TypeID + control byte)
             if elem_data.len() > 5
                 && let Ok((_, sub_parts)) = parse_typed_container(&elem_data)
             {
@@ -713,7 +738,6 @@ fn rebuild_ragdoll_bone_groups(groups: &[BoneGroupJson]) -> Result<Vec<u8>> {
 
     for g in groups {
         let group_blob = if g.bone_ids.is_empty() {
-            // Empty 0x004100A0 typed container is 4 bytes TypeID + 1 byte control_byte (0x00)
             let mut b = Vec::with_capacity(5);
             b.extend_from_slice(&0x004100A0u32.to_le_bytes());
             b.push(0);

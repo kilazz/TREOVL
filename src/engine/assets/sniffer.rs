@@ -10,22 +10,21 @@ pub enum AssetKind {
     Mesh = 3,
     Lua = 4,
     Generic = 5,
-    Xml = 6,
-    Animation = 7,
-    Object = 8,
-    Event = 9,
-    Behavior = 10,
-    Attachment = 11,
+    UI = 6,
+    Object = 7,
+    Animation = 8,
+    TerrainPalette = 9,
+    Event = 10,
+    Xml = 11,
     Parameter = 12,
-    UI = 13,
-    Vfx = 14,
-    TerrainPalette = 15,
+    Vfx = 13,
+    Font = 14,
+    Behavior = 15,
+    Attachment = 16,
+    FaceFx = 17,
 }
 
 impl AssetKind {
-    /// Maps the asset kind to the Slint UI Inspector tab kind ID:
-    /// 0: Texture, 1: Audio, 2: Material, 3: Mesh, 4: Lua, 5: Generic,
-    /// 6: UI, 7: Object, 8: Animation, 9: TerrainPalette
     pub fn to_ui_kind_id(&self) -> i32 {
         match self {
             Self::Texture => 0,
@@ -49,7 +48,6 @@ pub struct SniffedAsset {
     pub display_name: String,
 }
 
-/// Sniffs the binary chunk to detect its engine asset type and extracts readable names.
 pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
     if data.len() < 4 {
         return SniffedAsset {
@@ -63,45 +61,66 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
     let magic_bytes = &data[0..4];
 
     let (kind, kind_name, icon) = if magic_bytes == magic::TEX_3D {
-        (AssetKind::Texture, "Texture (DDS)", "🎨")
+        (AssetKind::Texture, "TRETexture (3D/2D)", "🎨")
     } else if magic_bytes == magic::TEX_CUBEMAP {
-        (AssetKind::Texture, "Cubemap (DDS)", "🌐")
+        (AssetKind::Texture, "TRECubeMap", "🌐")
     } else if magic_bytes == magic::TEX_INTERFACE {
-        (AssetKind::Texture, "Interface Image (TGA)", "🖼️")
+        (AssetKind::Texture, "TREInterfaceImage (TGA)", "🖼️")
     } else if magic_bytes == magic::AUDIO_WAV {
         (AssetKind::Audio, "Sound / Voice (WAV)", "🎵")
     } else if magic_bytes == magic::MESH {
-        (AssetKind::Mesh, "3D Mesh Geometry", "🗿")
+        (AssetKind::Mesh, "TREMeshResource", "🗿")
+    } else if magic_bytes == b"\x41\x00\x41\x00" {
+        (AssetKind::Mesh, "TREMeshGeometry", "📐")
     } else if magic_bytes == magic::ANIM_CLIP {
-        (AssetKind::Animation, "Skeletal Animation", "🎬")
-    } else if magic_bytes == magic::OBJECT {
-        (AssetKind::Object, "3D Object Entity", "🧊")
+        (AssetKind::Animation, "Skeletal Animation Clip", "🎬")
+    }
+    // FaceFX Facial Animation Actors (0x0046BA00 or "FACE" signature)
+    else if magic_bytes == b"FACE"
+        || (data.len() >= 4 && data[0] == 0x00 && data[1] == 0xBA && data[2] == 0x46)
+        || data.windows(4).any(|w| w == b"FACE")
+    {
+        (AssetKind::FaceFx, "FaceFX Facial Animation (.fxe)", "🗣️")
+    } else if magic_bytes == magic::OBJECT
+        || magic_bytes == b"\x21\x46\x46\x00"
+        || magic_bytes == b"\x67\x00\x41\x00"
+    {
+        (AssetKind::Object, "TREModelResource (Entity/Prop)", "🧊")
     } else if magic_bytes == b"\x7E\x00\x00\x04" {
         (AssetKind::TerrainPalette, "Terrain Texture Palette", "🗺️")
     } else if data.len() >= 4 && data[2] == 0x73 && data[3] == 0x00 {
-        (AssetKind::Vfx, "Particle System / VFX", "🔥")
+        (AssetKind::Vfx, "TREParticleSystem / VFX", "🔥")
+    } else if magic_bytes == b"\x72\x00\x41\x00" {
+        (AssetKind::Font, "TREFont / Sprite Sheet", "🔤")
     } else if magic_bytes == b"\x76\x00\x41\x00" {
         (AssetKind::UI, "UI Sprite Slice", "🖼️")
     } else if magic_bytes == b"\x77\x00\x41\x00" {
         (AssetKind::UI, "UI Control State", "🔘")
-    } else if magic_bytes == magic::EVENT || magic_bytes == b"\x04\x00\x00\xB0" {
-        (AssetKind::Event, "Animation Sound Event", "👣")
-    } else if magic_bytes == magic::LUA {
-        (AssetKind::Lua, "Lua 5.0 Bytecode", "📜")
+    } else if magic_bytes == b"\x71\x00\x41\x00" {
+        (AssetKind::UI, "UI / Menu Layout", "🖥️")
+    } else if magic_bytes == magic::EVENT || magic_bytes == b"\x0B\x01\x41\x00" {
+        (AssetKind::Event, "Animation Event Marker", "👣")
+    } else if magic_bytes == magic::LUA || data.windows(4).any(|w| w == magic::LUA) {
+        if magic_bytes == magic::LUA {
+            (AssetKind::Lua, "Lua 5.0.2 Bytecode", "📜")
+        } else {
+            (AssetKind::Lua, "Scripted Logic Node", "📜")
+        }
     } else if magic_bytes == b"RIFF" {
         (AssetKind::Audio, "Raw WAV Audio", "🎵")
     } else if magic_bytes == b"DDS " {
         (AssetKind::Texture, "Raw DDS Texture", "🎨")
     } else if (data.len() >= 4 && data[2] == 0x41 && data[1] == 0x06)
-        || (data.len() >= 4 && data[3] == 0x00 && data[2] == 0x46)
+        || (data.len() >= 4
+            && (data[2] == 0x46 || (data[2] == 0x40 && (data[1] == 0x00 || data[1] == 0x59))))
     {
-        (AssetKind::Material, "Shader Material", "🛠️")
-    } else if data.len() >= 4 && data[2] == 0x71 && data[3] == 0x00 {
-        (AssetKind::UI, "UI / Menu Layout", "🖥️")
+        (AssetKind::Material, "Shader Material (TREMaterial)", "🛠️")
+    } else if magic_bytes == b"\x4E\x00\x41\x00" {
+        (AssetKind::Generic, "Scene Node / Transform", "📍")
     } else if data.windows(5).any(|w| w == b"<?xml") {
         (AssetKind::Xml, "XML Document", "📋")
     } else if data.windows(4).any(|w| w == b".clb") {
-        (AssetKind::Parameter, "Collision Boundary Ref (.clb)", "🧱")
+        (AssetKind::Parameter, "Collision Bounds (.clb)", "🧱")
     } else if data.windows(4).any(|w| w == b"FACE")
         || data.windows(8).any(|w| w == b"Triumph ")
         || data.windows(6).any(|w| w == b"--Drop")
@@ -111,16 +130,13 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
         || data.windows(11).any(|w| w == b"plate_metal")
     {
         (AssetKind::Attachment, "Item Attachment Slot", "🍽️")
-    } else if data.windows(4).any(|w| w == magic::TEX_MIPMAP) {
-        (AssetKind::Texture, "Texture (MipMap)", "🎨")
     } else if data.len() <= 64 {
         (AssetKind::Parameter, "Engine Parameter", "⚙️")
     } else {
-        (AssetKind::Generic, "Binary Chunk", "📦")
+        (AssetKind::Generic, "Triumph Binary Container", "📦")
     };
 
     let extracted_name = extract_internal_strings(data);
-
     let display_name = match extracted_name {
         Some(name) => {
             if kind == AssetKind::Xml && !name.to_lowercase().ends_with(".xml") {
@@ -158,6 +174,7 @@ fn extract_internal_strings(data: &[u8]) -> Option<String> {
                         || clean.ends_with(".tga")
                         || clean.ends_with(".xml")
                         || clean.ends_with(".clb")
+                        || clean.ends_with(".fxe")
                     {
                         return Some(clean.to_string());
                     }
