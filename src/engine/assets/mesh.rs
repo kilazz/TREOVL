@@ -82,11 +82,7 @@ struct ParsedMeshData {
 }
 
 fn extract_mesh_geometry(chunk_data: &[u8]) -> Result<ParsedMeshData> {
-    let mut bones = Vec::new();
-
-    if let Ok(parsed_bones) = parse_object_bone_container(chunk_data) {
-        bones = parsed_bones;
-    }
+    let bones = parse_object_bone_container(chunk_data).unwrap_or_default();
 
     let mesh_data_bytes = if chunk_data.starts_with(magic::MESH) {
         let (_, elements) = parse_typed_container(chunk_data)?;
@@ -168,6 +164,7 @@ fn extract_mesh_geometry(chunk_data: &[u8]) -> Result<ParsedMeshData> {
         .any(|a| a.semantic == VertexSemantic::BlendIndices);
     let is_skinned = has_weights && has_indices;
 
+    let num_bones = bones.len();
     let vertex_count = raw_vertices.len() / stride;
     let mut positions = Vec::with_capacity(vertex_count);
     let mut normals = Vec::with_capacity(vertex_count);
@@ -216,7 +213,6 @@ fn extract_mesh_geometry(chunk_data: &[u8]) -> Result<ParsedMeshData> {
                         w_val.z = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
                         w_val.w = (1.0 - (w_val.x + w_val.y + w_val.z)).max(0.0);
                     } else if attr.byte_size == 1 {
-                        // 1-byte normalized weight (u8 / 255.0)
                         let w_norm = cur.read_u8().unwrap_or(0) as f32 / 255.0;
                         match weight_slot {
                             0 => w_val.x = w_norm,
@@ -238,7 +234,6 @@ fn extract_mesh_geometry(chunk_data: &[u8]) -> Result<ParsedMeshData> {
                         j_val[2] = cur.read_u8().unwrap_or(0) as u16;
                         j_val[3] = cur.read_u8().unwrap_or(0) as u16;
                     } else if attr.byte_size == 1 {
-                        // 1-byte bone index
                         let j_byte = cur.read_u8().unwrap_or(0) as u16;
                         if joint_slot < 4 {
                             j_val[joint_slot] = j_byte;
@@ -256,7 +251,14 @@ fn extract_mesh_geometry(chunk_data: &[u8]) -> Result<ParsedMeshData> {
             }
         }
 
-        // Normalize weights so their sum is exactly 1.0
+        // В Overlord для 3 костей сохраняются 2 веса (3-й неявный: 1 - w0 - w1)
+        if joint_slot == 3 && weight_slot == 2 {
+            w_val.z = (1.0 - (w_val.x + w_val.y)).max(0.0);
+        } else if joint_slot == 2 && weight_slot == 1 {
+            w_val.y = (1.0 - w_val.x).max(0.0);
+        }
+
+        // Нормализация весов скининга
         let weight_sum = w_val.x + w_val.y + w_val.z + w_val.w;
         if weight_sum > 0.001 {
             w_val.x /= weight_sum;
@@ -265,6 +267,15 @@ fn extract_mesh_geometry(chunk_data: &[u8]) -> Result<ParsedMeshData> {
             w_val.w /= weight_sum;
         } else {
             w_val.x = 1.0;
+        }
+
+        // Защита от выхода индексов костей за границы скелета
+        if num_bones > 0 {
+            let max_bone_idx = (num_bones - 1) as u16;
+            j_val[0] = j_val[0].min(max_bone_idx);
+            j_val[1] = j_val[1].min(max_bone_idx);
+            j_val[2] = j_val[2].min(max_bone_idx);
+            j_val[3] = j_val[3].min(max_bone_idx);
         }
 
         positions.push(pos);
@@ -432,6 +443,10 @@ pub fn export_mesh_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, MeshStats)> {
                 bnode["children"] = json!(children);
             }
             bone_nodes.push(bnode);
+        }
+
+        if armature_children.is_empty() {
+            armature_children.push(1);
         }
 
         builder.add_node(json!({

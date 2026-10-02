@@ -33,84 +33,97 @@ pub struct ObjectBone {
     pub rotation: Vector4,
     pub translation: Vector3,
 
+    // Точная структура 20 байт иерархии кости Overlord
+    pub bone_id: i32,
     pub skin_id: i32,
     pub parent_index: i32,
     pub next_sibling_index: i32,
     pub first_child_index: i32,
-    pub reserved: i32,
 }
 
+/// Извлекает массив всех костей из любых чанков мешей (ID 13) и объектов (ID 33/22)
 pub fn parse_object_bone_container(data: &[u8]) -> Result<Vec<ObjectBone>> {
-    let mut payload = data.to_vec();
+    let mut candidate_offsets = Vec::new();
 
-    // Блок ID 33 в объектах — это контейнер, где сами кости лежат в блоке ID 22 (DATA_BLOB)
-    if let Ok((_, elements)) = parse_chunk_elements(data) {
-        if let Some((_, bone_bytes)) = elements.iter().find(|(id, _)| *id == 22) {
-            payload = bone_bytes.clone();
-        } else if let Some((_, bone_bytes)) = elements.iter().find(|(id, _)| *id == 33) {
-            payload = bone_bytes.clone();
+    // 1. Поиск по сигнатурам корневых костей (Root, Bip01) в бинарнике
+    for (idx, window) in data.windows(5).enumerate() {
+        if window == b"Root\0" || window == b"Root " || window == b"Bip01" {
+            candidate_offsets.push(idx);
         }
-    } else if let Ok((_, typed_elements)) = super::parse_typed_container(data) {
+    }
+
+    // 2. Поиск по подконтейнерам (ID 13, 33, 22)
+    if let Ok((_, typed_elements)) = super::parse_typed_container(data) {
         for (id, chunk) in typed_elements {
-            if id == 33 || id == 22 {
-                payload = chunk;
-                break;
-            } else if let Ok((_, sub_elem)) = parse_chunk_elements(&chunk)
-                && let Some((_, sub_bones)) = sub_elem
-                    .into_iter()
-                    .find(|(sid, _)| *sid == 33 || *sid == 22)
+            if id == 1
+                && let Ok((_, sub_elems)) = parse_chunk_elements(&chunk)
             {
-                payload = sub_bones;
+                for (sid, schunk) in sub_elems {
+                    if sid == 13 || sid == 33 || sid == 22 {
+                        for (idx, w) in schunk.windows(5).enumerate() {
+                            if (w == b"Root\0" || w == b"Root " || w == b"Bip01")
+                                && let Some(pos) =
+                                    data.windows(schunk.len()).position(|p| p == schunk)
+                            {
+                                candidate_offsets.push(pos + idx);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    candidate_offsets.sort_unstable();
+    candidate_offsets.dedup();
+
+    for start_off in candidate_offsets {
+        let slice = &data[start_off..];
+        let mut cur = Cursor::new(slice);
+        let mut bones = Vec::new();
+
+        while (cur.position() as usize) + 144 <= slice.len() {
+            if let Ok(bone) = cur.read_le::<ObjectBone>() {
+                let clean_name = bone
+                    .name
+                    .chars()
+                    .filter(|c| c.is_ascii_graphic() || *c == ' ' || *c == '_')
+                    .collect::<String>();
+
+                let is_valid_name = !clean_name.is_empty()
+                    && clean_name.len() >= 2
+                    && !clean_name.starts_with('[')
+                    && clean_name.is_ascii();
+
+                let is_valid_transform = bone.translation.x.is_finite()
+                    && bone.translation.y.is_finite()
+                    && bone.translation.z.is_finite()
+                    && bone.translation.x.abs() < 50_000.0
+                    && bone.translation.y.abs() < 50_000.0
+                    && bone.translation.z.abs() < 50_000.0
+                    && bone.rotation.w.is_finite()
+                    && bone.rotation.w.abs() <= 2.0;
+
+                let is_valid_hierarchy = bone.parent_index >= -1 && bone.parent_index < 512;
+
+                if is_valid_name && is_valid_transform && is_valid_hierarchy {
+                    let mut valid_bone = bone;
+                    valid_bone.name = clean_name;
+                    bones.push(valid_bone);
+                } else {
+                    break;
+                }
+            } else {
                 break;
             }
         }
-    } else if data.len() > 15 && data[0] == 0x03 && data[1] == 0x14 {
-        payload = data[15..].to_vec();
-    }
 
-    if payload.len() < 144 {
-        return Ok(Vec::new());
-    }
-
-    let mut cur = Cursor::new(payload.as_slice());
-    let mut bones = Vec::new();
-
-    while (cur.position() as usize) + 144 <= payload.len() {
-        if let Ok(bone) = cur.read_le::<ObjectBone>() {
-            let clean_name = bone
-                .name
-                .chars()
-                .filter(|c| c.is_ascii_graphic() || *c == ' ' || *c == '_')
-                .collect::<String>();
-
-            let is_valid_name = !clean_name.is_empty()
-                && clean_name.len() >= 2
-                && !clean_name.starts_with('[')
-                && clean_name.is_ascii();
-
-            let is_valid_transform = bone.translation.x.is_finite()
-                && bone.translation.y.is_finite()
-                && bone.translation.z.is_finite()
-                && bone.translation.x.abs() < 50_000.0
-                && bone.translation.y.abs() < 50_000.0
-                && bone.translation.z.abs() < 50_000.0
-                && bone.rotation.w.is_finite();
-
-            let is_valid_hierarchy = bone.parent_index >= -1 && bone.parent_index < 1024;
-
-            if is_valid_name && is_valid_transform && is_valid_hierarchy {
-                let mut valid_bone = bone;
-                valid_bone.name = clean_name;
-                bones.push(valid_bone);
-            } else if !bones.is_empty() {
-                break;
-            }
-        } else {
-            break;
+        if bones.len() >= 2 {
+            return Ok(bones);
         }
     }
 
-    Ok(bones)
+    Ok(Vec::new())
 }
 
 pub fn export_skeleton_to_glb(bones: &[ObjectBone], rig_name: &str) -> Result<Vec<u8>> {
@@ -326,7 +339,6 @@ fn parse_single_bone_track(data: &[u8], total_duration: f32) -> Result<BoneTrack
                     bone_name = s.trim_matches(char::from(0)).trim().to_string();
                 }
             }
-            // ID 22 / 24: Translations (Root Motion or static position)
             22 | 24 => {
                 if let Ok((_, trans_sub)) = parse_chunk_elements(&chunk) {
                     for (_, tchunk) in trans_sub {
@@ -336,7 +348,6 @@ fn parse_single_bone_track(data: &[u8], total_duration: f32) -> Result<BoneTrack
                     parse_translation_blob(&chunk, total_duration, &mut translations);
                 }
             }
-            // ID 23 / 25: Rotations (Packed 6-byte Euler streams)
             23 | 25 => {
                 if let Ok((_, rot_sub)) = parse_chunk_elements(&chunk) {
                     for (_, rchunk) in rot_sub {
@@ -372,7 +383,6 @@ fn parse_translation_blob(
         return;
     }
 
-    // Check if data is array of (u32 timestamp_micros + 3x f32 position) = 16 bytes
     if data.len() >= 16 && data.len().is_multiple_of(16) {
         let mut cur = Cursor::new(data);
         while (cur.position() as usize) + 16 <= data.len() {
@@ -392,7 +402,6 @@ fn parse_translation_blob(
             });
         }
     } else if data.len() >= 12 {
-        // Single static position keyframe
         let mut cur = Cursor::new(data);
         let px = sanitize_f32(cur.read_f32::<LittleEndian>().unwrap_or(0.0), 0.0);
         let py = sanitize_f32(cur.read_f32::<LittleEndian>().unwrap_or(0.0), 0.0);
@@ -469,9 +478,7 @@ pub fn export_animation_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>> {
         let bone_node_id = nodes.len() + 1;
         bone_indices.push(bone_node_id);
 
-        nodes.push(json!({
-            "name": track.bone_name
-        }));
+        nodes.push(json!({ "name": track.bone_name }));
 
         if !track.translations.is_empty() {
             let time_offset = bin_data.len();
