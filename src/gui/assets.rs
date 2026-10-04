@@ -15,8 +15,12 @@ pub fn register(
     let tx_select = tx.clone();
     let state_sel = state.clone();
 
-    // Fast non-blocking selection: delegates parsing and decompression to worker thread
+    // Fast non-blocking selection with bounds check to prevent negative index wrap-around
     ui.on_select_asset(move |filtered_index| {
+        if filtered_index < 0 {
+            return;
+        }
+
         let st = state_sel.lock().unwrap();
         if let Some(&real_index) = st.visible_indices.get(filtered_index as usize)
             && let Some(target) = st.all_cached_assets.get(real_index)
@@ -105,6 +109,66 @@ pub fn register(
         });
     });
 
+    let tx_env = tx.clone();
+    ui.on_save_environment(move |chunk_str, json_str| {
+        let _ = tx_env.send(WorkerCommand::SaveEnvironment {
+            chunk_path: PathBuf::from(chunk_str.as_str()),
+            json_data: json_str.to_string(),
+        });
+    });
+
+    let tx_m8ld = tx.clone();
+    ui.on_save_m8ld(move |chunk_str, json_str| {
+        let _ = tx_m8ld.send(WorkerCommand::SaveM8ld {
+            chunk_path: PathBuf::from(chunk_str.as_str()),
+            json_data: json_str.to_string(),
+        });
+    });
+
+    let tx_uisp = tx.clone();
+    ui.on_save_ui_sprite(move |chunk_str, json_str| {
+        let _ = tx_uisp.send(WorkerCommand::SaveUiSprite {
+            chunk_path: PathBuf::from(chunk_str.as_str()),
+            json_data: json_str.to_string(),
+        });
+    });
+
+    // 8LD -> XML (1 file)
+    let tx_dec_8ld = tx.clone();
+    ui.on_decompile_8ld(move |src_str, dst_str| {
+        let _ = tx_dec_8ld.send(WorkerCommand::Decompile8ldDirect {
+            src: PathBuf::from(src_str.as_str()),
+            dst: PathBuf::from(dst_str.as_str()),
+        });
+    });
+
+    // 8LD -> XML (Batch)
+    let tx_dec_8ld_batch = tx.clone();
+    ui.on_decompile_8ld_batch(move |src_str, dst_str| {
+        let _ = tx_dec_8ld_batch.send(WorkerCommand::Decompile8ldBatch {
+            src_dir: PathBuf::from(src_str.as_str()),
+            dst_dir: PathBuf::from(dst_str.as_str()),
+        });
+    });
+
+    // XML -> 8LD (1 file)
+    let tx_comp_8ld = tx.clone();
+    ui.on_compile_8ld(move |src_str, dst_str| {
+        let _ = tx_comp_8ld.send(WorkerCommand::Compile8ldDirect {
+            src: PathBuf::from(src_str.as_str()),
+            dst: PathBuf::from(dst_str.as_str()),
+        });
+    });
+
+    // XML -> 8LD (Batch)
+    let tx_comp_8ld_batch = tx.clone();
+    ui.on_compile_8ld_batch(move |src_str, dst_str| {
+        let _ = tx_comp_8ld_batch.send(WorkerCommand::Compile8ldBatch {
+            src_dir: PathBuf::from(src_str.as_str()),
+            dst_dir: PathBuf::from(dst_str.as_str()),
+        });
+    });
+
     let tx_mesh_exp = tx.clone();
     ui.on_export_mesh_obj(move |chunk_str, out_str| {
         let out_path = PathBuf::from(out_str.as_str());
@@ -135,6 +199,22 @@ pub fn register(
             chunk_path: PathBuf::from(chunk_str.as_str()),
             out_path,
             is_glb,
+        });
+    });
+
+    let tx_col_exp = tx.clone();
+    ui.on_export_collision_glb(move |chunk_str, out_str| {
+        let _ = tx_col_exp.send(WorkerCommand::ExportCollisionGlb {
+            chunk_path: PathBuf::from(chunk_str.as_str()),
+            out_path: PathBuf::from(out_str.as_str()),
+        });
+    });
+
+    let tx_col_imp = tx.clone();
+    ui.on_import_collision_glb(move |chunk_str, in_str| {
+        let _ = tx_col_imp.send(WorkerCommand::ImportCollisionGlb {
+            chunk_path: PathBuf::from(chunk_str.as_str()),
+            in_path: PathBuf::from(in_str.as_str()),
         });
     });
 

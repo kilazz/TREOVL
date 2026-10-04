@@ -40,6 +40,28 @@ pub enum WorkerCommand {
         delta_yaw: f32,
         delta_pitch: f32,
     },
+    FilterAssets {
+        query: String,
+        generation: u64,
+    },
+
+    // Direct 8LD & XML File Operations
+    Decompile8ldDirect {
+        src: PathBuf,
+        dst: PathBuf,
+    },
+    Compile8ldDirect {
+        src: PathBuf,
+        dst: PathBuf,
+    },
+    Decompile8ldBatch {
+        src_dir: PathBuf,
+        dst_dir: PathBuf,
+    },
+    Compile8ldBatch {
+        src_dir: PathBuf,
+        dst_dir: PathBuf,
+    },
 
     // Asset Export Operations
     ExportDds {
@@ -59,6 +81,10 @@ pub enum WorkerCommand {
         chunk_path: PathBuf,
         out_path: PathBuf,
         is_glb: bool,
+    },
+    ExportCollisionGlb {
+        chunk_path: PathBuf,
+        out_path: PathBuf,
     },
     ExportLua {
         chunk_path: PathBuf,
@@ -87,6 +113,10 @@ pub enum WorkerCommand {
         in_path: PathBuf,
         is_glb: bool,
     },
+    ImportCollisionGlb {
+        chunk_path: PathBuf,
+        in_path: PathBuf,
+    },
     ImportLua {
         chunk_path: PathBuf,
         in_path: PathBuf,
@@ -104,6 +134,18 @@ pub enum WorkerCommand {
         json_data: String,
     },
     SaveTerrainPalette {
+        chunk_path: PathBuf,
+        json_data: String,
+    },
+    SaveEnvironment {
+        chunk_path: PathBuf,
+        json_data: String,
+    },
+    SaveM8ld {
+        chunk_path: PathBuf,
+        json_data: String,
+    },
+    SaveUiSprite {
         chunk_path: PathBuf,
         json_data: String,
     },

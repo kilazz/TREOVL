@@ -1,5 +1,4 @@
 use anyhow::{Result, bail};
-use byteorder::{LittleEndian, WriteBytesExt};
 
 use crate::engine::common::{
     extract_elements_from_table, magic, parse_raw_container_table, serialize_container_payload,
@@ -10,10 +9,12 @@ pub mod attachment;
 pub mod audio;
 pub mod character;
 pub mod collision;
+pub mod environment;
 pub mod event;
 pub mod facefx;
 pub mod font;
 pub mod lua;
+pub mod m8ld;
 pub mod map;
 pub mod material;
 pub mod mesh;
@@ -25,6 +26,7 @@ pub mod terrain;
 pub mod terrain_palette;
 pub mod texture;
 pub mod ui;
+pub mod ui_sprite;
 pub mod vfx;
 pub mod xml;
 
@@ -60,7 +62,7 @@ pub fn parse_typed_container(data: &[u8]) -> Result<(u32, Vec<ChunkElement>)> {
 
 pub fn build_typed_container(type_id: u32, elements: &[ChunkElement]) -> Vec<u8> {
     let mut out = Vec::new();
-    out.write_u32::<LittleEndian>(type_id).unwrap();
+    out.extend_from_slice(&type_id.to_le_bytes());
     let entries = elements
         .iter()
         .map(|(id, data)| (*id, false, data.as_slice()));

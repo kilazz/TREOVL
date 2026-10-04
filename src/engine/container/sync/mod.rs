@@ -262,6 +262,16 @@ pub fn sync_assets_to_chunks(project_dir: &Path) -> Result<usize> {
                     }
                 }
                 "Animation" => baseline_chunk,
+                "M8ldMap" => {
+                    let xml_str = String::from_utf8(asset_bytes)
+                        .context("M8LD XML file is not valid UTF-8")?;
+                    let crc = if baseline_chunk.len() >= 8 && baseline_chunk.starts_with(b"M8LD") {
+                        u32::from_le_bytes(baseline_chunk[4..8].try_into().unwrap_or_default())
+                    } else {
+                        0x3707714B
+                    };
+                    crate::engine::assets::m8ld::compile_xml_to_8ld(&xml_str, crc)
+                }
                 "Parameter" => crate::engine::assets::parameter::import_parameter_from_json(
                     &asset_bytes,
                     &baseline_chunk,

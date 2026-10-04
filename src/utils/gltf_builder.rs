@@ -11,6 +11,9 @@ pub struct GltfBuilder {
     meshes: Vec<Value>,
     animations: Vec<Value>,
     skins: Vec<Value>,
+    materials: Vec<Value>,
+    textures: Vec<Value>,
+    images: Vec<Value>,
 }
 
 impl GltfBuilder {
@@ -24,6 +27,9 @@ impl GltfBuilder {
             meshes: Vec::new(),
             animations: Vec::new(),
             skins: Vec::new(),
+            materials: Vec::new(),
+            textures: Vec::new(),
+            images: Vec::new(),
         }
     }
 
@@ -82,6 +88,30 @@ impl GltfBuilder {
         acc_idx
     }
 
+    pub fn add_image(&mut self, data: &[u8], mime_type: &str) -> usize {
+        let view_idx = self.add_buffer_view(data, None);
+        let img_idx = self.images.len();
+        self.images.push(json!({
+            "bufferView": view_idx,
+            "mimeType": mime_type
+        }));
+        img_idx
+    }
+
+    pub fn add_texture(&mut self, source_image_idx: usize) -> usize {
+        let tex_idx = self.textures.len();
+        self.textures.push(json!({
+            "source": source_image_idx
+        }));
+        tex_idx
+    }
+
+    pub fn add_material(&mut self, material: Value) -> usize {
+        let mat_idx = self.materials.len();
+        self.materials.push(material);
+        mat_idx
+    }
+
     pub fn add_mesh(&mut self, mesh: Value) -> usize {
         let idx = self.meshes.len();
         self.meshes.push(mesh);
@@ -131,6 +161,15 @@ impl GltfBuilder {
         }
         if !self.skins.is_empty() {
             gltf_json["skins"] = json!(self.skins);
+        }
+        if !self.materials.is_empty() {
+            gltf_json["materials"] = json!(self.materials);
+        }
+        if !self.textures.is_empty() {
+            gltf_json["textures"] = json!(self.textures);
+        }
+        if !self.images.is_empty() {
+            gltf_json["images"] = json!(self.images);
         }
 
         let mut json_bytes = serde_json::to_vec(&gltf_json)?;

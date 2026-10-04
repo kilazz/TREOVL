@@ -868,8 +868,14 @@ pub fn import_glb_to_mesh(original_chunk: &[u8], glb_bytes: &[u8]) -> Result<Vec
     ];
 
     if has_glb_skinning {
-        let j_acc_idx = prim["attributes"]["JOINTS_0"].as_u64().unwrap() as usize;
-        let w_acc_idx = prim["attributes"]["WEIGHTS_0"].as_u64().unwrap() as usize;
+        let j_acc_idx = prim["attributes"]["JOINTS_0"]
+            .as_u64()
+            .context("Missing JOINTS_0 accessor index in glTF primitive")?
+            as usize;
+        let w_acc_idx = prim["attributes"]["WEIGHTS_0"]
+            .as_u64()
+            .context("Missing WEIGHTS_0 accessor index in glTF primitive")?
+            as usize;
 
         let j_comp = accessors[j_acc_idx]["componentType"]
             .as_u64()

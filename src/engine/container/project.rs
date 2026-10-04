@@ -23,11 +23,14 @@ pub struct ProjectManifest {
 }
 
 pub fn unpack_archive(archive_path: &Path, output_dir: &Path) -> Result<(usize, String)> {
-    let data = fs::read(archive_path)
-        .with_context(|| format!("Failed to read archive: {:?}", archive_path))?;
+    let file = fs::File::open(archive_path)
+        .with_context(|| format!("Failed to open archive: {:?}", archive_path))?;
+    let mmap = unsafe { memmap2::Mmap::map(&file) }
+        .with_context(|| format!("Failed to memory map archive: {:?}", archive_path))?;
+    let data: &[u8] = &mmap[..];
 
-    let header = PrpHeader::read(&data)?;
-    let footer_opt = check_footer(&data);
+    let header = PrpHeader::read(data)?;
+    let footer_opt = check_footer(data);
     let has_footer = footer_opt.is_some();
     let footer_hash2 = footer_opt.as_ref().map(|f| f.hash2).unwrap_or(0x7C809B8B);
     let endian = footer_opt
@@ -71,8 +74,8 @@ pub fn unpack_archive(archive_path: &Path, output_dir: &Path) -> Result<(usize, 
     };
 
     let manifest_path = output_dir.join("project.json");
-    let file = fs::File::create(&manifest_path)?;
-    serde_json::to_writer_pretty(file, &manifest)?;
+    let manifest_file = fs::File::create(&manifest_path)?;
+    serde_json::to_writer_pretty(manifest_file, &manifest)?;
 
     match export_smart_assets(output_dir) {
         Ok(count) => {
@@ -117,7 +120,12 @@ pub fn pack_archive(
     let manifest_str = fs::read_to_string(&manifest_path)?;
     let manifest: ProjectManifest = serde_json::from_str(&manifest_str)?;
 
-    let payload = build_node(&manifest.root, project_dir, compression_level)?;
+    let payload = build_node(
+        &manifest.root,
+        project_dir,
+        compression_level,
+        manifest.endian,
+    )?;
     let mut final_binary = manifest.header.write(payload.len() as u32)?;
     final_binary.extend(payload);
 

@@ -1,11 +1,16 @@
 use super::node::PrpNode;
-use crate::engine::common::{magic, serialize_container_payload};
+use crate::engine::common::{Endian, magic, serialize_container_payload_with_endian};
 use crate::utils::zlib::{compress, decompress, is_zlib_compressed};
 use anyhow::{Context, Result, bail};
 use std::fs;
 use std::path::Path;
 
-pub fn build_node(node: &PrpNode, project_dir: &Path, compression_level: u32) -> Result<Vec<u8>> {
+pub fn build_node(
+    node: &PrpNode,
+    project_dir: &Path,
+    compression_level: u32,
+    endian: Endian,
+) -> Result<Vec<u8>> {
     if !node.is_container {
         let rel_path = match &node.file_path {
             Some(path) => path,
@@ -41,7 +46,7 @@ pub fn build_node(node: &PrpNode, project_dir: &Path, compression_level: u32) ->
 
     let mut child_buffers = Vec::new();
     for child in &node.children {
-        let child_bin = build_node(child, project_dir, compression_level)?;
+        let child_bin = build_node(child, project_dir, compression_level, endian)?;
         child_buffers.push((child, child_bin));
     }
 
@@ -53,7 +58,9 @@ pub fn build_node(node: &PrpNode, project_dir: &Path, compression_level: u32) ->
     let entries = child_buffers
         .iter()
         .map(|(child, bin)| (child.id, child.is_large, bin.as_slice()));
-    table.extend(serialize_container_payload(entries));
+
+    // Serialize container table preserving the target platform endianness (PC / Xbox 360 / PS3)
+    table.extend(serialize_container_payload_with_endian(entries, endian));
 
     Ok(table)
 }

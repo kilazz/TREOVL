@@ -566,6 +566,39 @@ impl AssetProcessor for XmlProcessor {
     }
 }
 
+pub struct M8ldProcessor;
+impl AssetProcessor for M8ldProcessor {
+    fn process(
+        &self,
+        data: &[u8],
+        stem: &str,
+        sniffed: &SniffedAsset,
+        workspace: &ProjectWorkspace,
+    ) -> Result<Option<(String, AssetSyncEntry)>> {
+        if sniffed.kind != AssetKind::M8ldMap && !data.starts_with(b"M8LD") {
+            return Ok(None);
+        }
+
+        let (_crc, xml_content) = crate::engine::assets::m8ld::decompile_8ld_to_xml(data)?;
+        let out_name = build_asset_filename(&sniffed.display_name, stem, "xml");
+
+        let xml_dir = workspace.assets_dir.join("xml");
+        fs::create_dir_all(&xml_dir)?;
+        let xml_path = xml_dir.join(&out_name);
+        fs::write(&xml_path, xml_content.as_bytes())?;
+
+        Ok(Some((
+            format!("assets/xml/{}", out_name),
+            AssetSyncEntry {
+                chunk_rel_path: format!("chunks/{}.bin", stem),
+                asset_kind: "M8ldMap".into(),
+                vanilla_crc32: calculate_crc32(xml_content.as_bytes()),
+                is_modified: false,
+            },
+        )))
+    }
+}
+
 pub struct ParameterProcessor;
 impl AssetProcessor for ParameterProcessor {
     fn process(
@@ -706,6 +739,7 @@ pub fn get_standard_processors() -> Vec<Box<dyn AssetProcessor>> {
         Box::new(FaceFxProcessor),
         Box::new(LuaProcessor),
         Box::new(XmlProcessor),
+        Box::new(M8ldProcessor),
         Box::new(ParameterProcessor),
         Box::new(UiProcessor),
         Box::new(ObjectProcessor),

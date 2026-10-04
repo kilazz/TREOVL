@@ -4,10 +4,11 @@ pub mod commands;
 pub mod textures;
 pub mod worker;
 
-use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
+use slint::ComponentHandle;
 use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
@@ -37,10 +38,12 @@ pub struct ActiveMeshPreview {
 pub struct AppState {
     pub all_ui_items: Vec<AssetItem>,
     pub all_cached_assets: Vec<CachedAsset>,
+    pub all_search_haystack: Vec<String>,
     pub visible_indices: Vec<usize>,
     pub current_proj_dir: Option<PathBuf>,
     pub camera: ViewportCamera,
     pub active_mesh: Option<ActiveMeshPreview>,
+    pub filter_generation: u64,
 }
 
 /// Resolves a directory path whether a directory or a child file was passed.
@@ -54,7 +57,7 @@ pub fn resolve_project_dir(path: &Path) -> PathBuf {
     }
 }
 
-pub fn scan_project_folder(project_dir: &Path) -> (Vec<AssetItem>, Vec<CachedAsset>) {
+pub fn scan_project_folder(project_dir: &Path) -> (Vec<AssetItem>, Vec<CachedAsset>, Vec<String>) {
     let chunks_dir = if project_dir.join("chunks").exists() {
         project_dir.join("chunks")
     } else {
@@ -63,6 +66,7 @@ pub fn scan_project_folder(project_dir: &Path) -> (Vec<AssetItem>, Vec<CachedAss
 
     let mut ui_items = Vec::new();
     let mut cached = Vec::new();
+    let mut haystacks = Vec::new();
 
     let cache_map: std::collections::HashMap<String, bool> = {
         let cache_file = project_dir.join(".asset_cache.json");
@@ -110,11 +114,18 @@ pub fn scan_project_folder(project_dir: &Path) -> (Vec<AssetItem>, Vec<CachedAss
                     }
                 });
 
+                let path_str = path.to_string_lossy().to_string();
+                let search_token = format!(
+                    "{} {} {}",
+                    sniffed.display_name, sniffed.kind_name, path_str
+                )
+                .to_lowercase();
+
                 ui_items.push(AssetItem {
                     display_name: sniffed.display_name.into(),
                     kind_name: sniffed.kind_name.into(),
                     icon: sniffed.icon.into(),
-                    file_path: path.to_string_lossy().to_string().into(),
+                    file_path: path_str.into(),
                     size_str: size_str.into(),
                     kind_id,
                     is_modified,
@@ -124,10 +135,12 @@ pub fn scan_project_folder(project_dir: &Path) -> (Vec<AssetItem>, Vec<CachedAss
                     path,
                     kind: sniffed.kind,
                 });
+
+                haystacks.push(search_token);
             }
         }
     }
-    (ui_items, cached)
+    (ui_items, cached, haystacks)
 }
 
 pub fn run_gui() -> Result<(), slint::PlatformError> {
@@ -164,52 +177,34 @@ pub fn run_gui() -> Result<(), slint::PlatformError> {
     let worker = BackgroundWorker::new(ui_weak.clone(), logger.clone(), app_state.clone());
     thread::spawn(move || worker.run(worker_rx));
 
-    let filter_ui_handle = ui_weak.clone();
-    let filter_state = app_state.clone();
+    // Non-blocking filter dispatch with sequential generation tracking
+    let filter_tx = worker_tx.clone();
+    static FILTER_GEN: AtomicU64 = AtomicU64::new(0);
+
     ui.on_filter_changed(move |query| {
-        let q = query.trim().to_lowercase();
-        let mut st = filter_state.lock().unwrap();
-        let mut new_visible = Vec::new();
-        let mut filtered_ui = Vec::new();
-
-        for (i, item) in st.all_ui_items.iter().enumerate() {
-            if q.is_empty()
-                || item.display_name.to_lowercase().contains(&q)
-                || item.kind_name.to_lowercase().contains(&q)
-                || item.file_path.to_lowercase().contains(&q)
-            {
-                new_visible.push(i);
-                filtered_ui.push(item.clone());
-            }
-        }
-
-        st.visible_indices = new_visible;
-
-        let ui_h = filter_ui_handle.clone();
-        let _ = slint::invoke_from_event_loop(move || {
-            if let Some(ui) = ui_h.upgrade() {
-                ui.set_asset_list(ModelRc::from(std::rc::Rc::new(VecModel::from(filtered_ui))));
-                ui.set_selected_index(-1);
-            }
+        let generation_id = FILTER_GEN.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = filter_tx.send(WorkerCommand::FilterAssets {
+            query: query.to_string(),
+            generation: generation_id,
         });
     });
 
     ui.on_browse_file(|| {
         rfd::FileDialog::new()
             .pick_file()
-            .map(|p| SharedString::from(p.to_string_lossy().into_owned()))
+            .map(|p| slint::SharedString::from(p.to_string_lossy().into_owned()))
             .unwrap_or_default()
     });
     ui.on_browse_folder(|| {
         rfd::FileDialog::new()
             .pick_folder()
-            .map(|p| SharedString::from(p.to_string_lossy().into_owned()))
+            .map(|p| slint::SharedString::from(p.to_string_lossy().into_owned()))
             .unwrap_or_default()
     });
     ui.on_save_file(|| {
         rfd::FileDialog::new()
             .save_file()
-            .map(|p| SharedString::from(p.to_string_lossy().into_owned()))
+            .map(|p| slint::SharedString::from(p.to_string_lossy().into_owned()))
             .unwrap_or_default()
     });
 

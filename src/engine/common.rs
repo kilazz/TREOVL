@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use byteorder::{BigEndian, LittleEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
 use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
@@ -65,15 +65,15 @@ impl Endian {
 
     pub fn write_u16(self, cur: &mut impl std::io::Write, val: u16) -> Result<(), std::io::Error> {
         match self {
-            Endian::Little => cur.write_u16::<LittleEndian>(val),
-            Endian::Big => cur.write_u16::<BigEndian>(val),
+            Endian::Little => byteorder::WriteBytesExt::write_u16::<LittleEndian>(cur, val),
+            Endian::Big => byteorder::WriteBytesExt::write_u16::<BigEndian>(cur, val),
         }
     }
 
     pub fn write_u32(self, cur: &mut impl std::io::Write, val: u32) -> Result<(), std::io::Error> {
         match self {
-            Endian::Little => cur.write_u32::<LittleEndian>(val),
-            Endian::Big => cur.write_u32::<BigEndian>(val),
+            Endian::Little => byteorder::WriteBytesExt::write_u32::<LittleEndian>(cur, val),
+            Endian::Big => byteorder::WriteBytesExt::write_u32::<BigEndian>(cur, val),
         }
     }
 
@@ -308,8 +308,8 @@ where
         let _ = endian.write_u32(&mut out, large_entries.len() as u32);
     }
     for (id, offset) in small_entries {
-        out.write_u8(id).unwrap();
-        out.write_u8(offset).unwrap();
+        out.push(id);
+        out.push(offset);
     }
     for (id, offset) in large_entries {
         let _ = endian.write_u32(&mut out, id);

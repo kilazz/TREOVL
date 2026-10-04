@@ -7,9 +7,34 @@ use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const LUA_MAGIC: &[u8; 4] = b"\x1bLua";
 pub const LUA_VERSION_50: u8 = 0x50;
+
+static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// RAII guard to guarantee temporary file cleanup across all execution paths.
+struct TempFileGuard(PathBuf);
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// Generates a process-unique, collision-resistant temporary file path.
+fn create_unique_temp_file(prefix: &str, ext: &str) -> (PathBuf, TempFileGuard) {
+    let pid = std::process::id();
+    let seq = TEMP_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("{}_{}_{}_{}.{}", prefix, pid, time, seq, ext));
+    let guard = TempFileGuard(path.clone());
+    (path, guard)
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LuaInfo {
@@ -145,8 +170,7 @@ pub fn compile_lua_script(source_path: &Path) -> Result<Vec<u8>> {
         "Lua 5.0 compiler (luac50.exe) not found! Please place luac50.exe into the root folder or 'bin/' folder.",
     )?;
 
-    let temp_out =
-        std::env::temp_dir().join(format!("ovl_lua_compile_{}.luac", std::process::id()));
+    let (temp_out, _guard) = create_unique_temp_file("ovl_lua_compile", "luac");
 
     let output = Command::new(&compiler)
         .arg("-o")
@@ -167,9 +191,7 @@ pub fn compile_lua_script(source_path: &Path) -> Result<Vec<u8>> {
     let bytecode = fs::read(&temp_out)
         .with_context(|| format!("Failed to read compiled bytecode from {:?}", temp_out))?;
 
-    let _ = fs::remove_file(temp_out);
     validate_lua_50_header(&bytecode)?;
-
     Ok(bytecode)
 }
 
@@ -213,11 +235,9 @@ pub fn decompile_lua_bytecode(bytecode: &[u8]) -> Result<String> {
 
     // 1. Attempt decompilation through external LuaDec 5.0 if installed
     if let Some(luadec) = find_luadec_executable() {
-        let temp_in =
-            std::env::temp_dir().join(format!("ovl_lua_decomp_{}.luac", std::process::id()));
+        let (temp_in, _guard) = create_unique_temp_file("ovl_lua_decomp", "luac");
         if fs::write(&temp_in, bytecode).is_ok() {
             let output = Command::new(&luadec).arg(&temp_in).output();
-            let _ = fs::remove_file(&temp_in);
             if let Ok(out) = output
                 && out.status.success()
             {

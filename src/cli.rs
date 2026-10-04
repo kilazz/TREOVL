@@ -102,6 +102,20 @@ pub enum Commands {
         /// Output .glb file
         output: PathBuf,
     },
+    /// Export 3D collision boundary (.clb) to glTF 2.0 Binary (.glb)
+    ExportCollisionGlb {
+        /// Input collision chunk (.bin or .clb)
+        collision: PathBuf,
+        /// Output .glb file
+        output: PathBuf,
+    },
+    /// Inject 3D collision boxes from glTF 2.0 Binary (.glb) back into collision chunk (.clb)
+    ImportCollisionGlb {
+        /// Target collision chunk (.bin or .clb)
+        collision: PathBuf,
+        /// Input .glb file
+        input: PathBuf,
+    },
     /// Export complete level scene with terrain and entity locators (.omp to .glb)
     ExportLevelGlb {
         /// Input level map (.omp)
@@ -109,11 +123,11 @@ pub enum Commands {
         /// Output .glb file
         output: PathBuf,
     },
-    /// Assemble level scene into .glb instancing real 3D models from assets/meshes
+    /// Assemble level scene into .glb instancing real 3D models with PBR textures
     AssembleLevel {
         /// Input level map (.omp)
         level: PathBuf,
-        /// Extracted assets directory containing meshes/
+        /// Extracted assets directory containing meshes/ and textures/
         assets_dir: PathBuf,
         /// Output .glb file
         output: PathBuf,
@@ -264,6 +278,17 @@ pub fn handle_cli() -> Result<()> {
                 v_count, tri_count
             );
         }
+        Commands::ExportCollisionGlb { collision, output } => {
+            let size = service::export_collision_glb(&collision, &output)?;
+            println!(
+                "[+] 3D Collision boxes exported to glTF (.glb) successfully ({} bytes).",
+                size
+            );
+        }
+        Commands::ImportCollisionGlb { collision, input } => {
+            service::import_collision_glb(&collision, &input)?;
+            println!("[+] Collision chunk successfully updated from 3D .glb boxes.");
+        }
         Commands::ExportLevelGlb { level, output } => {
             let data = fs::read(&level)?;
             let glb = export_level_to_glb(&data)?;
@@ -279,7 +304,7 @@ pub fn handle_cli() -> Result<()> {
             let glb = assemble_level_scene_glb(&data, &assets_dir)?;
             fs::write(&output, glb)?;
             println!(
-                "[+] Full level scene assembled with real meshes into: {:?}",
+                "[+] Full level scene assembled with textured meshes into: {:?}",
                 output
             );
         }
