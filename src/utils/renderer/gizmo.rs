@@ -1,10 +1,12 @@
 use super::camera::ViewportCamera;
 
+/// Renders an interactive 3D coordinate axis gizmo (X=Red, Y=Green, Z=Blue)
+/// on a translucent circular backdrop in the top-right corner of the viewport.
 pub fn render_axis_gizmo(pixels: &mut [u8], width: u32, height: u32, cam: &ViewportCamera) {
     let (sin_y, cos_y) = (cam.yaw.sin(), cam.yaw.cos());
     let (sin_p, cos_p) = (cam.pitch.sin(), cam.pitch.cos());
 
-    // Located in TOP-RIGHT corner
+    // Top-right corner anchor coordinates
     let gizmo_x = width as i32 - 46;
     let gizmo_y = 46i32;
     let radius = 24.0f32;
@@ -17,10 +19,12 @@ pub fn render_axis_gizmo(pixels: &mut [u8], width: u32, height: u32, cam: &Viewp
                 let py = gizmo_y + dy;
                 if px >= 0 && px < width as i32 && py >= 0 && py < height as i32 {
                     let idx = ((py as usize) * (width as usize) + (px as usize)) * 4;
-                    pixels[idx] = 18;
-                    pixels[idx + 1] = 20;
-                    pixels[idx + 2] = 24;
-                    pixels[idx + 3] = 220;
+                    if idx + 3 < pixels.len() {
+                        pixels[idx] = 18;
+                        pixels[idx + 1] = 20;
+                        pixels[idx + 2] = 24;
+                        pixels[idx + 3] = 220;
+                    }
                 }
             }
         }
@@ -34,9 +38,9 @@ pub fn render_axis_gizmo(pixels: &mut [u8], width: u32, height: u32, cam: &Viewp
     };
 
     let axes = [
-        (project_axis(1.0, 0.0, 0.0), [235, 75, 75, 255]), // X: Red
-        (project_axis(0.0, 1.0, 0.0), [75, 215, 85, 255]), // Y: Green
-        (project_axis(0.0, 0.0, 1.0), [75, 140, 245, 255]), // Z: Blue
+        (project_axis(1.0, 0.0, 0.0), [235, 75, 75, 255]), // X-axis: Red
+        (project_axis(0.0, 1.0, 0.0), [75, 215, 85, 255]), // Y-axis: Green
+        (project_axis(0.0, 0.0, 1.0), [75, 140, 245, 255]), // Z-axis: Blue
     ];
 
     for ((dx, dy), color) in axes {
@@ -70,10 +74,12 @@ fn draw_line_2d(
 
         if x >= 0 && x < width as i32 && y >= 0 && y < height as i32 {
             let idx = ((y as usize) * (width as usize) + (x as usize)) * 4;
-            pixels[idx] = color[0];
-            pixels[idx + 1] = color[1];
-            pixels[idx + 2] = color[2];
-            pixels[idx + 3] = color[3];
+            if idx + 3 < pixels.len() {
+                pixels[idx] = color[0];
+                pixels[idx + 1] = color[1];
+                pixels[idx + 2] = color[2];
+                pixels[idx + 3] = color[3];
+            }
         }
     }
 }

@@ -15,7 +15,7 @@ pub fn register(
     let tx_select = tx.clone();
     let state_sel = state.clone();
 
-    // Fast non-blocking selection with bounds check to prevent negative index wrap-around
+    // Fast non-blocking selection with bounds check
     ui.on_select_asset(move |filtered_index| {
         if filtered_index < 0 {
             return;
@@ -35,13 +35,37 @@ pub fn register(
         }
     });
 
-    // Interactive 3D viewport orbit dispatched to worker thread
+    // 3D Viewport Navigation & Orbit Callbacks
     let tx_rotate = tx.clone();
     ui.on_rotate_mesh_viewport(move |delta_yaw, delta_pitch| {
         let _ = tx_rotate.send(WorkerCommand::RotateMeshViewport {
             delta_yaw,
             delta_pitch,
         });
+    });
+
+    let tx_zoom = tx.clone();
+    ui.on_zoom_mesh_viewport(move |delta_zoom| {
+        let _ = tx_zoom.send(WorkerCommand::ZoomMeshViewport { delta_zoom });
+    });
+
+    let tx_fov = tx.clone();
+    ui.on_set_viewport_fov(move |fov_val| {
+        let _ = tx_fov.send(WorkerCommand::SetViewportFov {
+            fov_degrees: fov_val,
+        });
+    });
+
+    let tx_light = tx.clone();
+    ui.on_set_viewport_lighting(move |mode_idx| {
+        let _ = tx_light.send(WorkerCommand::SetViewportLighting {
+            mode: mode_idx as u32,
+        });
+    });
+
+    let tx_reset_cam = tx.clone();
+    ui.on_reset_viewport_camera(move || {
+        let _ = tx_reset_cam.send(WorkerCommand::ResetViewportCamera);
     });
 
     let tx_revert = tx.clone();
@@ -308,15 +332,7 @@ pub fn register(
         });
     });
 
-    let tx_dec_8ld = tx.clone();
-    ui.on_decompile_8ld(move |src_str, dst_str| {
-        let _ = tx_dec_8ld.send(WorkerCommand::Decompile8ldDirect {
-            src: PathBuf::from(src_str.as_str()),
-            dst: PathBuf::from(dst_str.as_str()),
-        });
-    });
-
-    // 8LD -> XML (1 file)
+    // 8LD -> XML (Single file)
     let tx_dec_8ld = tx.clone();
     ui.on_decompile_8ld(move |src_str, dst_str| {
         let _ = tx_dec_8ld.send(WorkerCommand::Decompile8ldDirect {
@@ -334,7 +350,7 @@ pub fn register(
         });
     });
 
-    // XML -> 8LD (1 file)
+    // XML -> 8LD (Single file)
     let tx_comp_8ld = tx.clone();
     ui.on_compile_8ld(move |src_str, dst_str| {
         let _ = tx_comp_8ld.send(WorkerCommand::Compile8ldDirect {

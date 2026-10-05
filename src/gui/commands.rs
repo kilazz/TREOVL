@@ -40,6 +40,16 @@ pub enum WorkerCommand {
         delta_yaw: f32,
         delta_pitch: f32,
     },
+    ZoomMeshViewport {
+        delta_zoom: f32,
+    },
+    SetViewportFov {
+        fov_degrees: f32,
+    },
+    SetViewportLighting {
+        mode: u32,
+    },
+    ResetViewportCamera,
     FilterAssets {
         query: String,
         generation: u64,

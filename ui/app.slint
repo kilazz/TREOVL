@@ -1,4 +1,10 @@
-import { TextEdit, Button, LineEdit, ListView } from "std-widgets.slint";
+import {
+    TextEdit,
+    Button,
+    LineEdit,
+    ListView,
+    Slider,
+} from "std-widgets.slint";
 import { TabButton, CustomButton } from "./components/buttons.slint";
 import { SectionTitle, SplitterBar } from "./components/common.slint";
 import { Viewport3DView } from "./views/viewport_3d.slint";
@@ -16,10 +22,10 @@ export struct AssetItem {
 
 export component AppWindow inherits Window {
     title: "Overlord Modding Studio — Workspace";
-    min-width: 1040px;
+    min-width: 1080px;
     min-height: 720px;
-    preferred-width: 1320px;
-    preferred-height: 840px;
+    preferred-width: 1360px;
+    preferred-height: 860px;
     background: #141414;
 
     // View Tabs: 0 = Workspace, 1 = Terminal Log
@@ -39,6 +45,10 @@ export component AppWindow inherits Window {
     in-out property <string> status_msg: "Ready.";
     in-out property <bool> status_is_error: false;
     in-out property <string> log_text: "System Ready.\n";
+
+    // 3D Viewport Controls State
+    in-out property <float> viewport_fov: 45.0;
+    in-out property <int> viewport_lighting: 0;
 
     // Active Asset Inspector States
     in-out property <image> tex_preview;
@@ -67,8 +77,12 @@ export component AppWindow inherits Window {
     callback select_asset(int);
     callback filter_changed(string);
 
-    // Interactive 3D Viewport Orbit Callback
+    // Interactive 3D Viewport Orbit & Camera Callbacks
     callback rotate_mesh_viewport(float, float);
+    callback zoom_mesh_viewport(float);
+    callback set_viewport_fov(float);
+    callback set_viewport_lighting(int);
+    callback reset_viewport_camera();
 
     // Contextual Asset Operations Callbacks (for loaded project chunks)
     callback export_dds(string, string);
@@ -953,7 +967,7 @@ export component AppWindow inherits Window {
                             save_clicked => { root.save_material(root.active_file_path, root.mat_json_text); }
                         }
 
-                        // Context 3: 3D Mesh (Perspective 3D Viewport with HUD stats in top-left)
+                        // Context 3: 3D Mesh (Hardware-accelerated Viewport with Zoom, FOV, Fit, and Studio Lighting in Header)
                         if root.active_kind_id == 3: VerticalLayout {
                             spacing: 10px;
                             vertical-stretch: 1;
@@ -964,28 +978,31 @@ export component AppWindow inherits Window {
                             }
 
                             HorizontalLayout {
-                                spacing: 8px;
+                                spacing: 6px;
+                                alignment: start;
+                                height: 30px;
+
                                 CustomButton {
                                     icon: "🗿";
-                                    text: "Export to .OBJ / .GLB";
+                                    text: "Export 3D";
                                     primary-color: #3e6a90;
-                                    min-w: 145px;
+                                    min-w: 110px;
                                     clicked => { let out = root.save_file(); if (out != "") { root.export_mesh_obj(root.active_file_path, out); } }
                                 }
 
                                 CustomButton {
                                     icon: "📤";
-                                    text: "Replace from .OBJ / .GLB";
+                                    text: "Replace 3D";
                                     primary-color: #23a55a;
-                                    min-w: 155px;
+                                    min-w: 115px;
                                     clicked => { let inp = root.browse_file(); if (inp != "") { root.import_mesh_obj(root.active_file_path, inp); } }
                                 }
 
                                 CustomButton {
                                     icon: "⛰️";
-                                    text: "Export Terrain to 3D";
+                                    text: "Terrain 3D";
                                     primary-color: #4e5058;
-                                    min-w: 145px;
+                                    min-w: 110px;
                                     clicked => { let out = root.save_file(); if (out != "") { root.export_terrain_obj(root.active_file_path, out); } }
                                 }
 
@@ -993,12 +1010,185 @@ export component AppWindow inherits Window {
                                     horizontal-stretch: 1;
                                 }
 
-                                Text {
-                                    text: root.mesh_info;
-                                    font-family: "Consolas";
-                                    color: #cfcfcf;
-                                    font-size: 11px;
-                                    vertical-alignment: center;
+                                // --- INTEGRATED TOP CONTROLS TOOLBAR (FIT, ZOOM, FOV, LIGHTING) ---
+                                Rectangle {
+                                    background: #20242c;
+                                    border-radius: 4px;
+                                    border-width: 1px;
+                                    border-color: #353535;
+
+                                    HorizontalLayout {
+                                        padding-left: 8px;
+                                        padding-right: 8px;
+                                        spacing: 6px;
+                                        alignment: center;
+
+                                        // Fit Button
+                                        Rectangle {
+                                            width: 55px;
+                                            height: 22px;
+                                            background: fit_ta.has-hover ? #3e6a90 : #2b303c;
+                                            border-radius: 3px;
+                                            border-width: 1px;
+                                            border-color: #3e4450;
+                                            Text {
+                                                text: "🎯 Fit";
+                                                font-size: 11px;
+                                                font-weight: 700;
+                                                color: #ffffff;
+                                                vertical-alignment: center;
+                                                horizontal-alignment: center;
+                                            }
+
+                                            fit_ta := TouchArea {
+                                                mouse-cursor: pointer;
+                                                clicked => { root.reset_viewport_camera(); }
+                                            }
+                                        }
+
+                                        // Zoom Buttons
+                                        Rectangle {
+                                            width: 24px;
+                                            height: 22px;
+                                            background: zin_ta.has-hover ? #3e6a90 : #2b303c;
+                                            border-radius: 3px;
+                                            border-width: 1px;
+                                            border-color: #3e4450;
+                                            Text {
+                                                text: "➕";
+                                                font-size: 9px;
+                                                color: #ffffff;
+                                                vertical-alignment: center;
+                                                horizontal-alignment: center;
+                                            }
+
+                                            zin_ta := TouchArea {
+                                                mouse-cursor: pointer;
+                                                clicked => { root.zoom_mesh_viewport(1.0); }
+                                            }
+                                        }
+
+                                        Rectangle {
+                                            width: 24px;
+                                            height: 22px;
+                                            background: zout_ta.has-hover ? #3e6a90 : #2b303c;
+                                            border-radius: 3px;
+                                            border-width: 1px;
+                                            border-color: #3e4450;
+                                            Text {
+                                                text: "➖";
+                                                font-size: 9px;
+                                                color: #ffffff;
+                                                vertical-alignment: center;
+                                                horizontal-alignment: center;
+                                            }
+
+                                            zout_ta := TouchArea {
+                                                mouse-cursor: pointer;
+                                                clicked => { root.zoom_mesh_viewport(-1.0); }
+                                            }
+                                        }
+
+                                        Rectangle {
+                                            width: 1px;
+                                            height: 16px;
+                                            background: #3e4450;
+                                        }
+
+                                        // FOV Slider
+                                        Text {
+                                            text: "FOV: " + Math.round(root.viewport_fov) + "°";
+                                            font-family: "Consolas";
+                                            font-size: 11px;
+                                            color: #cfcfcf;
+                                            vertical-alignment: center;
+                                            width: 54px;
+                                        }
+
+                                        Slider {
+                                            width: 80px;
+                                            minimum: 25.0;
+                                            maximum: 85.0;
+                                            value <=> root.viewport_fov;
+                                            changed(val) => { root.set_viewport_fov(val); }
+                                        }
+
+                                        Rectangle {
+                                            width: 1px;
+                                            height: 16px;
+                                            background: #3e4450;
+                                        }
+
+                                        // Lighting mode chips
+                                        Rectangle {
+                                            width: 62px;
+                                            height: 22px;
+                                            background: root.viewport_lighting == 0 ? #23a55a : (l0_ta.has-hover ? #3e4450 : #2b303c);
+                                            border-radius: 3px;
+                                            Text {
+                                                text: "☀️ Studio";
+                                                font-size: 10.5px;
+                                                font-weight: 700;
+                                                color: #ffffff;
+                                                vertical-alignment: center;
+                                                horizontal-alignment: center;
+                                            }
+
+                                            l0_ta := TouchArea {
+                                                mouse-cursor: pointer;
+                                                clicked => {
+                                                    root.viewport_lighting = 0;
+                                                    root.set_viewport_lighting(0);
+                                                }
+                                            }
+                                        }
+
+                                        Rectangle {
+                                            width: 60px;
+                                            height: 22px;
+                                            background: root.viewport_lighting == 1 ? #d28e1b : (l1_ta.has-hover ? #3e4450 : #2b303c);
+                                            border-radius: 3px;
+                                            Text {
+                                                text: "💡 Bright";
+                                                font-size: 10.5px;
+                                                font-weight: 700;
+                                                color: #ffffff;
+                                                vertical-alignment: center;
+                                                horizontal-alignment: center;
+                                            }
+
+                                            l1_ta := TouchArea {
+                                                mouse-cursor: pointer;
+                                                clicked => {
+                                                    root.viewport_lighting = 1;
+                                                    root.set_viewport_lighting(1);
+                                                }
+                                            }
+                                        }
+
+                                        Rectangle {
+                                            width: 56px;
+                                            height: 22px;
+                                            background: root.viewport_lighting == 2 ? #5865f2 : (l2_ta.has-hover ? #3e4450 : #2b303c);
+                                            border-radius: 3px;
+                                            Text {
+                                                text: "🎨 Unlit";
+                                                font-size: 10.5px;
+                                                font-weight: 700;
+                                                color: #ffffff;
+                                                vertical-alignment: center;
+                                                horizontal-alignment: center;
+                                            }
+
+                                            l2_ta := TouchArea {
+                                                mouse-cursor: pointer;
+                                                clicked => {
+                                                    root.viewport_lighting = 2;
+                                                    root.set_viewport_lighting(2);
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
 
@@ -1007,6 +1197,7 @@ export component AppWindow inherits Window {
                                 has_mesh: root.has_mesh;
                                 stats_lines: root.mesh_stats_lines;
                                 rotate_viewport(dyaw, dpitch) => { root.rotate_mesh_viewport(dyaw, dpitch); }
+                                zoom_viewport(delta) => { root.zoom_mesh_viewport(delta); }
                             }
                         }
 

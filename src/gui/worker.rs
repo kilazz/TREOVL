@@ -9,9 +9,10 @@ use crate::engine::math::Vector3;
 use crate::engine::service;
 use crate::gui::commands::WorkerCommand;
 use crate::gui::{ActiveMeshPreview, AppState, resolve_project_dir, scan_project_folder};
+use crate::utils::dds_decoder;
 use crate::utils::logger::UiLogger;
 use crate::utils::renderer::TextureData;
-use crate::utils::{dds_decoder, renderer};
+use crate::utils::renderer::wgpu_backend::WgpuRenderer;
 
 pub struct ResolvedTexture {
     pub filename: String,
@@ -24,6 +25,7 @@ pub struct BackgroundWorker {
     ui_handle: slint::Weak<AppWindow>,
     logger: UiLogger,
     state: Arc<Mutex<AppState>>,
+    gpu_renderer: Option<WgpuRenderer>,
 }
 
 impl BackgroundWorker {
@@ -32,16 +34,53 @@ impl BackgroundWorker {
         logger: UiLogger,
         state: Arc<Mutex<AppState>>,
     ) -> Self {
+        let gpu_renderer = Some(WgpuRenderer::new());
+
         Self {
             ui_handle,
             logger,
             state,
+            gpu_renderer,
         }
     }
 
     pub fn run(mut self, rx: Receiver<WorkerCommand>) {
         while let Ok(cmd) = rx.recv() {
-            self.handle_command(cmd);
+            match cmd {
+                WorkerCommand::RotateMeshViewport {
+                    mut delta_yaw,
+                    mut delta_pitch,
+                } => {
+                    let mut extra_commands = Vec::new();
+                    while let Ok(next_cmd) = rx.try_recv() {
+                        match next_cmd {
+                            WorkerCommand::RotateMeshViewport {
+                                delta_yaw: dy,
+                                delta_pitch: dp,
+                            } => {
+                                delta_yaw += dy;
+                                delta_pitch += dp;
+                            }
+                            other => {
+                                extra_commands.push(other);
+                                break;
+                            }
+                        }
+                    }
+
+                    self.handle_command(WorkerCommand::RotateMeshViewport {
+                        delta_yaw,
+                        delta_pitch,
+                    });
+
+                    for other_cmd in extra_commands {
+                        self.handle_command(other_cmd);
+                    }
+                }
+                other => {
+                    self.handle_command(other);
+                }
+            }
         }
     }
 
@@ -168,16 +207,17 @@ impl BackgroundWorker {
                             let sy = (max.y - min.y).abs();
                             let sz = (max.z - min.z).abs();
 
-                            // Search assets/textures/ for matching diffuse texture
                             let resolved_tex = {
                                 let st = self.state.lock().unwrap();
                                 resolve_diffuse_texture(st.current_proj_dir.as_deref())
                             };
 
                             let tex_desc = if let Some(ref t) = resolved_tex {
-                                format!("Texture: {} ({}×{})", t.filename, t.width, t.height)
+                                let clean_name =
+                                    t.filename.split("_chunk_").next().unwrap_or(&t.filename);
+                                format!("Texture: {} ({}×{})", clean_name, t.width, t.height)
                             } else {
-                                "Texture: None (Studio Clay)".to_string()
+                                "Texture: None (Hardware Unlit)".to_string()
                             };
 
                             mesh_info = format!(
@@ -220,8 +260,18 @@ impl BackgroundWorker {
                             let tex_arc =
                                 resolved_tex.map(|t| Arc::new((t.width, t.height, t.rgba)));
 
+                            // Auto-fit camera distance based on bounding box
+                            let max_dim = sx.max(sy).max(sz).max(1.0);
+                            let auto_dist = (max_dim * 1.75).clamp(1.5, 300.0);
+
                             let cam = {
                                 let mut st = self.state.lock().unwrap();
+                                st.camera.distance = auto_dist;
+                                st.camera.target = Vector3 {
+                                    x: (min.x + max.x) * 0.5,
+                                    y: (min.y + max.y) * 0.5,
+                                    z: (min.z + max.z) * 0.5,
+                                };
                                 st.active_mesh = Some(ActiveMeshPreview {
                                     positions: parsed.positions.clone(),
                                     indices: parsed.indices.clone(),
@@ -238,7 +288,8 @@ impl BackgroundWorker {
                                 rgba: &t.2,
                             });
 
-                            let buf = renderer::render_mesh_preview(
+                            // --- GPU Accelerated WGPU Render ---
+                            let buf = self.gpu_renderer.as_mut().unwrap().render(
                                 &parsed.positions,
                                 &parsed.indices,
                                 &parsed.normals,
@@ -247,6 +298,7 @@ impl BackgroundWorker {
                                 (1024, 1024),
                                 &cam,
                             );
+
                             mesh_buf = Some(buf);
                             has_mesh = true;
                         }
@@ -490,7 +542,9 @@ impl BackgroundWorker {
                             height: t.1,
                             rgba: &t.2,
                         });
-                        renderer::render_mesh_preview(
+
+                        // Fast GPU render using persistent render targets & uniform updates
+                        self.gpu_renderer.as_mut().unwrap().render(
                             &mesh.positions,
                             &mesh.indices,
                             &mesh.normals,
@@ -508,6 +562,181 @@ impl BackgroundWorker {
                         if let Some(ui) = ui_h.upgrade() {
                             ui.set_mesh_preview(Image::from_rgba8(buf));
                             ui.set_has_mesh(true);
+                        }
+                    });
+                }
+            }
+
+            WorkerCommand::ZoomMeshViewport { delta_zoom } => {
+                let factor = if delta_zoom > 0.0 { 0.88 } else { 1.14 };
+                let buf_opt = {
+                    let mut st = self.state.lock().unwrap();
+                    st.camera.zoom(factor);
+                    let cam = st.camera;
+
+                    st.active_mesh.as_ref().map(|mesh| {
+                        let tex_ref = mesh.texture.as_ref().map(|t| TextureData {
+                            width: t.0,
+                            height: t.1,
+                            rgba: &t.2,
+                        });
+
+                        self.gpu_renderer.as_mut().unwrap().render(
+                            &mesh.positions,
+                            &mesh.indices,
+                            &mesh.normals,
+                            &mesh.uvs,
+                            tex_ref.as_ref(),
+                            (1024, 1024),
+                            &cam,
+                        )
+                    })
+                };
+
+                if let Some(buf) = buf_opt {
+                    let ui_h = self.ui_handle.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = ui_h.upgrade() {
+                            ui.set_mesh_preview(Image::from_rgba8(buf));
+                        }
+                    });
+                }
+            }
+
+            WorkerCommand::SetViewportFov { fov_degrees } => {
+                let buf_opt = {
+                    let mut st = self.state.lock().unwrap();
+                    st.camera.fov_degrees = fov_degrees.clamp(20.0, 90.0);
+                    let cam = st.camera;
+
+                    st.active_mesh.as_ref().map(|mesh| {
+                        let tex_ref = mesh.texture.as_ref().map(|t| TextureData {
+                            width: t.0,
+                            height: t.1,
+                            rgba: &t.2,
+                        });
+
+                        self.gpu_renderer.as_mut().unwrap().render(
+                            &mesh.positions,
+                            &mesh.indices,
+                            &mesh.normals,
+                            &mesh.uvs,
+                            tex_ref.as_ref(),
+                            (1024, 1024),
+                            &cam,
+                        )
+                    })
+                };
+
+                if let Some(buf) = buf_opt {
+                    let ui_h = self.ui_handle.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = ui_h.upgrade() {
+                            ui.set_mesh_preview(Image::from_rgba8(buf));
+                        }
+                    });
+                }
+            }
+
+            WorkerCommand::SetViewportLighting { mode } => {
+                let buf_opt = {
+                    let mut st = self.state.lock().unwrap();
+                    st.camera.lighting_mode = mode;
+                    let cam = st.camera;
+
+                    st.active_mesh.as_ref().map(|mesh| {
+                        let tex_ref = mesh.texture.as_ref().map(|t| TextureData {
+                            width: t.0,
+                            height: t.1,
+                            rgba: &t.2,
+                        });
+
+                        self.gpu_renderer.as_mut().unwrap().render(
+                            &mesh.positions,
+                            &mesh.indices,
+                            &mesh.normals,
+                            &mesh.uvs,
+                            tex_ref.as_ref(),
+                            (1024, 1024),
+                            &cam,
+                        )
+                    })
+                };
+
+                if let Some(buf) = buf_opt {
+                    let ui_h = self.ui_handle.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = ui_h.upgrade() {
+                            ui.set_mesh_preview(Image::from_rgba8(buf));
+                        }
+                    });
+                }
+            }
+
+            WorkerCommand::ResetViewportCamera => {
+                let buf_opt = {
+                    let mut st = self.state.lock().unwrap();
+                    st.camera.yaw = 0.785;
+                    st.camera.pitch = 0.35;
+                    st.camera.fov_degrees = 45.0;
+
+                    if let Some(ref mesh) = st.active_mesh {
+                        let mut min = Vector3 {
+                            x: f32::INFINITY,
+                            y: f32::INFINITY,
+                            z: f32::INFINITY,
+                        };
+                        let mut max = Vector3 {
+                            x: f32::NEG_INFINITY,
+                            y: f32::NEG_INFINITY,
+                            z: f32::NEG_INFINITY,
+                        };
+                        for p in &mesh.positions {
+                            min.x = min.x.min(p.x);
+                            min.y = min.y.min(p.y);
+                            min.z = min.z.min(p.z);
+                            max.x = max.x.max(p.x);
+                            max.y = max.y.max(p.y);
+                            max.z = max.z.max(p.z);
+                        }
+                        let sx = (max.x - min.x).abs();
+                        let sy = (max.y - min.y).abs();
+                        let sz = (max.z - min.z).abs();
+                        let max_dim = sx.max(sy).max(sz).max(1.0);
+                        st.camera.distance = (max_dim * 1.75).clamp(1.5, 300.0);
+                        st.camera.target = Vector3 {
+                            x: (min.x + max.x) * 0.5,
+                            y: (min.y + max.y) * 0.5,
+                            z: (min.z + max.z) * 0.5,
+                        };
+                    }
+
+                    let cam = st.camera;
+
+                    st.active_mesh.as_ref().map(|mesh| {
+                        let tex_ref = mesh.texture.as_ref().map(|t| TextureData {
+                            width: t.0,
+                            height: t.1,
+                            rgba: &t.2,
+                        });
+
+                        self.gpu_renderer.as_mut().unwrap().render(
+                            &mesh.positions,
+                            &mesh.indices,
+                            &mesh.normals,
+                            &mesh.uvs,
+                            tex_ref.as_ref(),
+                            (1024, 1024),
+                            &cam,
+                        )
+                    })
+                };
+
+                if let Some(buf) = buf_opt {
+                    let ui_h = self.ui_handle.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = ui_h.upgrade() {
+                            ui.set_mesh_preview(Image::from_rgba8(buf));
                         }
                     });
                 }

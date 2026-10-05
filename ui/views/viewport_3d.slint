@@ -2,7 +2,9 @@ export component Viewport3DView inherits Rectangle {
     in property <image> preview_image;
     in property <bool> has_mesh: false;
     in property <[string]> stats_lines: [];
+
     callback rotate_viewport(float, float);
+    callback zoom_viewport(float);
 
     background: #111214;
     border-radius: 4px;
@@ -26,25 +28,27 @@ export component Viewport3DView inherits Rectangle {
         horizontal-alignment: center;
     }
 
-    // Geometry Statistics HUD in TOP-LEFT corner
+    // --- TOP-LEFT: GEOMETRY HUD ---
     if root.has_mesh && root.stats_lines.length > 0: Rectangle {
         x: 12px;
         y: 12px;
-        width: 260px;
-        background: #111317dd;
+        width: 370px;
+        height: hud_layout.preferred-height;
+        background: #0f1115f0;
         border-radius: 6px;
         border-width: 1px;
         border-color: #2c323b;
 
-        VerticalLayout {
-            padding: 8px;
-            spacing: 4px;
+        hud_layout := VerticalLayout {
+            padding: 10px;
+            spacing: 5px;
+            alignment: start;
 
             HorizontalLayout {
                 spacing: 6px;
                 Text {
                     text: "📊 Geometry & Material Stats";
-                    font-size: 11px;
+                    font-size: 12px;
                     font-weight: 700;
                     color: #f0b132;
                 }
@@ -58,8 +62,8 @@ export component Viewport3DView inherits Rectangle {
             for line in root.stats_lines: Text {
                 text: line;
                 font-family: "Consolas";
-                font-size: 10px;
-                color: #cfd3dc;
+                font-size: 11.5px;
+                color: #e2e4e9;
                 overflow: elide;
             }
         }
@@ -70,24 +74,32 @@ export component Viewport3DView inherits Rectangle {
     property <bool> is_dragging: false;
 
     TouchArea {
-        mouse-cursor: grab;
-        moved => {
-            if (self.pressed) {
-                if (!is_dragging) {
-                    is_dragging = true;
-                    drag_last_x = self.mouse-x;
-                    drag_last_y = self.mouse-y;
-                } else {
-                    let dx = (self.mouse-x - drag_last_x) / 1px;
-                    let dy = (self.mouse-y - drag_last_y) / 1px;
-                    drag_last_x = self.mouse-x;
-                    drag_last_y = self.mouse-y;
-                    if (dx != 0 || dy != 0) {
-                        root.rotate_viewport(dx / 80.0, dy / 80.0);
-                    }
-                }
-            } else {
+        mouse-cursor: self.pressed ? grabbing : grab;
+
+        scroll-event(event) => {
+            root.zoom_viewport(event.delta-y / 1px);
+            return accept;
+        }
+
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down) {
+                is_dragging = true;
+                drag_last_x = self.mouse-x;
+                drag_last_y = self.mouse-y;
+            } else if (event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) {
                 is_dragging = false;
+            }
+        }
+
+        moved => {
+            if (self.pressed && is_dragging) {
+                let dx = (self.mouse-x - drag_last_x) / 1px;
+                let dy = (self.mouse-y - drag_last_y) / 1px;
+                drag_last_x = self.mouse-x;
+                drag_last_y = self.mouse-y;
+                if (dx != 0 || dy != 0) {
+                    root.rotate_viewport(dx * 0.015, dy * 0.015);
+                }
             }
         }
     }
