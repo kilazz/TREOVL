@@ -43,6 +43,7 @@ pub fn get_standard_processors() -> Vec<Box<dyn AssetProcessor>> {
     vec![
         Box::new(entities::CharacterProcessor),
         Box::new(entities::AttachmentProcessor),
+        Box::new(entities::ProjectileProcessor),
         Box::new(entities::ObjectProcessor),
         Box::new(media::TextureProcessor),
         Box::new(media::AudioProcessor),

@@ -16,6 +16,10 @@ pub struct ItemAttachmentJson {
     pub mesh_package: String,
     pub submesh_name: String,
     pub sound_bank: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drop_sound: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub impact_sound: Option<String>,
     pub hold_offset: [f32; 3],
     pub flags: ItemFlagsJson,
     pub socket: ItemSocketConfigJson,
@@ -25,6 +29,7 @@ pub struct ItemAttachmentJson {
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct AttachmentEngineMetadataJson {
     pub resource_tag: String,
+    pub type_id_hex: String,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub unmapped_properties: Vec<RawAttachmentProp>,
 }
@@ -66,19 +71,22 @@ pub struct RawAttachmentProp {
 
 pub fn export_attachment_to_json(data: &[u8]) -> Result<String> {
     if data.len() < 7 {
-        bail!("Data too short for Item Attachment");
+        bail!("Data too short for Item / Weapon Attachment");
     }
 
     let (_, root_elements) =
         parse_chunk_elements(data).context("Failed to parse root Attachment container")?;
 
     let mut resource_tag = String::new();
-    let mut item_name = String::from("Plate");
+    let mut item_name = String::from("Item");
     let mut internal_model_slot = String::new();
     let mut mesh_package = String::new();
     let mut submesh_name = String::new();
     let mut sound_bank = String::new();
+    let mut drop_sound = None;
+    let mut impact_sound = None;
     let mut hold_offset = [0.0f32, 0.0f32, 0.0f32];
+    let mut item_type_id = 0x0046200Du32;
 
     let mut flags = ItemFlagsJson {
         is_pickable: true,
@@ -109,18 +117,30 @@ pub fn export_attachment_to_json(data: &[u8]) -> Result<String> {
         resource_tag = s;
     }
 
-    // 2. Item Resource (0x0046200D) in Chunk ID 21
-    if let Some((_, item_bytes)) = root_elements.iter().find(|(id, _)| *id == 21) {
-        let payload =
-            if let Some(pos) = item_bytes.windows(4).position(|w| w == b"\x0D\x20\x46\x00") {
-                &item_bytes[pos..]
-            } else if item_bytes.starts_with(b"\x01\x01\x00") && item_bytes.len() > 6 {
-                &item_bytes[6..]
-            } else {
-                item_bytes
-            };
+    // 2. Scan internal item payload (0x0046200D: Item or 0x00462015: Weapon)
+    for (_, chunk_bytes) in &root_elements {
+        let payload_opt = if let Some(pos) = chunk_bytes
+            .windows(4)
+            .position(|w| w == b"\x0D\x20\x46\x00")
+        {
+            item_type_id = 0x0046200D;
+            Some(&chunk_bytes[pos..])
+        } else if let Some(pos) = chunk_bytes
+            .windows(4)
+            .position(|w| w == b"\x15\x20\x46\x00")
+        {
+            item_type_id = 0x00462015;
+            Some(&chunk_bytes[pos..])
+        } else if chunk_bytes.starts_with(b"\x01\x01\x00") && chunk_bytes.len() > 6 {
+            Some(&chunk_bytes[6..])
+        } else {
+            None
+        };
 
-        if let Ok((_type_id, elements)) = parse_typed_container(payload) {
+        if let Some(payload) = payload_opt
+            && let Ok((type_id, elements)) = parse_typed_container(payload)
+        {
+            item_type_id = type_id;
             for (id, chunk) in elements {
                 match id {
                     20 => {
@@ -178,12 +198,23 @@ pub fn export_attachment_to_json(data: &[u8]) -> Result<String> {
                             hold_offset = pos;
                         }
                     }
-                    23 | 28 | 36 | 140 | 141 | 19 | 1 => {}
+                    // Weapon specific sound cues
                     _ => {
-                        unmapped_properties.push(RawAttachmentProp {
-                            id,
-                            hex: hex::encode_upper(&chunk),
-                        });
+                        if let Some(s) = read_length_prefixed_string(&chunk) {
+                            if s.starts_with("Drop ") {
+                                drop_sound = Some(s);
+                                continue;
+                            } else if s.contains("Impact") || s.contains("Hit") {
+                                impact_sound = Some(s);
+                                continue;
+                            }
+                        }
+                        if ![23, 28, 36, 140, 141, 19, 1].contains(&id) {
+                            unmapped_properties.push(RawAttachmentProp {
+                                id,
+                                hex: hex::encode_upper(&chunk),
+                            });
+                        }
                     }
                 }
             }
@@ -206,6 +237,7 @@ pub fn export_attachment_to_json(data: &[u8]) -> Result<String> {
 
     let metadata = AttachmentEngineMetadataJson {
         resource_tag,
+        type_id_hex: format!("{:08X}", item_type_id),
         unmapped_properties,
     };
 
@@ -216,6 +248,8 @@ pub fn export_attachment_to_json(data: &[u8]) -> Result<String> {
         mesh_package,
         submesh_name,
         sound_bank,
+        drop_sound,
+        impact_sound,
         hold_offset,
         flags,
         socket,
@@ -228,6 +262,16 @@ pub fn export_attachment_to_json(data: &[u8]) -> Result<String> {
 pub fn import_attachment_from_json(json_str: &str) -> Result<Vec<u8>> {
     let parsed: ItemAttachmentJson =
         serde_json::from_str(json_str).context("Syntax error in Item Attachment JSON format")?;
+
+    let type_id = u32::from_str_radix(
+        parsed
+            ._engine_metadata
+            .type_id_hex
+            .trim()
+            .trim_start_matches("0x"),
+        16,
+    )
+    .unwrap_or(0x0046200D);
 
     let mut item_sub = Vec::new();
     item_sub.push((
@@ -242,12 +286,7 @@ pub fn import_attachment_from_json(json_str: &str) -> Result<Vec<u8>> {
         .trim()
         .trim_start_matches("0x")
         .trim_start_matches("0X");
-    let mut flag_bits = u32::from_str_radix(raw_hex, 16).with_context(|| {
-        format!(
-            "Invalid hex representation in flags.raw_mask_hex: '{}'",
-            parsed.flags.raw_mask_hex
-        )
-    })?;
+    let mut flag_bits = u32::from_str_radix(raw_hex, 16).unwrap_or(0x21400000);
 
     if parsed.flags.is_pickable {
         flag_bits |= 0x01;
@@ -302,32 +341,19 @@ pub fn import_attachment_from_json(json_str: &str) -> Result<Vec<u8>> {
     item_sub.push((140, vec![1u8, 1, 0, 0]));
     item_sub.push((141, vec![1u8, 1, 0, 0]));
 
-    for (i, val) in parsed.hold_offset.iter().enumerate() {
-        if !val.is_finite() {
-            bail!(
-                "hold_offset[{}] must be a finite floating-point value, encountered: {}",
-                i,
-                val
-            );
-        }
-    }
     item_sub.push((143, build_transform_offset(parsed.hold_offset)));
 
     for prop in parsed._engine_metadata.unmapped_properties {
-        let b = hex::decode(&prop.hex).with_context(|| {
-            format!(
-                "Invalid hex sequence in unmapped property ID {}: '{}'",
-                prop.id, prop.hex
-            )
-        })?;
-        item_sub.push((prop.id, b));
+        if let Ok(b) = hex::decode(&prop.hex) {
+            item_sub.push((prop.id, b));
+        }
     }
 
     item_sub.push((19, vec![0xFF, 0xFF, 0xFF, 0xFF]));
     item_sub.push((1, vec![0u8]));
     item_sub.sort_by_key(|&(id, _)| id);
 
-    let item_resource_blob = build_typed_container(0x0046_200D, &item_sub);
+    let item_resource_blob = build_typed_container(type_id, &item_sub);
 
     let sound_elems = vec![
         (10, write_length_prefixed_string(&parsed.sound_bank)),
@@ -340,7 +366,7 @@ pub fn import_attachment_from_json(json_str: &str) -> Result<Vec<u8>> {
         .internal_model_slot
         .split('\\')
         .next()
-        .unwrap_or("17040")
+        .unwrap_or("9872")
         .trim_start_matches('[')
         .trim_end_matches(']');
     prefix_21.extend_from_slice(&write_length_prefixed_string(slot_tag));

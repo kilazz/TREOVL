@@ -28,6 +28,7 @@ pub enum AssetKind {
     UiSprite = 22,
     Dta = 23,
     VoicePackage = 24,
+    Projectile = 25,
 }
 
 impl AssetKind {
@@ -39,7 +40,7 @@ impl AssetKind {
             Self::Mesh => 3,
             Self::Lua => 4,
             Self::UI => 6,
-            Self::Object | Self::Character | Self::Attachment => 7,
+            Self::Object | Self::Character | Self::Attachment | Self::Projectile => 7,
             Self::Animation => 8,
             Self::TerrainPalette => 9,
             Self::Collision => 10,
@@ -101,18 +102,35 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
             (AssetKind::Generic, "Triumph Binary Container", "📦")
         }
 
-    // Priority 3: Attached Items / Equipment (TREItemResource, TypeID 0x0046200D)
-    } else if data.windows(4).any(|w| w == b"\x0D\x20\x46\x00")
+    // Priority 3: Weapons, Items, Attachments (0x0046200D & 0x00462015)
+    } else if data
+        .windows(4)
+        .any(|w| w == b"\x0D\x20\x46\x00" || w == b"\x15\x20\x46\x00")
         || (data.len() >= 4
-            && u32::from_le_bytes(data[0..4].try_into().unwrap_or_default()) == 0x0046200D)
+            && (u32::from_le_bytes(data[0..4].try_into().unwrap_or_default()) == 0x0046200D
+                || u32::from_le_bytes(data[0..4].try_into().unwrap_or_default()) == 0x00462015))
+    {
+        let is_weapon = data.starts_with(b"\x15\x20\x46\x00")
+            || data.windows(4).any(|w| w == b"\x15\x20\x46\x00");
+        let (label, icon) = if is_weapon {
+            ("Weapon Resource (TREWeaponResource)", "🗡️")
+        } else {
+            ("Attached Item / Prop (TREItemResource)", "🍽️")
+        };
+        (AssetKind::Attachment, label, icon)
+
+    // Priority 4: Combat Projectiles, Spells, Arrows (0x00463006)
+    } else if data.starts_with(b"\x06\x30\x46\x00")
+        || (data.len() >= 4
+            && u32::from_le_bytes(data[0..4].try_into().unwrap_or_default()) == 0x00463006)
     {
         (
-            AssetKind::Attachment,
-            "Attached Item / Prop (TREItemResource)",
-            "🍽️",
+            AssetKind::Projectile,
+            "Combat Projectile / Spell (TREProjectile)",
+            "🏹",
         )
 
-    // Priority 4: Textures and Surface Maps
+    // Priority 5: Textures and Surface Maps
     } else if magic_bytes == magic::TEX_3D {
         (AssetKind::Texture, "TRETexture (3D/2D)", "🎨")
     } else if magic_bytes == magic::TEX_CUBEMAP {
@@ -120,7 +138,7 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
     } else if magic_bytes == magic::TEX_INTERFACE {
         (AssetKind::Texture, "TREInterfaceImage (TGA)", "🖼️")
 
-    // Priority 5: Audio Containers (Direct or wrapped in typed container tables)
+    // Priority 6: Audio Containers
     } else if magic_bytes == magic::AUDIO_WAV
         || magic_bytes == b"\x00\x00\xA1\x00"
         || data[..data.len().min(512)]
@@ -129,17 +147,17 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
     {
         (AssetKind::Audio, "Sound / Voice (WAV)", "🎵")
 
-    // Priority 6: 3D Meshes & Geometry
+    // Priority 7: 3D Meshes & Geometry
     } else if magic_bytes == magic::MESH {
         (AssetKind::Mesh, "TREMeshResource", "🗿")
     } else if magic_bytes == b"\x41\x00\x41\x00" {
         (AssetKind::Mesh, "TREMeshGeometry", "📐")
 
-    // Priority 7: Skeletal Animation Clips
+    // Priority 8: Skeletal Animation Clips
     } else if magic_bytes == magic::ANIM_CLIP {
         (AssetKind::Animation, "Skeletal Animation Clip", "🎬")
 
-    // Priority 8: FaceFX Facial Animation Actors
+    // Priority 9: FaceFX Facial Animation Actors
     } else if magic_bytes == b"FACE"
         || (data.len() >= 4 && data[0] == 0x00 && data[1] == 0xBA && data[2] == 0x46)
         || data[..data.len().min(1024)]
@@ -148,15 +166,15 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
     {
         (AssetKind::FaceFx, "FaceFX Facial Animation (.fxe)", "🗣️")
 
-    // Priority 9: Terrain Biome Palettes
+    // Priority 10: Terrain Biome Palettes
     } else if magic_bytes == b"\x7E\x00\x00\x04" {
         (AssetKind::TerrainPalette, "Terrain Texture Palette", "🗺️")
 
-    // Priority 10: Particle Systems & VFX
+    // Priority 11: Particle Systems & VFX
     } else if data.len() >= 4 && data[2] == 0x73 && data[3] == 0x00 {
         (AssetKind::Vfx, "TREParticleSystem / VFX", "🔥")
 
-    // Priority 11: Fonts and UI Layouts
+    // Priority 12: Fonts and UI Layouts
     } else if magic_bytes == b"\x72\x00\x41\x00" {
         (AssetKind::Font, "TREFont / Sprite Sheet", "🔤")
     } else if magic_bytes == b"\x76\x00\x41\x00" {
@@ -166,11 +184,11 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
     } else if magic_bytes == b"\x71\x00\x41\x00" {
         (AssetKind::UI, "UI / Menu Layout", "🖥️")
 
-    // Priority 12: Animation Timeline Events
+    // Priority 13: Animation Timeline Events
     } else if magic_bytes == magic::EVENT || magic_bytes == b"\x0B\x01\x41\x00" {
         (AssetKind::Event, "Animation Event Marker", "👣")
 
-    // Priority 13: Lua Bytecode
+    // Priority 14: Lua Bytecode
     } else if magic_bytes == magic::LUA
         || data[..data.len().min(512)]
             .windows(4)
@@ -182,13 +200,13 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
             (AssetKind::Lua, "Scripted Logic Node", "📜")
         }
 
-    // Priority 14: Raw Binary Formats
+    // Priority 15: Raw Binary Formats
     } else if magic_bytes == b"RIFF" {
         (AssetKind::Audio, "Raw WAV Audio", "🎵")
     } else if magic_bytes == b"DDS " {
         (AssetKind::Texture, "Raw DDS Texture", "🎨")
 
-    // Priority 15: Shader Materials
+    // Priority 16: Shader Materials
     } else if (data.len() >= 4 && data[2] == 0x41 && data[1] == 0x06)
         || (data.len() >= 4
             && data[2] == 0x46
@@ -199,14 +217,14 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
     {
         (AssetKind::Material, "Shader Material (TREMaterial)", "🛠️")
 
-    // Priority 16: Collision Bounds (.clb)
+    // Priority 17: Collision Bounds (.clb)
     } else if filename_hint.to_lowercase().ends_with(".clb")
         && !data.starts_with(b"CRL\0")
         && !data.windows(4).any(|w| w == b"\x60\x00\x41\x00")
     {
         (AssetKind::Collision, "Collision Boundary (.clb)", "🧱")
 
-    // Priority 17: Environment & Atmosphere Profiles (.env)
+    // Priority 18: Environment & Atmosphere Profiles (.env)
     } else if filename_hint.to_lowercase().ends_with(".env")
         || (data.len() > 13 && data[0] == 0x80 && &data[5..9] == b"\xCC\x0B\x00\x00")
         || data[..data.len().min(1024)]
@@ -219,7 +237,7 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
             "🌌",
         )
 
-    // Priority 18: Lighting Sets & Binary Tables (.dta)
+    // Priority 19: Lighting Sets & Binary Tables (.dta)
     } else if filename_hint.to_lowercase().ends_with(".dta")
         || (data.len() > 64
             && crate::engine::container::footer::check_footer(data).is_some()
@@ -229,7 +247,7 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
     {
         (AssetKind::Dta, "Lighting Set / Binary Data (.dta)", "💡")
 
-    // Priority 19: Voice Package Descriptors (.debug-vpk, .vpk)
+    // Priority 20: Voice Package Descriptors (.debug-vpk, .vpk)
     } else if filename_hint.to_lowercase().ends_with(".debug-vpk")
         || filename_hint.to_lowercase().ends_with(".vpk")
         || (data.starts_with(b"RPK\0")
@@ -242,7 +260,7 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
             "🗣️",
         )
 
-    // Priority 20: Map 8-bit Layer Data (.8ld or headerless sub-chunks)
+    // Priority 21: Map 8-bit Layer Data (.8ld)
     } else if magic_bytes == b"M8LD"
         || filename_hint.to_lowercase().ends_with(".8ld")
         || (!data.is_empty()
@@ -255,7 +273,7 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
     {
         (AssetKind::M8ldMap, "Level Map Logic Layer (.8ld)", "🗺️")
 
-    // Priority 21: UI Sprite Collections & Atlases
+    // Priority 22: UI Sprite Collections & Atlases
     } else if magic_bytes == b"CRL\0"
         || data
             .windows(4)
@@ -263,7 +281,7 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
     {
         (AssetKind::UiSprite, "UI Sprite Collection", "🖼️")
 
-    // Priority 22: Miscellaneous Engine Structures
+    // Priority 23: Miscellaneous Engine Structures
     } else if magic_bytes == b"\x4E\x00\x41\x00" {
         (AssetKind::Generic, "Scene Node / Transform", "📍")
     } else if data[..data.len().min(1024)]

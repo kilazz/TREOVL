@@ -73,6 +73,42 @@ impl AssetProcessor for AttachmentProcessor {
     }
 }
 
+pub struct ProjectileProcessor;
+impl AssetProcessor for ProjectileProcessor {
+    fn process(
+        &self,
+        data: &[u8],
+        stem: &str,
+        sniffed: &SniffedAsset,
+        workspace: &ProjectWorkspace,
+    ) -> Result<Option<(String, AssetSyncEntry)>> {
+        if sniffed.kind != AssetKind::Projectile {
+            return Ok(None);
+        }
+
+        let proj_dir = workspace.assets_dir.join("projectiles");
+        fs::create_dir_all(&proj_dir)?;
+
+        let json_str = crate::engine::assets::character::export_character_to_json(
+            data,
+            Some(&workspace.assets_dir),
+            stem,
+        )?;
+        let out_name = build_asset_filename(&sniffed.display_name, stem, "json");
+        fs::write(proj_dir.join(&out_name), json_str.as_bytes())?;
+
+        Ok(Some((
+            format!("assets/projectiles/{}", out_name),
+            AssetSyncEntry {
+                chunk_rel_path: format!("chunks/{}.bin", stem),
+                asset_kind: "Character".into(),
+                vanilla_crc32: calculate_crc32(json_str.as_bytes()),
+                is_modified: false,
+            },
+        )))
+    }
+}
+
 pub struct ObjectProcessor;
 impl AssetProcessor for ObjectProcessor {
     fn process(
