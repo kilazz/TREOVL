@@ -4,6 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc::Receiver};
 
 use crate::AppWindow;
+use crate::engine::assets::animation::{
+    AnimationClip, ObjectBone, apply_skeletal_skinning, compute_skinning_matrices,
+    parse_animation_clip, parse_object_bone_container,
+};
 use crate::engine::assets::sniffer::AssetKind;
 use crate::engine::math::Vector3;
 use crate::engine::service;
@@ -176,21 +180,35 @@ impl BackgroundWorker {
                                 }
                                 ui.set_tex_info(tex_desc.into());
                                 ui.set_has_texture(ok);
+                                ui.set_has_animations(false);
                             }
                         });
                     }
                     AssetKind::Mesh => {
-                        let proj_dir = {
+                        let (proj_dir, display_name) = {
                             let st = self.state.lock().unwrap();
-                            st.current_proj_dir.clone()
+                            let dname = st
+                                .all_ui_items
+                                .get(filtered_index as usize)
+                                .map(|it| it.display_name.to_string())
+                                .unwrap_or_default();
+                            (st.current_proj_dir.clone(), dname)
                         };
 
                         let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-                        if let Some(submesh) =
+                        if let Some(mut submesh) =
                             load_mesh_with_smart_texture(&bytes, &stem, proj_dir.as_deref())
                         {
                             let (_, has_composite) =
                                 build_composite_mesh_assembly(&stem, proj_dir.as_deref());
+
+                            // If submesh has no bones, find master skeleton in the project
+                            if submesh.bones.is_empty()
+                                && let Some(master_bones) =
+                                    find_master_skeleton(proj_dir.as_deref())
+                            {
+                                submesh.bones = master_bones;
+                            }
 
                             let stats_lines = build_stats_lines(std::slice::from_ref(&submesh));
                             let mesh_info = format!(
@@ -199,40 +217,45 @@ impl BackgroundWorker {
                                 submesh.indices.len() / 3
                             );
 
-                            let preview = ActiveMeshPreview {
-                                submeshes: vec![submesh],
-                                is_composite: false,
-                                composite_name: stem.to_string(),
-                            };
-
-                            let cam = self.center_camera_for_preview(&preview);
-
-                            let draw_data: Vec<SubmeshDrawData> = preview
-                                .submeshes
+                            let clips = discover_companion_animations(
+                                &display_name,
+                                &stem,
+                                proj_dir.as_deref(),
+                            );
+                            let has_clips = !clips.is_empty();
+                            let clip_names: Vec<slint::SharedString> = clips
                                 .iter()
-                                .map(|sm| SubmeshDrawData {
-                                    positions: &sm.positions,
-                                    indices: &sm.indices,
-                                    normals: &sm.normals,
-                                    uvs: &sm.uvs,
-                                    texture: sm.texture.as_ref().map(|t| TextureData {
-                                        width: t.0,
-                                        height: t.1,
-                                        rgba: &t.2,
-                                    }),
+                                .enumerate()
+                                .map(|(i, c)| {
+                                    format!("{}: {} ({:.2}s)", i + 1, c.name, c.duration_seconds)
+                                        .into()
                                 })
                                 .collect();
 
-                            let buf = self.gpu_renderer.as_mut().unwrap().render(
-                                &draw_data,
-                                (1024, 1024),
-                                &cam,
-                            );
+                            let mut preview = ActiveMeshPreview {
+                                submeshes: vec![submesh],
+                                is_composite: false,
+                                composite_name: stem.to_string(),
+                                available_clips: clips,
+                                current_clip_index: if has_clips { Some(0) } else { None },
+                                current_time_seconds: 0.0,
+                                is_playing: false,
+                                playback_speed: 1.0,
+                            };
+
+                            let cam = self.center_camera_for_preview(&preview);
+                            let initial_duration = preview
+                                .available_clips
+                                .first()
+                                .map(|c| c.duration_seconds)
+                                .unwrap_or(1.0);
 
                             {
                                 let mut st = self.state.lock().unwrap();
-                                st.active_mesh = Some(preview);
+                                st.active_mesh = Some(preview.clone());
                             }
+
+                            self.evaluate_and_render_animated_frame(&mut preview, &cam);
 
                             let ui_h = self.ui_handle.clone();
                             let _ = slint::invoke_from_event_loop(move || {
@@ -243,19 +266,31 @@ impl BackgroundWorker {
                                     ui.set_mesh_info(mesh_info.into());
                                     ui.set_has_composite_available(has_composite);
                                     ui.set_is_composite_active(false);
+                                    ui.set_has_animations(has_clips);
+                                    ui.set_is_anim_playing(false);
+                                    ui.set_available_animations(ModelRc::from(std::rc::Rc::new(
+                                        VecModel::from(clip_names),
+                                    )));
+                                    ui.set_selected_anim_idx(0);
+                                    ui.set_anim_duration(initial_duration);
+                                    ui.set_anim_current_time(0.0);
                                     ui.set_mesh_stats_lines(ModelRc::from(std::rc::Rc::new(
                                         VecModel::from(stats_lines),
                                     )));
-                                    ui.set_mesh_preview(Image::from_rgba8(buf));
                                     ui.set_has_mesh(true);
                                 }
                             });
                         }
                     }
                     AssetKind::Object | AssetKind::Character => {
-                        let proj_dir = {
+                        let (proj_dir, display_name) = {
                             let st = self.state.lock().unwrap();
-                            st.current_proj_dir.clone()
+                            let dname = st
+                                .all_ui_items
+                                .get(filtered_index as usize)
+                                .map(|it| it.display_name.to_string())
+                                .unwrap_or_default();
+                            (st.current_proj_dir.clone(), dname)
                         };
 
                         let stem = path.file_stem().unwrap_or_default().to_string_lossy();
@@ -272,40 +307,44 @@ impl BackgroundWorker {
                                 .unwrap_or_default()
                         };
 
+                        let clips = discover_companion_animations(
+                            &display_name,
+                            &stem,
+                            proj_dir.as_deref(),
+                        );
+                        let has_clips = !clips.is_empty();
+                        let clip_names: Vec<slint::SharedString> = clips
+                            .iter()
+                            .enumerate()
+                            .map(|(i, c)| {
+                                format!("{}: {} ({:.2}s)", i + 1, c.name, c.duration_seconds).into()
+                            })
+                            .collect();
+
                         if has_composite && !composite_submeshes.is_empty() {
-                            let preview = ActiveMeshPreview {
+                            let mut preview = ActiveMeshPreview {
                                 submeshes: composite_submeshes,
                                 is_composite: true,
                                 composite_name: stem.to_string(),
+                                available_clips: clips,
+                                current_clip_index: if has_clips { Some(0) } else { None },
+                                current_time_seconds: 0.0,
+                                is_playing: false,
+                                playback_speed: 1.0,
                             };
                             let cam = self.center_camera_for_preview(&preview);
-
-                            let draw_data: Vec<SubmeshDrawData> = preview
-                                .submeshes
-                                .iter()
-                                .map(|sm| SubmeshDrawData {
-                                    positions: &sm.positions,
-                                    indices: &sm.indices,
-                                    normals: &sm.normals,
-                                    uvs: &sm.uvs,
-                                    texture: sm.texture.as_ref().map(|t| TextureData {
-                                        width: t.0,
-                                        height: t.1,
-                                        rgba: &t.2,
-                                    }),
-                                })
-                                .collect();
-
-                            let buf = self.gpu_renderer.as_mut().unwrap().render(
-                                &draw_data,
-                                (1024, 1024),
-                                &cam,
-                            );
+                            let initial_duration = preview
+                                .available_clips
+                                .first()
+                                .map(|c| c.duration_seconds)
+                                .unwrap_or(1.0);
 
                             {
                                 let mut st = self.state.lock().unwrap();
-                                st.active_mesh = Some(preview);
+                                st.active_mesh = Some(preview.clone());
                             }
+
+                            self.evaluate_and_render_animated_frame(&mut preview, &cam);
 
                             let ui_h = self.ui_handle.clone();
                             let _ = slint::invoke_from_event_loop(move || {
@@ -314,10 +353,17 @@ impl BackgroundWorker {
                                     ui.set_active_file_path(path_str.into());
                                     ui.set_active_kind_id(7);
                                     ui.set_mat_json_text(json.into());
-                                    ui.set_mesh_preview(Image::from_rgba8(buf));
                                     ui.set_has_mesh(true);
                                     ui.set_has_composite_available(true);
                                     ui.set_is_composite_active(true);
+                                    ui.set_has_animations(has_clips);
+                                    ui.set_is_anim_playing(false);
+                                    ui.set_available_animations(ModelRc::from(std::rc::Rc::new(
+                                        VecModel::from(clip_names),
+                                    )));
+                                    ui.set_selected_anim_idx(0);
+                                    ui.set_anim_duration(initial_duration);
+                                    ui.set_anim_current_time(0.0);
                                 }
                             });
                         } else {
@@ -329,6 +375,7 @@ impl BackgroundWorker {
                                     ui.set_active_kind_id(7);
                                     ui.set_mat_json_text(json.into());
                                     ui.set_has_composite_available(false);
+                                    ui.set_has_animations(false);
                                 }
                             });
                         }
@@ -340,6 +387,7 @@ impl BackgroundWorker {
                                 ui.set_selected_index(filtered_index);
                                 ui.set_active_file_path(path_str.into());
                                 ui.set_active_kind_id(1);
+                                ui.set_has_animations(false);
                             }
                         });
                     }
@@ -353,6 +401,7 @@ impl BackgroundWorker {
                                 ui.set_active_file_path(path_str.into());
                                 ui.set_active_kind_id(2);
                                 ui.set_mat_json_text(json.into());
+                                ui.set_has_animations(false);
                             }
                         });
                     }
@@ -366,6 +415,7 @@ impl BackgroundWorker {
                                 ui.set_active_file_path(path_str.into());
                                 ui.set_active_kind_id(4);
                                 ui.set_mat_json_text(disasm.into());
+                                ui.set_has_animations(false);
                             }
                         });
                     }
@@ -379,6 +429,7 @@ impl BackgroundWorker {
                                 ui.set_active_file_path(path_str.into());
                                 ui.set_active_kind_id(6);
                                 ui.set_mat_json_text(json.into());
+                                ui.set_has_animations(false);
                             }
                         });
                     }
@@ -393,6 +444,7 @@ impl BackgroundWorker {
                                 ui.set_active_file_path(path_str.into());
                                 ui.set_active_kind_id(7);
                                 ui.set_mat_json_text(json.into());
+                                ui.set_has_animations(false);
                             }
                         });
                     }
@@ -421,6 +473,7 @@ impl BackgroundWorker {
                                 ui.set_active_kind_id(8);
                                 ui.set_mesh_info(info.into());
                                 ui.set_mat_json_text(json.into());
+                                ui.set_has_animations(false);
                             }
                         });
                     }
@@ -437,6 +490,7 @@ impl BackgroundWorker {
                                 ui.set_active_file_path(path_str.into());
                                 ui.set_active_kind_id(9);
                                 ui.set_mat_json_text(json.into());
+                                ui.set_has_animations(false);
                             }
                         });
                     }
@@ -451,6 +505,7 @@ impl BackgroundWorker {
                                 ui.set_active_file_path(path_str.into());
                                 ui.set_active_kind_id(10);
                                 ui.set_mat_json_text(json.into());
+                                ui.set_has_animations(false);
                             }
                         });
                     }
@@ -465,6 +520,7 @@ impl BackgroundWorker {
                                 ui.set_active_file_path(path_str.into());
                                 ui.set_active_kind_id(11);
                                 ui.set_mat_json_text(json.into());
+                                ui.set_has_animations(false);
                             }
                         });
                     }
@@ -478,6 +534,7 @@ impl BackgroundWorker {
                                 ui.set_active_file_path(path_str.into());
                                 ui.set_active_kind_id(12);
                                 ui.set_mat_json_text(xml_str.into());
+                                ui.set_has_animations(false);
                             }
                         });
                     }
@@ -494,6 +551,7 @@ impl BackgroundWorker {
                                 ui.set_active_file_path(path_str.into());
                                 ui.set_active_kind_id(13);
                                 ui.set_mat_json_text(json.into());
+                                ui.set_has_animations(false);
                             }
                         });
                     }
@@ -508,6 +566,7 @@ impl BackgroundWorker {
                                 ui.set_active_file_path(path_str.into());
                                 ui.set_active_kind_id(14);
                                 ui.set_mat_json_text(json.into());
+                                ui.set_has_animations(false);
                             }
                         });
                     }
@@ -521,6 +580,7 @@ impl BackgroundWorker {
                                 ui.set_active_file_path(path_str.into());
                                 ui.set_active_kind_id(15);
                                 ui.set_mat_json_text(json.into());
+                                ui.set_has_animations(false);
                             }
                         });
                     }
@@ -531,9 +591,83 @@ impl BackgroundWorker {
                                 ui.set_selected_index(filtered_index);
                                 ui.set_active_file_path(path_str.into());
                                 ui.set_active_kind_id(5);
+                                ui.set_has_animations(false);
                             }
                         });
                     }
+                }
+            }
+
+            WorkerCommand::SelectAnimation { clip_index } => {
+                let mut re_render_opt = None;
+                {
+                    let mut st = self.state.lock().unwrap();
+                    if let Some(ref mut preview) = st.active_mesh
+                        && clip_index >= 0
+                        && (clip_index as usize) < preview.available_clips.len()
+                    {
+                        preview.current_clip_index = Some(clip_index as usize);
+                        preview.current_time_seconds = 0.0;
+                        let clip = &preview.available_clips[clip_index as usize];
+                        let duration = clip.duration_seconds;
+
+                        let ui_h = self.ui_handle.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_h.upgrade() {
+                                ui.set_anim_duration(duration);
+                                ui.set_anim_current_time(0.0);
+                            }
+                        });
+
+                        re_render_opt = Some((preview.clone(), st.camera));
+                    }
+                }
+
+                if let Some((mut preview, cam)) = re_render_opt {
+                    self.evaluate_and_render_animated_frame(&mut preview, &cam);
+                }
+            }
+
+            WorkerCommand::SetAnimationTime { time_seconds } => {
+                let mut re_render_opt = None;
+                {
+                    let mut st = self.state.lock().unwrap();
+                    if let Some(ref mut preview) = st.active_mesh {
+                        preview.current_time_seconds = time_seconds;
+                        re_render_opt = Some((preview.clone(), st.camera));
+                    }
+                }
+                if let Some((mut preview, cam)) = re_render_opt {
+                    self.evaluate_and_render_animated_frame(&mut preview, &cam);
+                }
+            }
+
+            WorkerCommand::TickAnimationPlayback { delta_seconds } => {
+                let mut re_render_opt = None;
+                let mut time_ui = 0.0f32;
+                {
+                    let mut st = self.state.lock().unwrap();
+                    if let Some(ref mut preview) = st.active_mesh
+                        && let Some(c_idx) = preview.current_clip_index
+                    {
+                        let duration = preview.available_clips[c_idx].duration_seconds.max(0.01);
+                        preview.current_time_seconds = (preview.current_time_seconds
+                            + delta_seconds * preview.playback_speed)
+                            % duration;
+                        time_ui = preview.current_time_seconds;
+                        re_render_opt = Some((preview.clone(), st.camera));
+                    }
+                }
+
+                let ui_h = self.ui_handle.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_h.upgrade() {
+                        ui.set_anim_current_time(time_ui);
+                    }
+                });
+
+                if let Some((mut preview, cam)) = re_render_opt {
+                    self.evaluate_and_render_animated_frame(&mut preview, &cam);
                 }
             }
 
@@ -560,32 +694,12 @@ impl BackgroundWorker {
                         let is_comp_active = preview.is_composite;
                         let stats_lines = build_stats_lines(&preview.submeshes);
 
-                        let draw_data: Vec<SubmeshDrawData> = preview
-                            .submeshes
-                            .iter()
-                            .map(|sm| SubmeshDrawData {
-                                positions: &sm.positions,
-                                indices: &sm.indices,
-                                normals: &sm.normals,
-                                uvs: &sm.uvs,
-                                texture: sm.texture.as_ref().map(|t| TextureData {
-                                    width: t.0,
-                                    height: t.1,
-                                    rgba: &t.2,
-                                }),
-                            })
-                            .collect();
-
-                        let buf = self.gpu_renderer.as_mut().unwrap().render(
-                            &draw_data,
-                            (1024, 1024),
-                            &cam,
-                        );
-
                         {
                             let mut st = self.state.lock().unwrap();
-                            st.active_mesh = Some(preview);
+                            st.active_mesh = Some(preview.clone());
                         }
+
+                        self.evaluate_and_render_animated_frame(&mut preview, &cam);
 
                         let ui_h = self.ui_handle.clone();
                         let _ = slint::invoke_from_event_loop(move || {
@@ -594,10 +708,32 @@ impl BackgroundWorker {
                                 ui.set_mesh_stats_lines(ModelRc::from(std::rc::Rc::new(
                                     VecModel::from(stats_lines),
                                 )));
-                                ui.set_mesh_preview(Image::from_rgba8(buf));
                             }
                         });
                     }
+                }
+            }
+
+            WorkerCommand::ToggleSkinning => {
+                let mut re_render_opt = None;
+                let is_enabled = {
+                    let mut st = self.state.lock().unwrap();
+                    st.is_skinning_enabled = !st.is_skinning_enabled;
+                    if let Some(ref mut preview) = st.active_mesh {
+                        re_render_opt = Some((preview.clone(), st.camera));
+                    }
+                    st.is_skinning_enabled
+                };
+
+                let ui_h = self.ui_handle.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_h.upgrade() {
+                        ui.set_is_skinning_enabled(is_enabled);
+                    }
+                });
+
+                if let Some((mut preview, cam)) = re_render_opt {
+                    self.evaluate_and_render_animated_frame(&mut preview, &cam);
                 }
             }
 
@@ -605,247 +741,96 @@ impl BackgroundWorker {
                 delta_yaw,
                 delta_pitch,
             } => {
-                let buf_opt = {
+                let mut re_render_opt = None;
+                {
                     let mut st = self.state.lock().unwrap();
                     st.camera.yaw += delta_yaw;
                     st.camera.pitch = (st.camera.pitch + delta_pitch).clamp(-1.45, 1.45);
-                    let cam = st.camera;
+                    if let Some(ref mut preview) = st.active_mesh {
+                        re_render_opt = Some((preview.clone(), st.camera));
+                    }
+                }
 
-                    st.active_mesh.as_ref().map(|mesh_prev| {
-                        let draw_data: Vec<SubmeshDrawData> = mesh_prev
-                            .submeshes
-                            .iter()
-                            .map(|sm| SubmeshDrawData {
-                                positions: &sm.positions,
-                                indices: &sm.indices,
-                                normals: &sm.normals,
-                                uvs: &sm.uvs,
-                                texture: sm.texture.as_ref().map(|t| TextureData {
-                                    width: t.0,
-                                    height: t.1,
-                                    rgba: &t.2,
-                                }),
-                            })
-                            .collect();
-
-                        self.gpu_renderer
-                            .as_mut()
-                            .unwrap()
-                            .render(&draw_data, (1024, 1024), &cam)
-                    })
-                };
-
-                if let Some(buf) = buf_opt {
-                    let ui_h = self.ui_handle.clone();
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(ui) = ui_h.upgrade() {
-                            ui.set_mesh_preview(Image::from_rgba8(buf));
-                            ui.set_has_mesh(true);
-                        }
-                    });
+                if let Some((mut preview, cam)) = re_render_opt {
+                    self.evaluate_and_render_animated_frame(&mut preview, &cam);
                 }
             }
 
             WorkerCommand::ZoomMeshViewport { delta_zoom } => {
                 let factor = if delta_zoom > 0.0 { 0.88 } else { 1.14 };
-                let buf_opt = {
+                let mut re_render_opt = None;
+                {
                     let mut st = self.state.lock().unwrap();
                     st.camera.zoom(factor);
-                    let cam = st.camera;
+                    if let Some(ref mut preview) = st.active_mesh {
+                        re_render_opt = Some((preview.clone(), st.camera));
+                    }
+                }
 
-                    st.active_mesh.as_ref().map(|mesh_prev| {
-                        let draw_data: Vec<SubmeshDrawData> = mesh_prev
-                            .submeshes
-                            .iter()
-                            .map(|sm| SubmeshDrawData {
-                                positions: &sm.positions,
-                                indices: &sm.indices,
-                                normals: &sm.normals,
-                                uvs: &sm.uvs,
-                                texture: sm.texture.as_ref().map(|t| TextureData {
-                                    width: t.0,
-                                    height: t.1,
-                                    rgba: &t.2,
-                                }),
-                            })
-                            .collect();
-
-                        self.gpu_renderer
-                            .as_mut()
-                            .unwrap()
-                            .render(&draw_data, (1024, 1024), &cam)
-                    })
-                };
-
-                if let Some(buf) = buf_opt {
-                    let ui_h = self.ui_handle.clone();
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(ui) = ui_h.upgrade() {
-                            ui.set_mesh_preview(Image::from_rgba8(buf));
-                        }
-                    });
+                if let Some((mut preview, cam)) = re_render_opt {
+                    self.evaluate_and_render_animated_frame(&mut preview, &cam);
                 }
             }
 
             WorkerCommand::SetViewportFov { fov_degrees } => {
-                let buf_opt = {
+                let mut re_render_opt = None;
+                {
                     let mut st = self.state.lock().unwrap();
                     st.camera.fov_degrees = fov_degrees.clamp(20.0, 90.0);
-                    let cam = st.camera;
+                    if let Some(ref mut preview) = st.active_mesh {
+                        re_render_opt = Some((preview.clone(), st.camera));
+                    }
+                }
 
-                    st.active_mesh.as_ref().map(|mesh_prev| {
-                        let draw_data: Vec<SubmeshDrawData> = mesh_prev
-                            .submeshes
-                            .iter()
-                            .map(|sm| SubmeshDrawData {
-                                positions: &sm.positions,
-                                indices: &sm.indices,
-                                normals: &sm.normals,
-                                uvs: &sm.uvs,
-                                texture: sm.texture.as_ref().map(|t| TextureData {
-                                    width: t.0,
-                                    height: t.1,
-                                    rgba: &t.2,
-                                }),
-                            })
-                            .collect();
-
-                        self.gpu_renderer
-                            .as_mut()
-                            .unwrap()
-                            .render(&draw_data, (1024, 1024), &cam)
-                    })
-                };
-
-                if let Some(buf) = buf_opt {
-                    let ui_h = self.ui_handle.clone();
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(ui) = ui_h.upgrade() {
-                            ui.set_mesh_preview(Image::from_rgba8(buf));
-                        }
-                    });
+                if let Some((mut preview, cam)) = re_render_opt {
+                    self.evaluate_and_render_animated_frame(&mut preview, &cam);
                 }
             }
 
             WorkerCommand::SetViewportLighting { mode } => {
-                let buf_opt = {
+                let mut re_render_opt = None;
+                {
                     let mut st = self.state.lock().unwrap();
                     st.camera.lighting_mode = mode;
-                    let cam = st.camera;
+                    if let Some(ref mut preview) = st.active_mesh {
+                        re_render_opt = Some((preview.clone(), st.camera));
+                    }
+                }
 
-                    st.active_mesh.as_ref().map(|mesh_prev| {
-                        let draw_data: Vec<SubmeshDrawData> = mesh_prev
-                            .submeshes
-                            .iter()
-                            .map(|sm| SubmeshDrawData {
-                                positions: &sm.positions,
-                                indices: &sm.indices,
-                                normals: &sm.normals,
-                                uvs: &sm.uvs,
-                                texture: sm.texture.as_ref().map(|t| TextureData {
-                                    width: t.0,
-                                    height: t.1,
-                                    rgba: &t.2,
-                                }),
-                            })
-                            .collect();
-
-                        self.gpu_renderer
-                            .as_mut()
-                            .unwrap()
-                            .render(&draw_data, (1024, 1024), &cam)
-                    })
-                };
-
-                if let Some(buf) = buf_opt {
-                    let ui_h = self.ui_handle.clone();
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(ui) = ui_h.upgrade() {
-                            ui.set_mesh_preview(Image::from_rgba8(buf));
-                        }
-                    });
+                if let Some((mut preview, cam)) = re_render_opt {
+                    self.evaluate_and_render_animated_frame(&mut preview, &cam);
                 }
             }
 
             WorkerCommand::SetViewportUpAxis { mode } => {
-                let buf_opt = {
+                let mut re_render_opt = None;
+                {
                     let mut st = self.state.lock().unwrap();
                     st.camera.up_axis = mode;
-                    let cam = st.camera;
+                    if let Some(ref mut preview) = st.active_mesh {
+                        re_render_opt = Some((preview.clone(), st.camera));
+                    }
+                }
 
-                    st.active_mesh.as_ref().map(|mesh_prev| {
-                        let draw_data: Vec<SubmeshDrawData> = mesh_prev
-                            .submeshes
-                            .iter()
-                            .map(|sm| SubmeshDrawData {
-                                positions: &sm.positions,
-                                indices: &sm.indices,
-                                normals: &sm.normals,
-                                uvs: &sm.uvs,
-                                texture: sm.texture.as_ref().map(|t| TextureData {
-                                    width: t.0,
-                                    height: t.1,
-                                    rgba: &t.2,
-                                }),
-                            })
-                            .collect();
-
-                        self.gpu_renderer
-                            .as_mut()
-                            .unwrap()
-                            .render(&draw_data, (1024, 1024), &cam)
-                    })
-                };
-
-                if let Some(buf) = buf_opt {
-                    let ui_h = self.ui_handle.clone();
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(ui) = ui_h.upgrade() {
-                            ui.set_mesh_preview(Image::from_rgba8(buf));
-                        }
-                    });
+                if let Some((mut preview, cam)) = re_render_opt {
+                    self.evaluate_and_render_animated_frame(&mut preview, &cam);
                 }
             }
 
             WorkerCommand::ResetViewportCamera => {
-                let buf_opt = {
+                let mut re_render_opt = None;
+                {
                     let mut st = self.state.lock().unwrap();
                     st.camera.yaw = 0.785;
                     st.camera.pitch = 0.35;
                     st.camera.fov_degrees = 45.0;
+                    if let Some(ref mut preview) = st.active_mesh {
+                        re_render_opt = Some((preview.clone(), st.camera));
+                    }
+                }
 
-                    let cam = st.camera;
-                    st.active_mesh.as_ref().map(|mesh_prev| {
-                        let draw_data: Vec<SubmeshDrawData> = mesh_prev
-                            .submeshes
-                            .iter()
-                            .map(|sm| SubmeshDrawData {
-                                positions: &sm.positions,
-                                indices: &sm.indices,
-                                normals: &sm.normals,
-                                uvs: &sm.uvs,
-                                texture: sm.texture.as_ref().map(|t| TextureData {
-                                    width: t.0,
-                                    height: t.1,
-                                    rgba: &t.2,
-                                }),
-                            })
-                            .collect();
-
-                        self.gpu_renderer
-                            .as_mut()
-                            .unwrap()
-                            .render(&draw_data, (1024, 1024), &cam)
-                    })
-                };
-
-                if let Some(buf) = buf_opt {
-                    let ui_h = self.ui_handle.clone();
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(ui) = ui_h.upgrade() {
-                            ui.set_mesh_preview(Image::from_rgba8(buf));
-                        }
-                    });
+                if let Some((mut preview, cam)) = re_render_opt {
+                    self.evaluate_and_render_animated_frame(&mut preview, &cam);
                 }
             }
 
@@ -1673,6 +1658,87 @@ impl BackgroundWorker {
         }
     }
 
+    fn evaluate_and_render_animated_frame(
+        &mut self,
+        preview: &mut ActiveMeshPreview,
+        cam: &ViewportCamera,
+    ) {
+        let mut debug_lines = Vec::new();
+
+        let is_skinning = self.state.lock().unwrap().is_skinning_enabled;
+
+        if let Some(clip_idx) = preview.current_clip_index
+            && let Some(clip) = preview.available_clips.get(clip_idx)
+        {
+            let t = preview.current_time_seconds;
+
+            for sm in &mut preview.submeshes {
+                if !sm.bones.is_empty() && !sm.weights.is_empty() {
+                    let (skin_matrices, lines) = compute_skinning_matrices(&sm.bones, clip, t);
+
+                    for mut line_vert in lines {
+                        let p = Vector3 {
+                            x: line_vert.position[0],
+                            y: line_vert.position[1],
+                            z: line_vert.position[2],
+                        };
+                        let tp = match cam.up_axis {
+                            1 => [p.x, -p.z, p.y],
+                            2 => [p.x, p.z, -p.y],
+                            _ => [p.x, p.y, p.z],
+                        };
+                        line_vert.position = tp;
+                        debug_lines.push(line_vert);
+                    }
+
+                    if is_skinning {
+                        apply_skeletal_skinning(
+                            &sm.rest_positions,
+                            &sm.rest_normals,
+                            &sm.joints,
+                            &sm.weights,
+                            &skin_matrices,
+                            &mut sm.positions,
+                            &mut sm.normals,
+                        );
+                    } else {
+                        sm.positions.copy_from_slice(&sm.rest_positions);
+                        sm.normals.copy_from_slice(&sm.rest_normals);
+                    }
+                }
+            }
+        }
+
+        let draw_data: Vec<SubmeshDrawData> = preview
+            .submeshes
+            .iter()
+            .map(|sm| SubmeshDrawData {
+                positions: &sm.positions,
+                indices: &sm.indices,
+                normals: &sm.normals,
+                uvs: &sm.uvs,
+                texture: sm.texture.as_ref().map(|t| TextureData {
+                    width: t.0,
+                    height: t.1,
+                    rgba: &t.2,
+                }),
+            })
+            .collect();
+
+        let buf =
+            self.gpu_renderer
+                .as_mut()
+                .unwrap()
+                .render(&draw_data, &debug_lines, (1024, 1024), cam);
+
+        let ui_h = self.ui_handle.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = ui_h.upgrade() {
+                ui.set_mesh_preview(Image::from_rgba8(buf));
+            }
+        });
+    }
+
     fn center_camera_for_preview(&self, preview: &ActiveMeshPreview) -> ViewportCamera {
         let mut st = self.state.lock().unwrap();
         let up_axis = st.camera.up_axis;
@@ -1689,14 +1755,18 @@ impl BackgroundWorker {
         };
 
         let transform = |p: Vector3| -> Vector3 {
-            if up_axis == 1 {
-                Vector3 {
+            match up_axis {
+                1 => Vector3 {
+                    x: p.x,
+                    y: -p.z,
+                    z: p.y,
+                },
+                2 => Vector3 {
                     x: p.x,
                     y: p.z,
                     z: -p.y,
-                }
-            } else {
-                p
+                },
+                _ => p,
             }
         };
 
@@ -1768,7 +1838,7 @@ impl BackgroundWorker {
 }
 
 // -----------------------------------------------------------------------------
-// SMART TEXTURE RESOLUTION & COMPOSITE ASSEMBLY
+// SMART TEXTURE & ANIMATION RESOLUTION
 // -----------------------------------------------------------------------------
 
 fn load_mesh_with_smart_texture(
@@ -1782,12 +1852,116 @@ fn load_mesh_with_smart_texture(
 
     Some(RenderSubmesh {
         name: mesh_stem.to_string(),
-        positions: parsed.positions,
+        positions: parsed.positions.clone(),
+        normals: parsed.normals.clone(),
+        rest_positions: parsed.positions,
+        rest_normals: parsed.normals,
+        joints: parsed.joints,
+        weights: parsed.weights,
+        bones: parsed.bones,
         indices: parsed.indices,
-        normals: parsed.normals,
         uvs: parsed.uvs,
         texture: tex_arc,
     })
+}
+
+fn find_master_skeleton(project_dir: Option<&Path>) -> Option<Vec<ObjectBone>> {
+    let base_dir = project_dir?;
+    let chunks_dir = base_dir.join("chunks");
+    if !chunks_dir.exists() {
+        return None;
+    }
+
+    for entry in fs::read_dir(&chunks_dir).ok()?.flatten() {
+        let p = entry.path();
+        if p.is_file()
+            && p.extension().is_some_and(|e| e == "bin")
+            && let Ok(bytes) = fs::read(&p)
+            && let Ok(bones) = parse_object_bone_container(&bytes)
+            && !bones.is_empty()
+        {
+            return Some(bones);
+        }
+    }
+    None
+}
+
+fn discover_companion_animations(
+    display_name: &str,
+    mesh_stem: &str,
+    project_dir: Option<&Path>,
+) -> Vec<AnimationClip> {
+    let base_dir = match project_dir {
+        Some(d) => d,
+        None => return Vec::new(),
+    };
+
+    let mut clips = Vec::new();
+    let chunks_dir = base_dir.join("chunks");
+
+    // Clean package prefix, e.g. "[FIRE_BEETLE]MESH\2" -> "firebeetle"
+    let pkg_name = display_name
+        .split(']')
+        .next()
+        .map(|s| s.trim_start_matches('['))
+        .unwrap_or(display_name);
+
+    let norm_pkg = s_normalize(pkg_name);
+    let norm_stem = s_normalize(mesh_stem);
+    let norm_disp = s_normalize(display_name);
+
+    if chunks_dir.exists()
+        && let Ok(entries) = fs::read_dir(&chunks_dir)
+    {
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.is_file()
+                && path.extension().is_some_and(|ext| ext == "bin")
+                && let Ok(bytes) = fs::read(&path)
+                && let Ok(clip) = parse_animation_clip(&bytes)
+            {
+                let norm_rig = s_normalize(&clip.target_rig);
+                let norm_clip = s_normalize(&clip.name);
+
+                let is_match = !norm_pkg.is_empty()
+                    && (norm_rig.contains(&norm_pkg) || norm_pkg.contains(&norm_rig))
+                    || norm_disp.contains(&norm_rig)
+                    || norm_rig.contains(&norm_stem)
+                    || norm_clip.contains(&norm_stem)
+                    || norm_disp.contains("beetle")
+                        && (norm_rig.contains("beetle") || norm_clip.contains("beetle"))
+                    || norm_disp.contains("minion")
+                        && (norm_rig.contains("minion") || norm_clip.contains("minion"));
+
+                if is_match {
+                    clips.push(clip);
+                }
+            }
+        }
+
+        // Fallback: If no name matched, but this archive contains clips, include all archive clips
+        if clips.is_empty() {
+            for e in fs::read_dir(&chunks_dir)
+                .ok()
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                let path = e.path();
+                if path.is_file()
+                    && path.extension().is_some_and(|ext| ext == "bin")
+                    && let Ok(bytes) = fs::read(&path)
+                    && let Ok(clip) = parse_animation_clip(&bytes)
+                {
+                    clips.push(clip);
+                }
+            }
+        }
+    }
+
+    clips.sort_by(|a, b| a.name.cmp(&b.name));
+    clips.dedup_by(|a, b| a.name == b.name);
+    clips
 }
 
 fn resolve_smart_texture_for_mesh(

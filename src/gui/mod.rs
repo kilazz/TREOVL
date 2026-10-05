@@ -12,9 +12,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
+use crate::engine::assets::animation::{AnimationClip, ObjectBone};
 use crate::engine::assets::sniffer::{AssetKind, sniff_asset};
 use crate::engine::container::sync::{AssetSyncCache, calculate_crc32};
-use crate::engine::math::{Vector2, Vector3};
+use crate::engine::math::{Vector2, Vector3, Vector4};
 use crate::utils::logger::UiLogger;
 use crate::utils::renderer::ViewportCamera;
 use crate::{AppWindow, AssetItem};
@@ -31,8 +32,13 @@ pub struct CachedAsset {
 pub struct RenderSubmesh {
     pub name: String,
     pub positions: Vec<Vector3>,
-    pub indices: Vec<u32>,
     pub normals: Vec<Vector3>,
+    pub rest_positions: Vec<Vector3>,
+    pub rest_normals: Vec<Vector3>,
+    pub joints: Vec<[u16; 4]>,
+    pub weights: Vec<Vector4>,
+    pub bones: Vec<ObjectBone>,
+    pub indices: Vec<u32>,
     pub uvs: Vec<Vector2>,
     pub texture: Option<Arc<(u32, u32, Vec<u8>)>>,
 }
@@ -42,6 +48,11 @@ pub struct ActiveMeshPreview {
     pub submeshes: Vec<RenderSubmesh>,
     pub is_composite: bool,
     pub composite_name: String,
+    pub available_clips: Vec<AnimationClip>,
+    pub current_clip_index: Option<usize>,
+    pub current_time_seconds: f32,
+    pub is_playing: bool,
+    pub playback_speed: f32,
 }
 
 #[derive(Default)]
@@ -54,6 +65,16 @@ pub struct AppState {
     pub camera: ViewportCamera,
     pub active_mesh: Option<ActiveMeshPreview>,
     pub filter_generation: u64,
+    pub is_skinning_enabled: bool,
+}
+
+impl AppState {
+    pub fn new() -> Self {
+        Self {
+            is_skinning_enabled: true,
+            ..Default::default()
+        }
+    }
 }
 
 /// Resolves a directory path whether a directory or a child file was passed.
@@ -156,7 +177,7 @@ pub fn scan_project_folder(project_dir: &Path) -> (Vec<AssetItem>, Vec<CachedAss
 pub fn run_gui() -> Result<(), slint::PlatformError> {
     let ui = AppWindow::new()?;
     let ui_weak = ui.as_weak();
-    let app_state = Arc::new(Mutex::new(AppState::default()));
+    let app_state = Arc::new(Mutex::new(AppState::new()));
 
     let (log_tx, log_rx) = mpsc::channel::<String>();
     let logger = UiLogger::new(log_tx);

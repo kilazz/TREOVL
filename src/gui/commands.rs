@@ -54,9 +54,21 @@ pub enum WorkerCommand {
     },
     ResetViewportCamera,
     ToggleCompositeView,
+    ToggleSkinning, // Allows debugging rig independently from mesh deformation
     FilterAssets {
         query: String,
         generation: u64,
+    },
+
+    // Real-Time Viewport Animation Playback Commands
+    SelectAnimation {
+        clip_index: i32,
+    },
+    SetAnimationTime {
+        time_seconds: f32,
+    },
+    TickAnimationPlayback {
+        delta_seconds: f32,
     },
 
     // Standalone Direct File Operations (Global Toolbox)

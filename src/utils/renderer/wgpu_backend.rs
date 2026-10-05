@@ -428,6 +428,7 @@ impl WgpuRenderer {
     pub fn render(
         &mut self,
         submeshes: &[SubmeshDrawData],
+        debug_lines: &[GridVertex],
         size: (u32, u32),
         cam: &ViewportCamera,
     ) -> SharedPixelBuffer<Rgba8Pixel> {
@@ -443,10 +444,6 @@ impl WgpuRenderer {
 
         self.ensure_render_targets(width, height);
 
-        // Transformation closures:
-        // Mode 1 (Default): Upright (+90° X) -> X'=X, Y'=-Z (shell UP, feet DOWN), Z'=Y (head FORWARD)
-        // Mode 2: Inverted (-90° X) -> X'=X, Y'=Z, Z'=-Y
-        // Mode 0: Raw as-is -> X'=X, Y'=Y, Z'=Z
         let transform_pos = |p: Vector3| -> [f32; 3] {
             match cam.up_axis {
                 1 => [p.x, -p.z, p.y],
@@ -514,12 +511,15 @@ impl WgpuRenderer {
         } else {
             2.0
         };
-        let grid_verts = build_gpu_grid_vertices(center, floor_y, model_radius);
+
+        let mut all_lines = build_gpu_grid_vertices(center, floor_y, model_radius);
+        all_lines.extend_from_slice(debug_lines);
+
         let grid_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Grid Line Vertex Buffer"),
-                contents: bytemuck::cast_slice(&grid_verts),
+                label: Some("Grid & Skeleton Line Vertex Buffer"),
+                contents: bytemuck::cast_slice(&all_lines),
                 usage: wgpu::BufferUsages::VERTEX,
             });
 
@@ -671,15 +671,13 @@ impl WgpuRenderer {
                 multiview_mask: None,
             });
 
-            // 1. Render Ground Grid
-            if !grid_verts.is_empty() {
+            if !all_lines.is_empty() {
                 render_pass.set_pipeline(&self.grid_pipeline);
                 render_pass.set_bind_group(0, &self.scene_bind_group, &[]);
                 render_pass.set_vertex_buffer(0, grid_buffer.slice(..));
-                render_pass.draw(0..grid_verts.len() as u32, 0..1);
+                render_pass.draw(0..all_lines.len() as u32, 0..1);
             }
 
-            // 2. Render all submeshes in composite
             render_pass.set_pipeline(&self.mesh_pipeline);
             render_pass.set_bind_group(0, &self.scene_bind_group, &[]);
 
@@ -748,7 +746,6 @@ impl WgpuRenderer {
         drop(data);
         targets.output_buffer.unmap();
 
-        // 3. Render 3D coordinate orientation gizmo
         render_axis_gizmo(dst, width, height, cam);
 
         self.last_pixel_buffer = Some(pixel_buffer.clone());

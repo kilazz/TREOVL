@@ -1,3 +1,4 @@
+use glam::{EulerRot, Quat};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -38,16 +39,15 @@ impl BoneRotation {
         }
     }
 
+    /// Converts Triumph Engine Euler angles into a mathematically normalized Quaternion.
+    /// Safely utilizes the ZYX intrinsic rotation order (Z=Roll, Y=Yaw, X=Pitch) matching the engine.
     pub fn to_quaternion(self) -> Vector4 {
-        let (cp, sp) = ((self.pitch * 0.5).cos(), (self.pitch * 0.5).sin());
-        let (cy, sy) = ((self.yaw * 0.5).cos(), (self.yaw * 0.5).sin());
-        let (cr, sr) = ((self.roll * 0.5).cos(), (self.roll * 0.5).sin());
-
+        let q = Quat::from_euler(EulerRot::ZYX, self.roll, self.yaw, self.pitch).normalize();
         Vector4 {
-            x: sp * cy * cr - cp * sy * sr,
-            y: cp * sy * cr + sp * cy * sr,
-            z: cp * cy * sr - sp * sy * cr,
-            w: cp * cy * cr + sp * sy * sr,
+            x: q.x,
+            y: q.y,
+            z: q.z,
+            w: q.w,
         }
     }
 }

@@ -49,9 +49,18 @@ export component AppWindow inherits Window {
     // 3D Viewport Controls & Composite State
     in-out property <float> viewport_fov: 45.0;
     in-out property <int> viewport_lighting: 0;
-    in-out property <int> viewport_up_axis: 1; // 1: Game (+90° Upright), 0: Raw (As-is), 2: Invert (-90°)
+    in-out property <int> viewport_up_axis: 1;
     in-out property <bool> has_composite_available: false;
     in-out property <bool> is_composite_active: false;
+    in-out property <bool> is_skinning_enabled: true;
+
+    // Real-Time Viewport Animation Playback States
+    in-out property <bool> has_animations: false;
+    in-out property <bool> is_anim_playing: false;
+    in-out property <[string]> available_animations: [];
+    in-out property <int> selected_anim_idx: 0;
+    in-out property <float> anim_current_time: 0.0;
+    in-out property <float> anim_duration: 1.0;
 
     // Active Asset Inspector States
     in-out property <image> tex_preview;
@@ -88,6 +97,21 @@ export component AppWindow inherits Window {
     callback set_viewport_up_axis(int);
     callback reset_viewport_camera();
     callback toggle_composite_view();
+    callback toggle_skinning();
+
+    // Real-Time Viewport Animation Playback Callbacks
+    callback select_active_animation(int);
+    callback scrub_animation_timeline(float);
+    callback tick_animation_frame(float);
+
+    // 30 FPS Animation Playback Timer
+    anim_timer := Timer {
+        interval: 33ms;
+        running: root.is_anim_playing && root.has_animations;
+        triggered => {
+            root.tick_animation_frame(0.033);
+        }
+    }
 
     // Contextual Asset Operations Callbacks (for loaded project chunks)
     callback export_dds(string, string);
@@ -1019,6 +1043,14 @@ export component AppWindow inherits Window {
                                     min-w: 140px;
                                     clicked => { root.toggle_composite_view(); }
                                 }
+
+                                if root.has_animations: CustomButton {
+                                    icon: "🦴";
+                                    text: root.is_skinning_enabled ? "Skinning: ON" : "Skinning: OFF";
+                                    primary-color: root.is_skinning_enabled ? #23a55a : #4e5058;
+                                    min-w: 130px;
+                                    clicked => { root.toggle_skinning(); }
+                                }
                             }
 
                             // --- ROW 2: VIEWPORT NAVIGATION & SHADING TOOLBAR ---
@@ -1268,6 +1300,108 @@ export component AppWindow inherits Window {
                                 stats_lines: root.mesh_stats_lines;
                                 rotate_viewport(dyaw, dpitch) => { root.rotate_mesh_viewport(dyaw, dpitch); }
                                 zoom_viewport(delta) => { root.zoom_mesh_viewport(delta); }
+                            }
+
+                            // --- REAL-TIME ANIMATION TIMELINE PLAYER HUD (ALWAYS VISIBLE) ---
+                            Rectangle {
+                                height: 44px;
+                                background: #20242c;
+                                border-radius: 6px;
+                                border-width: 1px;
+                                border-color: #353535;
+
+                                HorizontalLayout {
+                                    padding-left: 12px;
+                                    padding-right: 12px;
+                                    spacing: 12px;
+                                    alignment: space-between;
+
+                                    // Play / Pause Button
+                                    Rectangle {
+                                        width: 80px;
+                                        height: 28px;
+                                        y: (parent.height - self.height) / 2;
+                                        background: !root.has_animations ? #2b303c : (root.is_anim_playing ? #d28e1b : #23a55a);
+                                        border-radius: 4px;
+                                        Text {
+                                            text: !root.has_animations ? "⛔ No Anim" : (root.is_anim_playing ? "⏸ Pause" : "▶ Play");
+                                            font-size: 11px;
+                                            font-weight: 700;
+                                            color: !root.has_animations ? #808080 : #ffffff;
+                                            vertical-alignment: center;
+                                            horizontal-alignment: center;
+                                        }
+
+                                        TouchArea {
+                                            enabled: root.has_animations;
+                                            mouse-cursor: root.has_animations ? pointer : default;
+                                            clicked => {
+                                                root.is_anim_playing = !root.is_anim_playing;
+                                            }
+                                        }
+                                    }
+
+                                    // Animation Clips Selector Dropdown / Cycle Chip
+                                    Rectangle {
+                                        width: 220px;
+                                        height: 28px;
+                                        y: (parent.height - self.height) / 2;
+                                        background: #2b303c;
+                                        border-radius: 4px;
+                                        border-width: 1px;
+                                        border-color: #3e4450;
+                                        HorizontalLayout {
+                                            padding-left: 8px;
+                                            padding-right: 8px;
+                                            Text {
+                                                text: "🎬 " + (root.available_animations.length > 0 ? root.available_animations[root.selected_anim_idx] : "No Clips in Package");
+                                                font-size: 11px;
+                                                font-weight: 700;
+                                                color: root.available_animations.length > 0 ? #58a6ff : #808080;
+                                                vertical-alignment: center;
+                                                overflow: elide;
+                                            }
+                                        }
+
+                                        TouchArea {
+                                            enabled: root.available_animations.length > 0;
+                                            mouse-cursor: root.available_animations.length > 0 ? pointer : default;
+                                            clicked => {
+                                                if (root.available_animations.length > 0) {
+                                                    root.selected_anim_idx = Math.mod(root.selected_anim_idx + 1, root.available_animations.length);
+                                                    root.select_active_animation(root.selected_anim_idx);
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Timeline Scrubber Slider
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        horizontal-stretch: 1;
+                                        alignment: center;
+
+                                        Text {
+                                            text: Math.round(root.anim_current_time * 100.0) / 100.0 + "s / " + Math.round(root.anim_duration * 100.0) / 100.0 + "s";
+                                            font-family: "Consolas";
+                                            font-size: 11px;
+                                            font-weight: 700;
+                                            color: #f0b132;
+                                            vertical-alignment: center;
+                                            width: 95px;
+                                        }
+
+                                        Slider {
+                                            enabled: root.has_animations;
+                                            minimum: 0.0;
+                                            maximum: root.anim_duration;
+                                            value <=> root.anim_current_time;
+                                            changed(val) => {
+                                                root.scrub_animation_timeline(val);
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
 

@@ -80,6 +80,31 @@ pub fn register(
         let _ = tx_comp.send(WorkerCommand::ToggleCompositeView);
     });
 
+    let tx_skin = tx.clone();
+    ui.on_toggle_skinning(move || {
+        let _ = tx_skin.send(WorkerCommand::ToggleSkinning);
+    });
+
+    // Real-Time Viewport Animation Playback Callbacks
+    let tx_anim_sel = tx.clone();
+    ui.on_select_active_animation(move |clip_idx| {
+        let _ = tx_anim_sel.send(WorkerCommand::SelectAnimation {
+            clip_index: clip_idx,
+        });
+    });
+
+    let tx_anim_scrub = tx.clone();
+    ui.on_scrub_animation_timeline(move |time_sec| {
+        let _ = tx_anim_scrub.send(WorkerCommand::SetAnimationTime {
+            time_seconds: time_sec,
+        });
+    });
+
+    let tx_anim_tick = tx.clone();
+    ui.on_tick_animation_frame(move |dt| {
+        let _ = tx_anim_tick.send(WorkerCommand::TickAnimationPlayback { delta_seconds: dt });
+    });
+
     let tx_revert = tx.clone();
     let state_revert = state;
     ui.on_revert_asset(move |chunk_str| {
