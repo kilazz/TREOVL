@@ -28,30 +28,8 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize> {
         );
     }
 
-    let dirs = [
-        "textures",
-        "audio",
-        "materials",
-        "meshes",
-        "animations",
-        "scripts",
-        "raw_chunks",
-        "xml",
-        "parameters",
-        "ui",
-        "objects",
-        "vfx",
-        "events",
-        "facefx",
-        "characters",
-        "attachments",
-        "terrain_palettes",
-        "collisions",
-        "fonts",
-    ];
-    for dir in dirs {
-        fs::create_dir_all(workspace.assets_dir.join(dir))?;
-    }
+    // Create only the root assets/ directory; subfolders are created by processors as needed.
+    fs::create_dir_all(&workspace.assets_dir)?;
 
     let processors = get_standard_processors();
     let raw_processor = RawProcessor;
@@ -262,6 +240,16 @@ pub fn sync_assets_to_chunks(project_dir: &Path) -> Result<usize> {
                     }
                 }
                 "Animation" => baseline_chunk,
+                "Dta" => {
+                    let json_str =
+                        String::from_utf8(asset_bytes).context("DTA JSON is not valid UTF-8")?;
+                    crate::engine::assets::dta::import_dta_from_json(&json_str, &baseline_chunk)?
+                }
+                "VoicePackage" => {
+                    let json_str = String::from_utf8(asset_bytes)
+                        .context("Voice Package JSON is not valid UTF-8")?;
+                    crate::engine::assets::vpk::import_vpk_from_json(&json_str, &baseline_chunk)?
+                }
                 "M8ldMap" => {
                     let xml_str = String::from_utf8(asset_bytes)
                         .context("M8LD XML file is not valid UTF-8")?;

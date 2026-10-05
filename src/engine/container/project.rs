@@ -23,14 +23,12 @@ pub struct ProjectManifest {
 }
 
 pub fn unpack_archive(archive_path: &Path, output_dir: &Path) -> Result<(usize, String)> {
-    let file = fs::File::open(archive_path)
-        .with_context(|| format!("Failed to open archive: {:?}", archive_path))?;
-    let mmap = unsafe { memmap2::Mmap::map(&file) }
-        .with_context(|| format!("Failed to memory map archive: {:?}", archive_path))?;
-    let data: &[u8] = &mmap[..];
+    // Standard I/O read: closes the file handle immediately, avoiding Windows ERROR_SHARING_VIOLATION
+    let data = fs::read(archive_path)
+        .with_context(|| format!("Failed to read archive into memory: {:?}", archive_path))?;
 
-    let header = PrpHeader::read(data)?;
-    let footer_opt = check_footer(data);
+    let header = PrpHeader::read(&data)?;
+    let footer_opt = check_footer(&data);
     let has_footer = footer_opt.is_some();
     let footer_hash2 = footer_opt.as_ref().map(|f| f.hash2).unwrap_or(0x7C809B8B);
     let endian = footer_opt

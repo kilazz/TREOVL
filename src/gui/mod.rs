@@ -14,7 +14,7 @@ use std::thread;
 
 use crate::engine::assets::sniffer::{AssetKind, sniff_asset};
 use crate::engine::container::sync::{AssetSyncCache, calculate_crc32};
-use crate::engine::math::Vector3;
+use crate::engine::math::{Vector2, Vector3};
 use crate::utils::logger::UiLogger;
 use crate::utils::renderer::ViewportCamera;
 use crate::{AppWindow, AssetItem};
@@ -32,6 +32,8 @@ pub struct ActiveMeshPreview {
     pub positions: Vec<Vector3>,
     pub indices: Vec<u32>,
     pub normals: Vec<Vector3>,
+    pub uvs: Vec<Vector2>,
+    pub texture: Option<Arc<(u32, u32, Vec<u8>)>>,
 }
 
 #[derive(Default)]

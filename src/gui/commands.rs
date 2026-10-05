@@ -45,7 +45,7 @@ pub enum WorkerCommand {
         generation: u64,
     },
 
-    // Direct 8LD & XML File Operations
+    // Standalone Direct File Operations (Global Toolbox)
     Decompile8ldDirect {
         src: PathBuf,
         dst: PathBuf,
@@ -63,7 +63,91 @@ pub enum WorkerCommand {
         dst_dir: PathBuf,
     },
 
-    // Asset Export Operations
+    DirectVpkToJson {
+        src: PathBuf,
+        dst: PathBuf,
+    },
+    DirectJsonToVpk {
+        src_json: PathBuf,
+        baseline_vpk: PathBuf,
+        dst: PathBuf,
+    },
+
+    DirectDtaToJson {
+        src: PathBuf,
+        dst: PathBuf,
+    },
+    DirectJsonToDta {
+        src_json: PathBuf,
+        baseline_dta: PathBuf,
+        dst: PathBuf,
+    },
+    DirectEnvToJson {
+        src: PathBuf,
+        dst: PathBuf,
+    },
+    DirectJsonToEnv {
+        src_json: PathBuf,
+        baseline_env: PathBuf,
+        dst: PathBuf,
+    },
+
+    DirectMeshExport {
+        src: PathBuf,
+        dst: PathBuf,
+        is_glb: bool,
+    },
+    DirectMeshImport {
+        chunk_target: PathBuf,
+        model_src: PathBuf,
+        is_glb: bool,
+    },
+    DirectAssembleLevel {
+        omp_path: PathBuf,
+        assets_dir: PathBuf,
+        dst: PathBuf,
+    },
+    DirectTerrainExport {
+        src: PathBuf,
+        dst: PathBuf,
+        is_glb: bool,
+    },
+
+    DirectCollisionExport {
+        src: PathBuf,
+        dst: PathBuf,
+    },
+    DirectCollisionImport {
+        chunk_target: PathBuf,
+        glb_src: PathBuf,
+    },
+    DirectFontToJson {
+        src: PathBuf,
+        dst: PathBuf,
+    },
+    DirectJsonToFont {
+        src_json: PathBuf,
+        dst: PathBuf,
+    },
+
+    DirectTextureExport {
+        src: PathBuf,
+        dst: PathBuf,
+    },
+    DirectTextureImport {
+        chunk_target: PathBuf,
+        img_src: PathBuf,
+    },
+    DirectAudioExport {
+        src: PathBuf,
+        dst: PathBuf,
+    },
+    DirectAudioImport {
+        chunk_target: PathBuf,
+        wav_src: PathBuf,
+    },
+
+    // Contextual Asset Export Operations
     ExportDds {
         chunk_path: PathBuf,
         out_path: PathBuf,
@@ -99,7 +183,7 @@ pub enum WorkerCommand {
         out_path: PathBuf,
     },
 
-    // Asset Import & Save Operations
+    // Contextual Asset Import & Save Operations
     ImportDds {
         chunk_path: PathBuf,
         in_path: PathBuf,
@@ -146,6 +230,14 @@ pub enum WorkerCommand {
         json_data: String,
     },
     SaveUiSprite {
+        chunk_path: PathBuf,
+        json_data: String,
+    },
+    SaveDta {
+        chunk_path: PathBuf,
+        json_data: String,
+    },
+    SaveVpk {
         chunk_path: PathBuf,
         json_data: String,
     },

@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, bail};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Cursor;
 use std::path::Path;
 
 use super::{
@@ -17,16 +19,14 @@ pub struct CharacterActorJson {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_binding: Option<CharacterModelBinding>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub breakable_config: Option<BreakablePropsConfigJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collapse_target_model: Option<String>,
     pub actor_flags: Option<CharacterFlagsJson>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub combat_attributes: Option<CharacterAttributesJson>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub timing_parameters: Option<CharacterCombatTimingsJson>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub knockback_parameters: Option<CharacterKnockbackJson>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub state_and_rewards: Option<CharacterStateAndRewardsJson>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub morph_parameters: Option<CharacterMorphParamsJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub equipment: Option<CharacterEquipmentJson>,
@@ -62,12 +62,26 @@ pub struct CharacterEngineMetadataJson {
     pub unmapped_raw_blocks: Vec<RawCharacterBlock>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct BreakablePropsConfigJson {
+    pub base_health: f32,
+    pub collapse_target_model: String,
+    pub physics_material_id: u32,
+    pub debris_pieces_count: usize,
+    pub sound_cue_id: u32,
+    pub trigger_collapse_on_hit: bool,
+    pub spawn_debris_particles: bool,
+    pub can_be_carried: bool,
+    pub center_offset: [f32; 3],
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct CharacterFlagsJson {
     pub casts_dynamic_shadows: bool,
     pub can_be_targeted: bool,
     pub ragdoll_on_death: bool,
-    pub is_civilian: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_civilian: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -182,21 +196,55 @@ pub struct RawCharacterBlock {
     pub hex: String,
 }
 
+fn validate_float_field(field_name: &str, val: Option<f32>) -> Result<()> {
+    if let Some(v) = val {
+        if !v.is_finite() {
+            bail!(
+                "Field '{}' must be a valid finite number, found: {}",
+                field_name,
+                v
+            );
+        }
+        if v.abs() > 1_000_000.0 {
+            bail!("Field '{}' value is unreasonably large: {}", field_name, v);
+        }
+    }
+    Ok(())
+}
+
+fn extract_collapse_target_from_script(script: &str) -> Option<String> {
+    for line in script.lines() {
+        if line.contains("Collapse(")
+            && let Some(first_quote) = line.find('"')
+        {
+            let tail = &line[first_quote + 1..];
+            if let Some(second_quote) = tail.find('"') {
+                let target = &tail[..second_quote];
+                return Some(target.replace("\\\\", "\\"));
+            }
+        }
+    }
+    None
+}
+
 pub fn export_character_to_json(
     data: &[u8],
     assets_dir: Option<&Path>,
     stem: &str,
 ) -> Result<String> {
     if data.len() < 5 {
-        bail!("Data too short for a Character Actor container");
+        bail!("Data too short for a Character / Actor container");
     }
 
     let (type_id, elements) =
         parse_typed_container(data).context("Failed to parse Character typed container")?;
 
+    let is_breakable = type_id == 0x00463018;
+
     let mut character_name = String::from("Unnamed_Character");
     let mut resource_tag = None;
     let mut model_binding = None;
+    let mut collapse_target_model = None;
     let mut facefx_actor = None;
     let mut embedded_facefx_file = None;
     let mut lifeforce_color = None;
@@ -212,10 +260,20 @@ pub fn export_character_to_json(
     let mut raw_flags_hex_val = None;
     let mut timings = CharacterCombatTimingsJson::default();
     let mut knockback = CharacterKnockbackJson::default();
-    let mut state_rewards = CharacterStateAndRewardsJson::default();
+    let mut state_and_rewards = CharacterStateAndRewardsJson::default();
     let mut morph_params = CharacterMorphParamsJson::default();
     let mut equipment = None;
     let mut unmapped_raw_blocks = Vec::new();
+
+    // Breakable-specific structured properties
+    let mut brk_health = 5.0f32;
+    let mut brk_material_id = 2u32;
+    let mut brk_debris_count = 8usize;
+    let mut brk_sound_cue = 112u32;
+    let mut brk_trigger_collapse = true;
+    let mut brk_spawn_particles = true;
+    let mut brk_can_be_carried = true;
+    let mut brk_center_offset = [0.0f32, 0.0f32, 0.0f32];
 
     for (id, chunk) in &elements {
         match *id {
@@ -237,7 +295,11 @@ pub fn export_character_to_json(
                     casts_dynamic_shadows: (mask & 0x2000_0000) != 0,
                     can_be_targeted: (mask & 0x0100_0000) != 0,
                     ragdoll_on_death: (mask & 0x0040_0000) != 0,
-                    is_civilian: (mask & 0x0000_0002) != 0,
+                    is_civilian: if is_breakable {
+                        None
+                    } else {
+                        Some((mask & 0x0000_0002) != 0)
+                    },
                 };
                 raw_flags_hex_val = Some(format!("0x{:08X}", mask));
             }
@@ -245,11 +307,49 @@ pub fn export_character_to_json(
                 attributes.is_enabled = Some(chunk[0] != 0);
             }
             28 if !chunk.is_empty() => {
-                state_rewards.stance_id = Some(chunk[0]);
+                state_and_rewards.stance_id = Some(chunk[0]);
             }
-            29 | 63 => {
-                if equipment.is_none() {
+            29 => {
+                if is_breakable {
+                    brk_can_be_carried = chunk.len() >= 4 && chunk[0] != 0;
+                } else if equipment.is_none() {
                     equipment = parse_equipment_definition(&elements);
+                }
+            }
+            63 => {
+                if !is_breakable && equipment.is_none() {
+                    equipment = parse_equipment_definition(&elements);
+                }
+            }
+            31 | 37 | 67 => {
+                if model_binding.is_none()
+                    && let Some(mb) = parse_model_binding(chunk)
+                {
+                    model_binding = Some(mb);
+                }
+            }
+            46 if is_breakable && chunk.len() >= 4 => {
+                brk_material_id = u32::from_le_bytes(chunk[0..4].try_into().unwrap_or_default());
+            }
+            70 if is_breakable && !chunk.is_empty() => {
+                brk_debris_count = chunk[0] as usize;
+            }
+            201 if is_breakable && chunk.len() >= 10 => {
+                brk_sound_cue = chunk[6] as u32;
+            }
+            202 if is_breakable && !chunk.is_empty() => {
+                brk_trigger_collapse = chunk[0] != 0;
+            }
+            203 if is_breakable && !chunk.is_empty() => {
+                brk_spawn_particles = chunk[0] != 0;
+            }
+            300 if is_breakable && chunk.len() >= 15 => {
+                let mut cur = Cursor::new(&chunk[3..15]);
+                let x = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+                let y = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+                let z = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+                if x.is_finite() && y.is_finite() && z.is_finite() {
+                    brk_center_offset = [x, y, z];
                 }
             }
             50 => {
@@ -270,11 +370,6 @@ pub fn export_character_to_json(
             66 if chunk.len() >= 4 => {
                 attributes.engagement_distance = parse_f32_safe(chunk);
             }
-            67 => {
-                if let Some(mb) = parse_model_binding(chunk) {
-                    model_binding = Some(mb);
-                }
-            }
             74 if chunk.len() >= 4 => {
                 attributes.faction_id = Some(u32::from_le_bytes(
                     chunk[0..4].try_into().unwrap_or_default(),
@@ -292,8 +387,9 @@ pub fn export_character_to_json(
             112 => {
                 ai_behaviors = parse_ai_behaviors(chunk);
             }
-            115 => {
+            115 | 200 => {
                 if let Some((lua_source, bytecode)) = extract_embedded_lua_and_bytecode(chunk) {
+                    collapse_target_model = extract_collapse_target_from_script(&lua_source);
                     embedded_lua_script = Some(lua_source.clone());
 
                     if let Some(dir) = assets_dir {
@@ -308,6 +404,20 @@ pub fn export_character_to_json(
                             let _ = fs::write(luac_path, &bytecode);
                         }
                         lua_script_file = Some(format!("assets/scripts/{}.lua", file_base));
+                    }
+                }
+
+                if *id == 200 {
+                    for window in chunk.windows(4) {
+                        let val = f32::from_le_bytes(window.try_into().unwrap_or_default());
+                        if val > 0.0
+                            && val <= 50_000.0
+                            && val.is_finite()
+                            && (val == 5.0 || val == 10.0 || val == 1.0)
+                        {
+                            brk_health = val;
+                            break;
+                        }
                     }
                 }
             }
@@ -330,18 +440,18 @@ pub fn export_character_to_json(
                 timings.stumble_recovery_time_sec = parse_f32_safe(chunk);
             }
             120 if !chunk.is_empty() => {
-                state_rewards.is_stunned = Some(chunk[0] != 0);
+                state_and_rewards.is_stunned = Some(chunk[0] != 0);
             }
             121 if chunk.len() >= 4 => {
                 attributes.hit_reaction_force = parse_f32_safe(chunk);
             }
             122 if chunk.len() >= 4 => {
-                state_rewards.experience_reward = Some(u32::from_le_bytes(
+                state_and_rewards.experience_reward = Some(u32::from_le_bytes(
                     chunk[0..4].try_into().unwrap_or_default(),
                 ));
             }
             123 if chunk.len() >= 4 => {
-                state_rewards.loot_drop_multiplier = Some(u32::from_le_bytes(
+                state_and_rewards.loot_drop_multiplier = Some(u32::from_le_bytes(
                     chunk[0..4].try_into().unwrap_or_default(),
                 ));
             }
@@ -387,7 +497,7 @@ pub fn export_character_to_json(
                 }
             }
             88 | 92 | 96 | 97 | 98 | 102 | 111 | 114 | 128 | 129 | 134 | 147 | 148 | 152 | 153
-            | 159 | 161 | 167 | 19 | 1 => {}
+            | 159 | 161 | 167 | 19 | 1 | 41 | 42 | 45 | 71 | 301 => {}
             _ => {
                 unmapped_raw_blocks.push(RawCharacterBlock {
                     id: *id,
@@ -397,11 +507,33 @@ pub fn export_character_to_json(
         }
     }
 
+    let engine_class = match type_id {
+        0x00463018 => "TREBreakable".to_string(),
+        _ => "TREActorController".to_string(),
+    };
+
     let metadata = CharacterEngineMetadataJson {
         type_id_hex: format!("{:08X}", type_id),
-        engine_class: "TREActorController".to_string(),
+        engine_class,
         raw_flags_hex: raw_flags_hex_val,
         unmapped_raw_blocks,
+    };
+
+    let breakable_config = if is_breakable {
+        attributes.base_health = Some(brk_health);
+        Some(BreakablePropsConfigJson {
+            base_health: brk_health,
+            collapse_target_model: collapse_target_model.clone().unwrap_or_default(),
+            physics_material_id: brk_material_id,
+            debris_pieces_count: brk_debris_count,
+            sound_cue_id: brk_sound_cue,
+            trigger_collapse_on_hit: brk_trigger_collapse,
+            spawn_debris_particles: brk_spawn_particles,
+            can_be_carried: brk_can_be_carried,
+            center_offset: brk_center_offset,
+        })
+    } else {
+        None
     };
 
     let char_json = CharacterActorJson {
@@ -409,11 +541,17 @@ pub fn export_character_to_json(
         character_name,
         resource_tag,
         model_binding,
+        breakable_config,
+        collapse_target_model: if is_breakable {
+            None
+        } else {
+            collapse_target_model
+        },
         actor_flags: Some(flags),
         combat_attributes: Some(attributes),
         timing_parameters: Some(timings),
         knockback_parameters: Some(knockback),
-        state_and_rewards: Some(state_rewards),
+        state_and_rewards: Some(state_and_rewards),
         morph_parameters: Some(morph_params),
         equipment,
         facefx_actor,
@@ -432,16 +570,65 @@ pub fn export_character_to_json(
 }
 
 pub fn import_character_from_json(json_str: &str, project_dir: Option<&Path>) -> Result<Vec<u8>> {
-    let parsed: CharacterActorJson = serde_json::from_str(json_str)?;
-    let type_id = u32::from_str_radix(&parsed._engine_metadata.type_id_hex, 16)
-        .context("Invalid TypeID hex in Character JSON metadata")?;
+    let parsed: CharacterActorJson =
+        serde_json::from_str(json_str).context("Syntax error in Character Actor JSON format")?;
+
+    let clean_type_id = parsed
+        ._engine_metadata
+        .type_id_hex
+        .trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X");
+    let type_id = u32::from_str_radix(clean_type_id, 16).with_context(|| {
+        format!(
+            "Invalid TypeID hex: '{}'",
+            parsed._engine_metadata.type_id_hex
+        )
+    })?;
+
+    let is_breakable = type_id == 0x00463018;
+
+    if let Some(ref attrs) = parsed.combat_attributes {
+        validate_float_field("move_speed_scale", attrs.move_speed_scale)?;
+        validate_float_field("turn_speed_scale", attrs.turn_speed_scale)?;
+        validate_float_field("perception_radius", attrs.perception_radius)?;
+        validate_float_field("collision_radius", attrs.collision_radius)?;
+        validate_float_field("engagement_distance", attrs.engagement_distance)?;
+        validate_float_field("mass", attrs.mass)?;
+        validate_float_field("base_health", attrs.base_health)?;
+        validate_float_field("hit_reaction_force", attrs.hit_reaction_force)?;
+        validate_float_field("target_awareness_range", attrs.target_awareness_range)?;
+    }
+
+    if let Some(ref timings) = parsed.timing_parameters {
+        validate_float_field(
+            "stumble_recovery_time_sec",
+            timings.stumble_recovery_time_sec,
+        )?;
+        validate_float_field("attack_windup_time_sec", timings.attack_windup_time_sec)?;
+        validate_float_field("attack_cooldown_time_sec", timings.attack_cooldown_time_sec)?;
+        validate_float_field("block_window_time_sec", timings.block_window_time_sec)?;
+        validate_float_field("invulnerability_time_sec", timings.invulnerability_time_sec)?;
+    }
 
     let mut elements = Vec::new();
 
-    // 1. Restore unmapped raw engine blocks
+    let updated_lua = if let Some(ref script_rel) = parsed.lua_script_file
+        && let Some(base_dir) = project_dir
+    {
+        fs::read_to_string(base_dir.join(script_rel)).ok()
+    } else {
+        parsed.embedded_lua_script.clone()
+    };
+
+    // Reconstruct raw unmapped components with validation
     for block in &parsed._engine_metadata.unmapped_raw_blocks {
-        let mut chunk_bytes = hex::decode(&block.hex)
-            .with_context(|| format!("Invalid hex payload in block ID {}", block.id))?;
+        let mut chunk_bytes = hex::decode(&block.hex).with_context(|| {
+            format!(
+                "Invalid hex payload in block ID {}: '{}'",
+                block.id, block.hex
+            )
+        })?;
 
         if block.id == 117
             && let Some(ref color) = parsed.lifeforce_color
@@ -452,7 +639,6 @@ pub fn import_character_from_json(json_str: &str, project_dir: Option<&Path>) ->
         elements.push((block.id, chunk_bytes));
     }
 
-    // 2. Synthesize all structured properties cleanly
     if let Some(ref tag) = parsed.resource_tag {
         elements.push((20, write_length_prefixed_string(tag)));
     }
@@ -462,7 +648,13 @@ pub fn import_character_from_json(json_str: &str, project_dir: Option<&Path>) ->
 
     if let Some(ref flags) = parsed.actor_flags {
         let mut mask = if let Some(ref raw_h) = parsed._engine_metadata.raw_flags_hex {
-            u32::from_str_radix(raw_h.trim_start_matches("0x"), 16).unwrap_or(0x2140_0000)
+            let clean_hex = raw_h
+                .trim()
+                .trim_start_matches("0x")
+                .trim_start_matches("0X");
+            u32::from_str_radix(clean_hex, 16).with_context(|| {
+                format!("Invalid hex representation in raw_flags_hex: '{}'", raw_h)
+            })?
         } else {
             0x2140_0000
         };
@@ -472,140 +664,248 @@ pub fn import_character_from_json(json_str: &str, project_dir: Option<&Path>) ->
         } else {
             mask &= !0x2000_0000;
         }
-
         if flags.can_be_targeted {
             mask |= 0x0100_0000;
         } else {
             mask &= !0x0100_0000;
         }
-
         if flags.ragdoll_on_death {
             mask |= 0x0040_0000;
         } else {
             mask &= !0x0040_0000;
         }
-
-        if flags.is_civilian {
-            mask |= 0x0000_0002;
-        } else {
-            mask &= !0x0000_0002;
+        if !is_breakable && let Some(civilian) = flags.is_civilian {
+            if civilian {
+                mask |= 0x0000_0002;
+            } else {
+                mask &= !0x0000_0002;
+            }
         }
 
         elements.push((22, mask.to_le_bytes().to_vec()));
     }
 
-    if let Some(ref attrs) = parsed.combat_attributes {
-        if let Some(en) = attrs.is_enabled {
-            elements.push((23, vec![if en { 1 } else { 0 }]));
-        }
-        if let Some(v) = attrs.move_speed_scale {
-            elements.push((61, v.to_le_bytes().to_vec()));
-        }
-        if let Some(v) = attrs.turn_speed_scale {
-            elements.push((62, v.to_le_bytes().to_vec()));
-        }
-        if let Some(v) = attrs.perception_radius {
-            elements.push((64, v.to_le_bytes().to_vec()));
-        }
-        if let Some(v) = attrs.collision_radius {
-            elements.push((65, v.to_le_bytes().to_vec()));
-        }
-        if let Some(v) = attrs.engagement_distance {
-            elements.push((66, v.to_le_bytes().to_vec()));
-        }
-        if let Some(fid) = attrs.faction_id {
-            elements.push((74, fid.to_le_bytes().to_vec()));
-        }
-        if let Some(active) = attrs.is_active_on_spawn {
-            elements.push((77, vec![if active { 1 } else { 0 }]));
-        }
-        if let Some(v) = attrs.mass {
-            elements.push((80, v.to_le_bytes().to_vec()));
-        }
-        if let Some(v) = attrs.base_health {
-            elements.push((83, v.to_le_bytes().to_vec()));
-        }
-        if let Some(v) = attrs.hit_reaction_force {
-            elements.push((121, v.to_le_bytes().to_vec()));
-        }
-    }
+    let is_en = parsed
+        .combat_attributes
+        .as_ref()
+        .and_then(|a| a.is_enabled)
+        .unwrap_or(true);
+    elements.push((23, vec![if is_en { 1 } else { 0 }]));
 
-    if let Some(ref sr) = parsed.state_and_rewards {
-        if let Some(s) = sr.stance_id {
-            elements.push((28, vec![s]));
-        }
-        if let Some(st) = sr.is_stunned {
-            elements.push((120, vec![if st { 1 } else { 0 }]));
-        }
-        if let Some(exp) = sr.experience_reward {
-            elements.push((122, exp.to_le_bytes().to_vec()));
-        }
-        if let Some(loot) = sr.loot_drop_multiplier {
-            elements.push((123, loot.to_le_bytes().to_vec()));
-        }
-    }
+    if is_breakable {
+        let brk = parsed.breakable_config.as_ref();
+        let mat_id = brk.map(|b| b.physics_material_id).unwrap_or(2);
+        let health = brk
+            .map(|b| b.base_health)
+            .or_else(|| {
+                parsed
+                    .combat_attributes
+                    .as_ref()
+                    .and_then(|a| a.base_health)
+            })
+            .unwrap_or(5.0);
+        let debris_count = brk.map(|b| b.debris_pieces_count).unwrap_or(8);
+        let cue_id = brk.map(|b| b.sound_cue_id).unwrap_or(112);
+        let trigger = brk.is_none_or(|b| b.trigger_collapse_on_hit);
+        let particles = brk.is_none_or(|b| b.spawn_debris_particles);
+        let carry = brk.is_none_or(|b| b.can_be_carried);
+        let center = brk.map(|b| b.center_offset).unwrap_or([0.0, 0.5, 0.0]);
 
-    if let Some(ref eq) = parsed.equipment {
-        elements.push((29, vec![1, 40, 0, 2, 40, 0, 43, 4, 1, 1, 0, 0, 0]));
-        let item_sub = vec![(20, write_length_prefixed_string(&eq.item_name))];
-        let item_blob = build_typed_container(0x00464010, &item_sub);
-        elements.push((63, item_blob));
-    }
+        let stance_byte = parsed
+            .state_and_rewards
+            .as_ref()
+            .and_then(|sr| sr.stance_id)
+            .unwrap_or(0);
+        elements.push((28, vec![stance_byte]));
 
-    if let Some(ref timings) = parsed.timing_parameters {
-        if let Some(v) = timings.stumble_recovery_time_sec {
-            elements.push((119, v.to_le_bytes().to_vec()));
+        if carry {
+            elements.push((29, vec![1, 40, 0, 2, 40, 0, 43, 4, 1, 1, 0, 0, 0]));
+        } else {
+            elements.push((29, vec![0u8]));
         }
-        if let Some(v) = timings.attack_windup_time_sec {
-            elements.push((127, v.to_le_bytes().to_vec()));
+
+        elements.push((41, vec![1, 1, 0, 0]));
+        elements.push((42, vec![2, 0x1E, 0, 0x23, 1, 0, 0, 0, 0, 0]));
+        elements.push((45, vec![1, 1, 0, 0]));
+        elements.push((46, mat_id.to_le_bytes().to_vec()));
+
+        // Synthesize block 70 (Havok debris pieces hierarchy)
+        let mut blk70 = Vec::with_capacity(1 + debris_count * 2 + debris_count * 28);
+        blk70.push(debris_count as u8);
+        for i in 0..debris_count {
+            blk70.push((40 + i) as u8);
+            blk70.push((i * 28) as u8);
         }
-        if let Some(v) = timings.attack_cooldown_time_sec {
-            elements.push((131, v.to_le_bytes().to_vec()));
+        for _ in 0..debris_count {
+            blk70.extend_from_slice(&[
+                6, 0x28, 0, 0x29, 1, 0x2A, 2, 0x2B, 3, 0x2C, 7, 0x2D, 11, 0, 0, 0, 1, 0x14, 0, 0,
+                1, 1, 0, 0, 1, 1, 0, 0,
+            ]);
         }
-        if let Some(v) = timings.block_window_time_sec {
-            elements.push((132, v.to_le_bytes().to_vec()));
+        elements.push((70, blk70));
+
+        // Block 71 (Debris impulse and physics properties)
+        elements.push((
+            71,
+            vec![
+                13, 0x29, 0, 0x2A, 7, 0x2B, 8, 0x2C, 9, 0x2D, 10, 0x64, 11, 0x65, 24, 0x66, 37,
+                0x67, 50, 0x68, 63, 0x69, 76, 0x6A, 89, 0x6B, 102, 1, 10, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 4, 0x29, 0, 0x2A, 1, 0x2C, 2, 0x30, 3, 0, 0, 0, 0, 4, 0x29, 0, 0x2A, 1, 0x2C, 2,
+                0x30, 3, 0, 0, 0, 0, 4, 0x29, 0, 0x2A, 1, 0x2C, 2, 0x30, 3, 0, 0, 0, 0, 4, 0x29, 0,
+                0x2A, 1, 0x2C, 2, 0x30, 3, 0, 0, 0, 0, 4, 0x29, 0, 0x2A, 1, 0x2C, 2, 0x30, 3, 0, 0,
+                0, 0, 4, 0x29, 0, 0x2A, 1, 0x2C, 2, 0x30, 3, 0, 0, 0, 0, 4, 0x29, 0, 0x2A, 1, 0x2C,
+                2, 0x30, 3, 0, 0, 0, 0, 4, 0x29, 0, 0x2A, 1, 0x2C, 2, 0x30, 3, 0, 0, 0, 0,
+            ],
+        ));
+
+        // Synthesize block 200 (Health + Lua Script)
+        let lua_text = updated_lua.clone().unwrap_or_else(|| {
+            format!(
+                "local AliasName = GetAlias()\nCollapse(AliasName, \"{}\")",
+                brk.map(|b| b.collapse_target_model.as_str()).unwrap_or("")
+            )
+        });
+
+        let mut script_sub = Vec::new();
+        for line in lua_text.lines() {
+            let b = line.as_bytes();
+            script_sub.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            script_sub.extend_from_slice(b);
         }
-        if let Some(v) = timings.invulnerability_time_sec {
-            elements.push((133, v.to_le_bytes().to_vec()));
+
+        let mut script_container = Vec::new();
+        script_container.extend_from_slice(&[3, 0x15, 0, 0x16, 0x54, 0x17, 0x58, 2, 0, 0, 0]);
+        script_container.extend_from_slice(&script_sub);
+        script_container.extend_from_slice(&[0xBF, 0, 0, 0]);
+        script_container.extend_from_slice(b"\x1bLua\x50\x01\x04\x04\x04\x06\x08\x09\x09\x08\xB6\x09\x93\x68\xE7\xF5\x7D\x41\x01\0\0\0\0\0\0\0\0\0\0\0\x04\x07\0\0\0\x01\0\0\0\x01\0\0\0\x02\0\0\0\x02\0\0\0\x02\0\0\0\x02\0\0\0\x02\0\0\0\x01\0\0\0\x0A\0\0\0AliasName\0\x02\0\0\0\x06\0\0\0\0\0\0\0\x03\0\0\0\x04\x09\0\0\0GetAlias\0\x04\x09\0\0\0Collapse\0\x04\x14\0\0\0[Props_Sewers]OBJ\\6\0\0\0\0\0\x07\0\0\0\x05\0\0\0\x99\x80\0\0\x45\0\0\x01\0\0\0\x02\x81\0\0\x03\x59\x80\x01\x01\x1B\x80\0\0\0\0\0\0");
+
+        let mut blk200 = Vec::new();
+        blk200.extend_from_slice(&[
+            0x83, 4, 0, 0, 0, 10, 0, 12, 4, 13, 5, 14, 0, 0, 0, 0x21, 1, 0, 0, 19, 0, 0, 0, 0x22,
+            1, 0, 0, 22, 0, 0, 0, 0x23, 1, 0, 0, 23, 0, 0, 0, 0x24, 1, 0, 0,
+        ]);
+        blk200.extend_from_slice(&health.to_le_bytes());
+        blk200.push(0);
+        blk200.extend_from_slice(&script_container);
+        elements.push((200, blk200));
+
+        elements.push((201, vec![1, 0x16, 0, 1, 0x14, 0, cue_id as u8, 0, 0, 0]));
+        elements.push((202, vec![if trigger { 1 } else { 0 }, 1, 0, 0]));
+        elements.push((203, vec![if particles { 1 } else { 0 }, 1, 0, 0]));
+
+        let mut blk300 = vec![1u8, 20, 0];
+        let _ = blk300.write_f32::<LittleEndian>(center[0]);
+        let _ = blk300.write_f32::<LittleEndian>(center[1]);
+        let _ = blk300.write_f32::<LittleEndian>(center[2]);
+        elements.push((300, blk300));
+        elements.push((301, vec![0u8]));
+    } else {
+        if let Some(ref sr) = parsed.state_and_rewards {
+            if let Some(s) = sr.stance_id {
+                elements.push((28, vec![s]));
+            }
+            if let Some(st) = sr.is_stunned {
+                elements.push((120, vec![if st { 1 } else { 0 }]));
+            }
+            if let Some(exp) = sr.experience_reward {
+                elements.push((122, exp.to_le_bytes().to_vec()));
+            }
+            if let Some(loot) = sr.loot_drop_multiplier {
+                elements.push((123, loot.to_le_bytes().to_vec()));
+            }
+        }
+
+        if let Some(ref attrs) = parsed.combat_attributes {
+            if let Some(v) = attrs.move_speed_scale {
+                elements.push((61, v.to_le_bytes().to_vec()));
+            }
+            if let Some(v) = attrs.turn_speed_scale {
+                elements.push((62, v.to_le_bytes().to_vec()));
+            }
+            if let Some(v) = attrs.perception_radius {
+                elements.push((64, v.to_le_bytes().to_vec()));
+            }
+            if let Some(v) = attrs.collision_radius {
+                elements.push((65, v.to_le_bytes().to_vec()));
+            }
+            if let Some(v) = attrs.engagement_distance {
+                elements.push((66, v.to_le_bytes().to_vec()));
+            }
+            if let Some(fid) = attrs.faction_id {
+                elements.push((74, fid.to_le_bytes().to_vec()));
+            }
+            if let Some(active) = attrs.is_active_on_spawn {
+                elements.push((77, vec![if active { 1 } else { 0 }]));
+            }
+            if let Some(v) = attrs.mass {
+                elements.push((80, v.to_le_bytes().to_vec()));
+            }
+            if let Some(v) = attrs.base_health {
+                elements.push((83, v.to_le_bytes().to_vec()));
+            }
+            if let Some(v) = attrs.hit_reaction_force {
+                elements.push((121, v.to_le_bytes().to_vec()));
+            }
+        }
+
+        if let Some(ref eq) = parsed.equipment {
+            elements.push((29, vec![1, 40, 0, 2, 40, 0, 43, 4, 1, 1, 0, 0, 0]));
+            let item_sub = vec![(20, write_length_prefixed_string(&eq.item_name))];
+            let item_blob = build_typed_container(0x00464010, &item_sub);
+            elements.push((63, item_blob));
+        }
+
+        if let Some(ref timings) = parsed.timing_parameters {
+            if let Some(v) = timings.stumble_recovery_time_sec {
+                elements.push((119, v.to_le_bytes().to_vec()));
+            }
+            if let Some(v) = timings.attack_windup_time_sec {
+                elements.push((127, v.to_le_bytes().to_vec()));
+            }
+            if let Some(v) = timings.attack_cooldown_time_sec {
+                elements.push((131, v.to_le_bytes().to_vec()));
+            }
+            if let Some(v) = timings.block_window_time_sec {
+                elements.push((132, v.to_le_bytes().to_vec()));
+            }
+            if let Some(v) = timings.invulnerability_time_sec {
+                elements.push((133, v.to_le_bytes().to_vec()));
+            }
+        }
+
+        elements.push((88, vec![1, 1, 0, 0]));
+        elements.push((92, vec![0, 0, 0, 0]));
+        elements.push((96, vec![0]));
+        elements.push((97, vec![0]));
+        elements.push((98, vec![0]));
+        elements.push((102, vec![0, 0, 0, 0]));
+        elements.push((111, vec![0xFF, 0xFF, 0xFF, 0xFF]));
+        elements.push((114, vec![1, 0x22, 0, 0, 0, 0, 0x40]));
+        elements.push((134, vec![1]));
+        elements.push((167, vec![0]));
+
+        if let Some(ref lua_code) = updated_lua
+            && !elements.iter().any(|(id, _)| *id == 115)
+        {
+            elements.push((115, rebuild_lua_component(&[], lua_code)));
         }
     }
 
     if let Some(ref mb) = parsed.model_binding {
-        elements.push((67, build_model_binding(&mb.object_path, &mb.model_name)));
+        let binding_id = if is_breakable { 31 } else { 67 };
+        elements.push((
+            binding_id,
+            build_model_binding(&mb.object_path, &mb.model_name),
+        ));
     }
 
-    // Engine structural constants
-    elements.push((88, vec![1, 1, 0, 0]));
-    elements.push((92, vec![0, 0, 0, 0]));
-    elements.push((96, vec![0]));
-    elements.push((97, vec![0]));
-    elements.push((98, vec![0]));
-    elements.push((102, vec![0, 0, 0, 0]));
-    elements.push((111, vec![0xFF, 0xFF, 0xFF, 0xFF]));
-    elements.push((114, vec![1, 0x22, 0, 0, 0, 0, 0x40]));
-    elements.push((134, vec![1]));
-    elements.push((167, vec![0]));
     elements.push((19, vec![0xFF, 0xFF, 0xFF, 0xFF]));
     elements.push((1, vec![0]));
-
-    // Scripting component
-    let updated_lua = if let Some(ref script_rel) = parsed.lua_script_file
-        && let Some(base_dir) = project_dir
-    {
-        fs::read_to_string(base_dir.join(script_rel)).ok()
-    } else {
-        parsed.embedded_lua_script.clone()
-    };
-
-    if let Some(ref lua_code) = updated_lua {
-        elements.push((115, rebuild_lua_component(&[], lua_code)));
-    }
 
     if let Some(ref fxa) = parsed.facefx_actor {
         elements.push((139, write_length_prefixed_string(fxa)));
     }
 
-    // Embedded FaceFX
     if let Some(ref fxe_rel) = parsed.embedded_facefx_file
         && let Some(base_dir) = project_dir
         && let Ok(new_fxe) = fs::read(base_dir.join(fxe_rel))

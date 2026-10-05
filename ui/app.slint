@@ -1,6 +1,8 @@
 import { TextEdit, Button, LineEdit, ListView } from "std-widgets.slint";
 import { TabButton, CustomButton } from "./components/buttons.slint";
 import { SectionTitle, SplitterBar } from "./components/common.slint";
+import { Viewport3DView } from "./views/viewport_3d.slint";
+import { JsonEditorView } from "./views/editor_view.slint";
 
 export struct AssetItem {
     display_name: string,
@@ -8,7 +10,7 @@ export struct AssetItem {
     icon: string,
     file_path: string,
     size_str: string,
-    kind_id: int, // 0: Texture, 1: Audio, 2: Material, 3: Mesh, 4: Lua, 5: Generic, 6: UI, 7: Object, 8: Animation, 9: TerrainPalette, 10: Collision, 11: Environment, 12: M8LD Map Logic, 13: UI Sprite Collection
+    kind_id: int, // 0: Texture, 1: Audio, 2: Material, 3: Mesh, 4: Lua, 5: Generic, 6: UI, 7: Object, 8: Animation, 9: TerrainPalette, 10: Collision, 11: Environment, 12: M8LD Map Logic, 13: UI Sprite Collection, 14: Lighting Set (.dta), 15: Voice Package (.debug-vpk)
     is_modified: bool,
 }
 
@@ -23,6 +25,9 @@ export component AppWindow inherits Window {
     // View Tabs: 0 = Workspace, 1 = Terminal Log
     in-out property <int> active_tab: 0;
     in-out property <length> sidebar_width: 440px;
+
+    // Toolbox Subcategory Tab: 0 = Localization, 1 = Lighting & Env, 2 = 3D & Maps, 3 = Collisions & Fonts, 4 = Textures & Audio
+    in-out property <int> active_toolbox_tab: 0;
 
     // Workspace Data
     in-out property <string> active_project_dir: "";
@@ -43,6 +48,7 @@ export component AppWindow inherits Window {
     in-out property <bool> has_mesh: false;
     in-out property <string> mat_json_text: "";
     in-out property <string> mesh_info: "No mesh loaded.";
+    in-out property <[string]> mesh_stats_lines: [];
 
     // File Dialog Callbacks
     callback browse_file() -> string;
@@ -64,7 +70,7 @@ export component AppWindow inherits Window {
     // Interactive 3D Viewport Orbit Callback
     callback rotate_mesh_viewport(float, float);
 
-    // Contextual Asset Operations Callbacks
+    // Contextual Asset Operations Callbacks (for loaded project chunks)
     callback export_dds(string, string);
     callback import_dds(string, string);
     callback export_wav(string, string);
@@ -76,13 +82,8 @@ export component AppWindow inherits Window {
     callback save_environment(string, string);
     callback save_m8ld(string, string);
     callback save_ui_sprite(string, string);
-
-    // Localization Suite (8LD & XML - Single and Batch)
-    callback decompile_8ld(string, string);
-    callback compile_8ld(string, string);
-    callback decompile_8ld_batch(string, string);
-    callback compile_8ld_batch(string, string);
-
+    callback save_dta(string, string);
+    callback save_vpk(string, string);
     callback export_mesh_obj(string, string);
     callback import_mesh_obj(string, string);
     callback export_terrain_obj(string, string);
@@ -92,6 +93,35 @@ export component AppWindow inherits Window {
     callback import_lua(string, string);
     callback export_anim_glb(string, string);
     callback export_anim_json(string, string);
+
+    // Standalone Direct File Operations (Global Toolbox)
+    callback decompile_8ld(string, string);
+    callback compile_8ld(string, string);
+    callback decompile_8ld_batch(string, string);
+    callback compile_8ld_batch(string, string);
+
+    callback direct_vpk_to_json(string, string);
+    callback direct_json_to_vpk(string, string, string);
+
+    callback direct_dta_to_json(string, string);
+    callback direct_json_to_dta(string, string, string);
+    callback direct_env_to_json(string, string);
+    callback direct_json_to_env(string, string, string);
+
+    callback direct_mesh_export(string, string);
+    callback direct_mesh_import(string, string);
+    callback direct_assemble_level(string, string, string);
+    callback direct_terrain_export(string, string);
+
+    callback direct_collision_export(string, string);
+    callback direct_collision_import(string, string);
+    callback direct_font_to_json(string, string);
+    callback direct_json_to_font(string, string);
+
+    callback direct_texture_export(string, string);
+    callback direct_texture_import(string, string);
+    callback direct_audio_export(string, string);
+    callback direct_audio_import(string, string);
 
     VerticalLayout {
         padding: 12px;
@@ -143,9 +173,9 @@ export component AppWindow inherits Window {
         if root.active_tab == 0: VerticalLayout {
             spacing: 10px;
 
-            // QUICK ACTIONS TOOLBAR (ORGANIZED IN 2 FUNCTIONAL ROWS)
+            // QUICK ACTIONS TOOLBAR (ORGANIZED IN 3 ROWS)
             Rectangle {
-                height: 82px;
+                height: 114px;
                 background: #2b2d31;
                 border-color: #1f2023;
                 border-width: 1px;
@@ -184,12 +214,8 @@ export component AppWindow inherits Window {
                             min-w: 130px;
                             clicked => {
                                 let path = root.browse_folder();
-                                if (path != "") {
-                                    root.load_project(path);
-                                } else {
-                                    let f = root.browse_file();
-                                    if (f != "") { root.load_project(f); }
-                                }
+                                if (path != "") { root.load_project(path); }
+                                else { let f = root.browse_file(); if (f != "") { root.load_project(f); } }
                             }
                         }
 
@@ -199,12 +225,8 @@ export component AppWindow inherits Window {
                             primary-color: #d28e1b;
                             min-w: 125px;
                             clicked => {
-                                if (root.active_project_dir != "") {
-                                    root.open_assets_folder(root.active_project_dir);
-                                } else {
-                                    let proj = root.browse_folder();
-                                    if (proj != "") { root.open_assets_folder(proj); }
-                                }
+                                if (root.active_project_dir != "") { root.open_assets_folder(root.active_project_dir); }
+                                else { let proj = root.browse_folder(); if (proj != "") { root.open_assets_folder(proj); } }
                             }
                         }
 
@@ -214,12 +236,8 @@ export component AppWindow inherits Window {
                             primary-color: #636773;
                             min-w: 125px;
                             clicked => {
-                                if (root.active_project_dir != "") {
-                                    root.clean_rebuild(root.active_project_dir);
-                                } else {
-                                    let proj = root.browse_folder();
-                                    if (proj != "") { root.clean_rebuild(proj); }
-                                }
+                                if (root.active_project_dir != "") { root.clean_rebuild(root.active_project_dir); }
+                                else { let proj = root.browse_folder(); if (proj != "") { root.clean_rebuild(proj); } }
                             }
                         }
 
@@ -229,12 +247,8 @@ export component AppWindow inherits Window {
                             primary-color: #23a55a;
                             min-w: 120px;
                             clicked => {
-                                if (root.active_project_dir != "") {
-                                    root.pack_prp(root.active_project_dir);
-                                } else {
-                                    let proj = root.browse_folder();
-                                    if (proj != "") { root.pack_prp(proj); }
-                                }
+                                if (root.active_project_dir != "") { root.pack_prp(root.active_project_dir); }
+                                else { let proj = root.browse_folder(); if (proj != "") { root.pack_prp(proj); } }
                             }
                         }
 
@@ -279,73 +293,430 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    // ROW 2: LOCALIZATION SUITE (8LD / XML - Single & Batch)
+                    // ROW 2: CATEGORY SELECTOR CHIPS
                     HorizontalLayout {
                         spacing: 6px;
                         alignment: start;
+                        height: 22px;
 
                         Text {
-                            text: "Localization:";
+                            text: "Toolbox:";
                             font-family: "Consolas";
                             font-size: 11px;
                             font-weight: 700;
                             color: #949ba4;
                             vertical-alignment: center;
-                            width: 95px;
+                            width: 65px;
                         }
 
-                        CustomButton {
-                            icon: "🔓";
-                            text: "8LD -> XML (1 file)";
-                            primary-color: #d28e1b;
-                            min-w: 155px;
-                            clicked => {
-                                let src = root.browse_file();
-                                if (src != "") {
-                                    let dst = root.browse_folder();
-                                    if (dst != "") { root.decompile_8ld(src, dst); }
+                        // Tab 0: Localization
+                        Rectangle {
+                            background: root.active_toolbox_tab == 0 ? #3e6a90 : (c0_ta.has-hover ? #2e3035 : #202124);
+                            border-radius: 3px;
+                            border-width: 1px;
+                            border-color: root.active_toolbox_tab == 0 ? #58a6ff : #353535;
+                            HorizontalLayout {
+                                padding-left: 8px;
+                                padding-right: 8px;
+                                Text {
+                                    text: "🌐 Localization";
+                                    font-size: 11px;
+                                    font-weight: 700;
+                                    color: root.active_toolbox_tab == 0 ? #ffffff : #c0c0c0;
+                                    vertical-alignment: center;
+                                }
+                            }
+
+                            c0_ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.active_toolbox_tab = 0; }
+                            }
+                        }
+
+                        // Tab 1: Lighting & Env
+                        Rectangle {
+                            background: root.active_toolbox_tab == 1 ? #d28e1b : (c1_ta.has-hover ? #2e3035 : #202124);
+                            border-radius: 3px;
+                            border-width: 1px;
+                            border-color: root.active_toolbox_tab == 1 ? #f0b132 : #353535;
+                            HorizontalLayout {
+                                padding-left: 8px;
+                                padding-right: 8px;
+                                Text {
+                                    text: "💡 Lighting & Env";
+                                    font-size: 11px;
+                                    font-weight: 700;
+                                    color: root.active_toolbox_tab == 1 ? #ffffff : #c0c0c0;
+                                    vertical-alignment: center;
+                                }
+                            }
+
+                            c1_ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.active_toolbox_tab = 1; }
+                            }
+                        }
+
+                        // Tab 2: 3D Models & Maps
+                        Rectangle {
+                            background: root.active_toolbox_tab == 2 ? #23a55a : (c2_ta.has-hover ? #2e3035 : #202124);
+                            border-radius: 3px;
+                            border-width: 1px;
+                            border-color: root.active_toolbox_tab == 2 ? #57f287 : #353535;
+                            HorizontalLayout {
+                                padding-left: 8px;
+                                padding-right: 8px;
+                                Text {
+                                    text: "🗿 3D & Maps";
+                                    font-size: 11px;
+                                    font-weight: 700;
+                                    color: root.active_toolbox_tab == 2 ? #ffffff : #c0c0c0;
+                                    vertical-alignment: center;
+                                }
+                            }
+
+                            c2_ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.active_toolbox_tab = 2; }
+                            }
+                        }
+
+                        // Tab 3: Collisions & Fonts
+                        Rectangle {
+                            background: root.active_toolbox_tab == 3 ? #5865f2 : (c3_ta.has-hover ? #2e3035 : #202124);
+                            border-radius: 3px;
+                            border-width: 1px;
+                            border-color: root.active_toolbox_tab == 3 ? #7983f5 : #353535;
+                            HorizontalLayout {
+                                padding-left: 8px;
+                                padding-right: 8px;
+                                Text {
+                                    text: "🧱 Collision & Fonts";
+                                    font-size: 11px;
+                                    font-weight: 700;
+                                    color: root.active_toolbox_tab == 3 ? #ffffff : #c0c0c0;
+                                    vertical-alignment: center;
+                                }
+                            }
+
+                            c3_ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.active_toolbox_tab = 3; }
+                            }
+                        }
+
+                        // Tab 4: Textures & Audio
+                        Rectangle {
+                            background: root.active_toolbox_tab == 4 ? #b57a16 : (c4_ta.has-hover ? #2e3035 : #202124);
+                            border-radius: 3px;
+                            border-width: 1px;
+                            border-color: root.active_toolbox_tab == 4 ? #f0b132 : #353535;
+                            HorizontalLayout {
+                                padding-left: 8px;
+                                padding-right: 8px;
+                                Text {
+                                    text: "🎨 Textures & Audio";
+                                    font-size: 11px;
+                                    font-weight: 700;
+                                    color: root.active_toolbox_tab == 4 ? #ffffff : #c0c0c0;
+                                    vertical-alignment: center;
+                                }
+                            }
+
+                            c4_ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.active_toolbox_tab = 4; }
+                            }
+                        }
+                    }
+
+                    // ROW 3: CONTEXTUAL ACTIONS FOR SELECTED TOOLBOX CATEGORY
+                    HorizontalLayout {
+                        spacing: 6px;
+                        alignment: start;
+
+                        // --- CATEGORY 0: LOCALIZATION ---
+                        if root.active_toolbox_tab == 0: HorizontalLayout {
+                            spacing: 6px;
+                            CustomButton {
+                                icon: "🔓";
+                                text: "8LD -> XML (1 file)";
+                                primary-color: #d28e1b;
+                                min-w: 150px;
+                                clicked => {
+                                    let src = root.browse_file();
+                                    if (src != "") { let dst = root.browse_folder(); if (dst != "") { root.decompile_8ld(src, dst); } }
+                                }
+                            }
+
+                            CustomButton {
+                                icon: "🗂️";
+                                text: "8LD -> XML (Batch)";
+                                primary-color: #b57a16;
+                                min-w: 155px;
+                                clicked => {
+                                    let src = root.browse_folder();
+                                    if (src != "") { let dst = root.browse_folder(); if (dst != "") { root.decompile_8ld_batch(src, dst); } }
+                                }
+                            }
+
+                            CustomButton {
+                                icon: "🔒";
+                                text: "XML -> 8LD (1 file)";
+                                primary-color: #23a55a;
+                                min-w: 150px;
+                                clicked => {
+                                    let src = root.browse_file();
+                                    if (src != "") { let dst = root.browse_folder(); if (dst != "") { root.compile_8ld(src, dst); } }
+                                }
+                            }
+
+                            CustomButton {
+                                icon: "📦";
+                                text: "XML -> 8LD (Batch)";
+                                primary-color: #1c8849;
+                                min-w: 155px;
+                                clicked => {
+                                    let src = root.browse_folder();
+                                    if (src != "") { let dst = root.browse_folder(); if (dst != "") { root.compile_8ld_batch(src, dst); } }
+                                }
+                            }
+
+                            CustomButton {
+                                icon: "🗣️";
+                                text: "VPK -> JSON";
+                                primary-color: #3e6a90;
+                                min-w: 135px;
+                                clicked => {
+                                    let src = root.browse_file();
+                                    if (src != "") { let dst = root.save_file(); if (dst != "") { root.direct_vpk_to_json(src, dst); } }
+                                }
+                            }
+
+                            CustomButton {
+                                icon: "🔒";
+                                text: "JSON -> VPK";
+                                primary-color: #1c8849;
+                                min-w: 135px;
+                                clicked => {
+                                    let json_src = root.browse_file();
+                                    if (json_src != "") {
+                                        let base = root.browse_file();
+                                        if (base != "") { let out = root.save_file(); if (out != "") { root.direct_json_to_vpk(json_src, base, out); } }
+                                    }
                                 }
                             }
                         }
 
-                        CustomButton {
-                            icon: "🗂️";
-                            text: "8LD -> XML (Batch)";
-                            primary-color: #b57a16;
-                            min-w: 160px;
-                            clicked => {
-                                let src = root.browse_folder();
-                                if (src != "") {
-                                    let dst = root.browse_folder();
-                                    if (dst != "") { root.decompile_8ld_batch(src, dst); }
+                        // --- CATEGORY 1: LIGHTING & ENVIRONMENT ---
+                        if root.active_toolbox_tab == 1: HorizontalLayout {
+                            spacing: 6px;
+                            CustomButton {
+                                icon: "💡";
+                                text: "DTA -> JSON";
+                                primary-color: #d28e1b;
+                                min-w: 135px;
+                                clicked => {
+                                    let src = root.browse_file();
+                                    if (src != "") { let dst = root.save_file(); if (dst != "") { root.direct_dta_to_json(src, dst); } }
+                                }
+                            }
+
+                            CustomButton {
+                                icon: "🔒";
+                                text: "JSON -> DTA";
+                                primary-color: #23a55a;
+                                min-w: 135px;
+                                clicked => {
+                                    let json_src = root.browse_file();
+                                    if (json_src != "") {
+                                        let base = root.browse_file();
+                                        if (base != "") { let out = root.save_file(); if (out != "") { root.direct_json_to_dta(json_src, base, out); } }
+                                    }
+                                }
+                            }
+
+                            CustomButton {
+                                icon: "🌌";
+                                text: "ENV -> JSON";
+                                primary-color: #3e6a90;
+                                min-w: 135px;
+                                clicked => {
+                                    let src = root.browse_file();
+                                    if (src != "") { let dst = root.save_file(); if (dst != "") { root.direct_env_to_json(src, dst); } }
+                                }
+                            }
+
+                            CustomButton {
+                                icon: "💾";
+                                text: "JSON -> ENV";
+                                primary-color: #1c8849;
+                                min-w: 135px;
+                                clicked => {
+                                    let json_src = root.browse_file();
+                                    if (json_src != "") {
+                                        let base = root.browse_file();
+                                        if (base != "") { let out = root.save_file(); if (out != "") { root.direct_json_to_env(json_src, base, out); } }
+                                    }
                                 }
                             }
                         }
 
-                        CustomButton {
-                            icon: "🔒";
-                            text: "XML -> 8LD (1 file)";
-                            primary-color: #23a55a;
-                            min-w: 155px;
-                            clicked => {
-                                let src = root.browse_file();
-                                if (src != "") {
-                                    let dst = root.browse_folder();
-                                    if (dst != "") { root.compile_8ld(src, dst); }
+                        // --- CATEGORY 2: 3D MODELS & LEVEL MAPS ---
+                        if root.active_toolbox_tab == 2: HorizontalLayout {
+                            spacing: 6px;
+                            CustomButton {
+                                icon: "🗿";
+                                text: "Mesh -> GLB/OBJ";
+                                primary-color: #3e6a90;
+                                min-w: 145px;
+                                clicked => {
+                                    let src = root.browse_file();
+                                    if (src != "") { let dst = root.save_file(); if (dst != "") { root.direct_mesh_export(src, dst); } }
+                                }
+                            }
+
+                            CustomButton {
+                                icon: "📥";
+                                text: "Inject 3D into Mesh";
+                                primary-color: #23a55a;
+                                min-w: 155px;
+                                clicked => {
+                                    let target_chunk = root.browse_file();
+                                    if (target_chunk != "") {
+                                        let model = root.browse_file();
+                                        if (model != "") { root.direct_mesh_import(target_chunk, model); }
+                                    }
+                                }
+                            }
+
+                            CustomButton {
+                                icon: "🗺️";
+                                text: "Assemble Level (OMP -> GLB)";
+                                primary-color: #d28e1b;
+                                min-w: 200px;
+                                clicked => {
+                                    let omp = root.browse_file();
+                                    if (omp != "") {
+                                        let assets = root.browse_folder();
+                                        if (assets != "") { let out = root.save_file(); if (out != "") { root.direct_assemble_level(omp, assets, out); } }
+                                    }
+                                }
+                            }
+
+                            CustomButton {
+                                icon: "⛰️";
+                                text: "Terrain -> GLB";
+                                primary-color: #4e5058;
+                                min-w: 135px;
+                                clicked => {
+                                    let src = root.browse_file();
+                                    if (src != "") { let dst = root.save_file(); if (dst != "") { root.direct_terrain_export(src, dst); } }
                                 }
                             }
                         }
 
-                        CustomButton {
-                            icon: "📦";
-                            text: "XML -> 8LD (Batch)";
-                            primary-color: #1c8849;
-                            min-w: 160px;
-                            clicked => {
-                                let src = root.browse_folder();
-                                if (src != "") {
-                                    let dst = root.browse_folder();
-                                    if (dst != "") { root.compile_8ld_batch(src, dst); }
+                        // --- CATEGORY 3: COLLISIONS & FONTS ---
+                        if root.active_toolbox_tab == 3: HorizontalLayout {
+                            spacing: 6px;
+                            CustomButton {
+                                icon: "🧱";
+                                text: "Collision -> 3D GLB";
+                                primary-color: #3e6a90;
+                                min-w: 160px;
+                                clicked => {
+                                    let src = root.browse_file();
+                                    if (src != "") { let dst = root.save_file(); if (dst != "") { root.direct_collision_export(src, dst); } }
+                                }
+                            }
+
+                            CustomButton {
+                                icon: "📥";
+                                text: "Inject GLB into Collision";
+                                primary-color: #23a55a;
+                                min-w: 175px;
+                                clicked => {
+                                    let target_chunk = root.browse_file();
+                                    if (target_chunk != "") {
+                                        let glb = root.browse_file();
+                                        if (glb != "") { root.direct_collision_import(target_chunk, glb); }
+                                    }
+                                }
+                            }
+
+                            CustomButton {
+                                icon: "🔤";
+                                text: "Font CLB -> JSON";
+                                primary-color: #5865f2;
+                                min-w: 150px;
+                                clicked => {
+                                    let src = root.browse_file();
+                                    if (src != "") { let dst = root.save_file(); if (dst != "") { root.direct_font_to_json(src, dst); } }
+                                }
+                            }
+
+                            CustomButton {
+                                icon: "🔒";
+                                text: "JSON -> Font CLB";
+                                primary-color: #1c8849;
+                                min-w: 150px;
+                                clicked => {
+                                    let src = root.browse_file();
+                                    if (src != "") { let dst = root.save_file(); if (dst != "") { root.direct_json_to_font(src, dst); } }
+                                }
+                            }
+                        }
+
+                        // --- CATEGORY 4: TEXTURES & AUDIO ---
+                        if root.active_toolbox_tab == 4: HorizontalLayout {
+                            spacing: 6px;
+                            CustomButton {
+                                icon: "🎨";
+                                text: "Texture -> DDS/TGA";
+                                primary-color: #3e6a90;
+                                min-w: 160px;
+                                clicked => {
+                                    let src = root.browse_file();
+                                    if (src != "") { let dst = root.save_file(); if (dst != "") { root.direct_texture_export(src, dst); } }
+                                }
+                            }
+
+                            CustomButton {
+                                icon: "📥";
+                                text: "Inject DDS into Texture";
+                                primary-color: #23a55a;
+                                min-w: 175px;
+                                clicked => {
+                                    let target_chunk = root.browse_file();
+                                    if (target_chunk != "") {
+                                        let img = root.browse_file();
+                                        if (img != "") { root.direct_texture_import(target_chunk, img); }
+                                    }
+                                }
+                            }
+
+                            CustomButton {
+                                icon: "🎵";
+                                text: "Audio -> WAV";
+                                primary-color: #d28e1b;
+                                min-w: 135px;
+                                clicked => {
+                                    let src = root.browse_file();
+                                    if (src != "") { let dst = root.save_file(); if (dst != "") { root.direct_audio_export(src, dst); } }
+                                }
+                            }
+
+                            CustomButton {
+                                icon: "📥";
+                                text: "Inject WAV into Audio";
+                                primary-color: #1c8849;
+                                min-w: 165px;
+                                clicked => {
+                                    let target_chunk = root.browse_file();
+                                    if (target_chunk != "") {
+                                        let wav = root.browse_file();
+                                        if (wav != "") { root.direct_audio_import(target_chunk, wav); }
+                                    }
                                 }
                             }
                         }
@@ -459,7 +830,6 @@ export component AppWindow inherits Window {
                         padding: 14px;
                         spacing: 10px;
 
-                        // Header Information with Revert button
                         HorizontalLayout {
                             alignment: space-between;
                             VerticalLayout {
@@ -493,7 +863,7 @@ export component AppWindow inherits Window {
                             background: #353535;
                         }
 
-                        // CONTEXT 0: TEXTURES
+                        // Context 0: Textures
                         if root.active_kind_id == 0: VerticalLayout {
                             spacing: 10px;
                             vertical-stretch: 1;
@@ -505,10 +875,7 @@ export component AppWindow inherits Window {
                                     text: "Export to Image";
                                     primary-color: #3e6a90;
                                     min-w: 130px;
-                                    clicked => {
-                                        let out = root.save_file();
-                                        if (out != "") { root.export_dds(root.active_file_path, out); }
-                                    }
+                                    clicked => { let out = root.save_file(); if (out != "") { root.export_dds(root.active_file_path, out); } }
                                 }
 
                                 CustomButton {
@@ -516,10 +883,7 @@ export component AppWindow inherits Window {
                                     text: "Replace from Image";
                                     primary-color: #23a55a;
                                     min-w: 140px;
-                                    clicked => {
-                                        let inp = root.browse_file();
-                                        if (inp != "") { root.import_dds(root.active_file_path, inp); }
-                                    }
+                                    clicked => { let inp = root.browse_file(); if (inp != "") { root.import_dds(root.active_file_path, inp); } }
                                 }
 
                                 Rectangle {
@@ -542,7 +906,6 @@ export component AppWindow inherits Window {
                                 border-color: #353535;
                                 clip: true;
                                 vertical-stretch: 1;
-
                                 Image {
                                     source: root.tex_preview;
                                     width: 100%;
@@ -552,11 +915,10 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        // CONTEXT 1: AUDIO
+                        // Context 1: Audio
                         if root.active_kind_id == 1: VerticalLayout {
                             spacing: 12px;
                             alignment: start;
-
                             SectionTitle {
                                 text: "AUDIO EXTRACTION & REPLACEMENT";
                                 text-color: #3e6a90;
@@ -569,10 +931,7 @@ export component AppWindow inherits Window {
                                     text: "Export to .WAV";
                                     primary-color: #3e6a90;
                                     min-w: 125px;
-                                    clicked => {
-                                        let out = root.save_file();
-                                        if (out != "") { root.export_wav(root.active_file_path, out); }
-                                    }
+                                    clicked => { let out = root.save_file(); if (out != "") { root.export_wav(root.active_file_path, out); } }
                                 }
 
                                 CustomButton {
@@ -580,52 +939,27 @@ export component AppWindow inherits Window {
                                     text: "Replace from .WAV";
                                     primary-color: #23a55a;
                                     min-w: 135px;
-                                    clicked => {
-                                        let inp = root.browse_file();
-                                        if (inp != "") { root.import_wav(root.active_file_path, inp); }
-                                    }
+                                    clicked => { let inp = root.browse_file(); if (inp != "") { root.import_wav(root.active_file_path, inp); } }
                                 }
                             }
                         }
 
-                        // CONTEXT 2: MATERIALS
-                        if root.active_kind_id == 2: VerticalLayout {
-                            spacing: 8px;
-                            vertical-stretch: 1;
-
-                            HorizontalLayout {
-                                spacing: 8px;
-                                CustomButton {
-                                    icon: "💾";
-                                    text: "Save Changes to Material";
-                                    primary-color: #23a55a;
-                                    min-w: 175px;
-                                    clicked => { root.save_material(root.active_file_path, root.mat_json_text); }
-                                }
-                            }
-
-                            Rectangle {
-                                background: #111214;
-                                border-radius: 4px;
-                                border-width: 1px;
-                                border-color: #353535;
-                                vertical-stretch: 1;
-
-                                TextEdit {
-                                    text <=> root.mat_json_text;
-                                    font-family: "Consolas";
-                                    font-size: 11px;
-                                }
-                            }
+                        // Context 2: Materials
+                        if root.active_kind_id == 2: JsonEditorView {
+                            title_text: "MATERIAL PROPERTIES EDITOR (SHADERS & TEXTURES)";
+                            title_color: #f0b132;
+                            save_btn_text: "Save Changes to Material";
+                            content <=> root.mat_json_text;
+                            save_clicked => { root.save_material(root.active_file_path, root.mat_json_text); }
                         }
 
-                        // CONTEXT 3: 3D MESH & TERRAIN
+                        // Context 3: 3D Mesh (Perspective 3D Viewport with HUD stats in top-left)
                         if root.active_kind_id == 3: VerticalLayout {
                             spacing: 10px;
                             vertical-stretch: 1;
 
                             SectionTitle {
-                                text: "3D GEOMETRY, MIKKTSPACE TANGENTS & VIEWPORT";
+                                text: "3D GEOMETRY, PERSPECTIVE VIEWPORT & SHADING";
                                 text-color: #f0b132;
                             }
 
@@ -636,10 +970,7 @@ export component AppWindow inherits Window {
                                     text: "Export to .OBJ / .GLB";
                                     primary-color: #3e6a90;
                                     min-w: 145px;
-                                    clicked => {
-                                        let out = root.save_file();
-                                        if (out != "") { root.export_mesh_obj(root.active_file_path, out); }
-                                    }
+                                    clicked => { let out = root.save_file(); if (out != "") { root.export_mesh_obj(root.active_file_path, out); } }
                                 }
 
                                 CustomButton {
@@ -647,10 +978,7 @@ export component AppWindow inherits Window {
                                     text: "Replace from .OBJ / .GLB";
                                     primary-color: #23a55a;
                                     min-w: 155px;
-                                    clicked => {
-                                        let inp = root.browse_file();
-                                        if (inp != "") { root.import_mesh_obj(root.active_file_path, inp); }
-                                    }
+                                    clicked => { let inp = root.browse_file(); if (inp != "") { root.import_mesh_obj(root.active_file_path, inp); } }
                                 }
 
                                 CustomButton {
@@ -658,10 +986,7 @@ export component AppWindow inherits Window {
                                     text: "Export Terrain to 3D";
                                     primary-color: #4e5058;
                                     min-w: 145px;
-                                    clicked => {
-                                        let out = root.save_file();
-                                        if (out != "") { root.export_terrain_obj(root.active_file_path, out); }
-                                    }
+                                    clicked => { let out = root.save_file(); if (out != "") { root.export_terrain_obj(root.active_file_path, out); } }
                                 }
 
                                 Rectangle {
@@ -677,64 +1002,18 @@ export component AppWindow inherits Window {
                                 }
                             }
 
-                            // Interactive 3D Orbit Viewport
-                            Rectangle {
-                                background: #111214;
-                                border-radius: 4px;
-                                border-width: 1px;
-                                border-color: #353535;
-                                clip: true;
-                                vertical-stretch: 1;
-
-                                Image {
-                                    source: root.mesh_preview;
-                                    width: 100%;
-                                    height: 100%;
-                                    image-fit: contain;
-                                }
-
-                                if !root.has_mesh: Text {
-                                    text: "Select a 3D Mesh (.bin) to preview model in interactive 3D viewport";
-                                    color: #808080;
-                                    font-size: 12px;
-                                    vertical-alignment: center;
-                                    horizontal-alignment: center;
-                                }
-
-                                property <length> drag_last_x: 0px;
-                                property <length> drag_last_y: 0px;
-                                property <bool> is_dragging: false;
-
-                                TouchArea {
-                                    mouse-cursor: grab;
-                                    moved => {
-                                        if (self.pressed) {
-                                            if (!is_dragging) {
-                                                is_dragging = true;
-                                                drag_last_x = self.mouse-x;
-                                                drag_last_y = self.mouse-y;
-                                            } else {
-                                                let dx = (self.mouse-x - drag_last_x) / 1px;
-                                                let dy = (self.mouse-y - drag_last_y) / 1px;
-                                                drag_last_x = self.mouse-x;
-                                                drag_last_y = self.mouse-y;
-                                                if (dx != 0 || dy != 0) {
-                                                    root.rotate_mesh_viewport(dx / 80.0, dy / 80.0);
-                                                }
-                                            }
-                                        } else {
-                                            is_dragging = false;
-                                        }
-                                    }
-                                }
+                            Viewport3DView {
+                                preview_image: root.mesh_preview;
+                                has_mesh: root.has_mesh;
+                                stats_lines: root.mesh_stats_lines;
+                                rotate_viewport(dyaw, dpitch) => { root.rotate_mesh_viewport(dyaw, dpitch); }
                             }
                         }
 
-                        // CONTEXT 4: LUA SCRIPT
+                        // Context 4: Lua Script
                         if root.active_kind_id == 4: VerticalLayout {
                             spacing: 12px;
                             alignment: start;
-
                             SectionTitle {
                                 text: "COMPILED SCRIPT (LUA 5.0.2)";
                                 text-color: #f0b132;
@@ -747,10 +1026,7 @@ export component AppWindow inherits Window {
                                     text: "Export to .luac";
                                     primary-color: #3e6a90;
                                     min-w: 125px;
-                                    clicked => {
-                                        let out = root.save_file();
-                                        if (out != "") { root.export_lua(root.active_file_path, out); }
-                                    }
+                                    clicked => { let out = root.save_file(); if (out != "") { root.export_lua(root.active_file_path, out); } }
                                 }
 
                                 CustomButton {
@@ -758,15 +1034,12 @@ export component AppWindow inherits Window {
                                     text: "Replace from .luac";
                                     primary-color: #23a55a;
                                     min-w: 135px;
-                                    clicked => {
-                                        let inp = root.browse_file();
-                                        if (inp != "") { root.import_lua(root.active_file_path, inp); }
-                                    }
+                                    clicked => { let inp = root.browse_file(); if (inp != "") { root.import_lua(root.active_file_path, inp); } }
                                 }
                             }
                         }
 
-                        // CONTEXT 5: GENERIC / RAW
+                        // Context 5: Generic Raw
                         if root.active_kind_id == 5: VerticalLayout {
                             alignment: center;
                             Text {
@@ -777,83 +1050,28 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        // CONTEXT 6: UI LAYOUT EDITOR
-                        if root.active_kind_id == 6: VerticalLayout {
-                            spacing: 8px;
-                            vertical-stretch: 1;
-
-                            SectionTitle {
-                                text: "UI LAYOUT EDITOR (MENU & HUD)";
-                                text-color: #63d297;
-                            }
-
-                            HorizontalLayout {
-                                spacing: 10px;
-                                CustomButton {
-                                    icon: "💾";
-                                    text: "Save Changes to UI Layout";
-                                    primary-color: #23a55a;
-                                    min-w: 195px;
-                                    clicked => { root.save_ui(root.active_file_path, root.mat_json_text); }
-                                }
-                            }
-
-                            Rectangle {
-                                background: #111214;
-                                border-radius: 4px;
-                                border-width: 1px;
-                                border-color: #353535;
-                                vertical-stretch: 1;
-
-                                TextEdit {
-                                    text <=> root.mat_json_text;
-                                    font-family: "Consolas";
-                                    font-size: 11px;
-                                }
-                            }
+                        // Context 6: UI Layout
+                        if root.active_kind_id == 6: JsonEditorView {
+                            title_text: "UI LAYOUT EDITOR (MENU & HUD)";
+                            title_color: #63d297;
+                            save_btn_text: "Save Changes to UI Layout";
+                            content <=> root.mat_json_text;
+                            save_clicked => { root.save_ui(root.active_file_path, root.mat_json_text); }
                         }
 
-                        // CONTEXT 7: 3D OBJECT ENTITY EDITOR
-                        if root.active_kind_id == 7: VerticalLayout {
-                            spacing: 8px;
-                            vertical-stretch: 1;
-
-                            SectionTitle {
-                                text: "3D OBJECT ENTITY EDITOR (SCENE GRAPH)";
-                                text-color: #3e6a90;
-                            }
-
-                            HorizontalLayout {
-                                spacing: 10px;
-                                CustomButton {
-                                    icon: "💾";
-                                    text: "Save Changes to Object Entity";
-                                    primary-color: #23a55a;
-                                    min-w: 210px;
-                                    clicked => { root.save_object(root.active_file_path, root.mat_json_text); }
-                                }
-                            }
-
-                            Rectangle {
-                                background: #111214;
-                                border-radius: 4px;
-                                border-width: 1px;
-                                border-color: #353535;
-                                vertical-stretch: 1;
-
-                                TextEdit {
-                                    text <=> root.mat_json_text;
-                                    font-family: "Consolas";
-                                    font-size: 11px;
-                                }
-                            }
+                        // Context 7: 3D Object Entity
+                        if root.active_kind_id == 7: JsonEditorView {
+                            title_text: "3D OBJECT ENTITY EDITOR (SCENE GRAPH & PREFABS)";
+                            title_color: #3e6a90;
+                            save_btn_text: "Save Changes to Object Entity";
+                            content <=> root.mat_json_text;
+                            save_clicked => { root.save_object(root.active_file_path, root.mat_json_text); }
                         }
 
-                        // CONTEXT 8: SKELETAL ANIMATION CLIP
+                        // Context 8: Animation Clip
                         if root.active_kind_id == 8: VerticalLayout {
                             spacing: 8px;
                             vertical-stretch: 1;
-
                             SectionTitle {
                                 text: "SKELETAL ANIMATION CLIP (TIMELINE & CHANNELS)";
                                 text-color: #f0b132;
@@ -866,10 +1084,7 @@ export component AppWindow inherits Window {
                                     text: "Export to .GLB";
                                     primary-color: #3e6a90;
                                     min-w: 130px;
-                                    clicked => {
-                                        let out = root.save_file();
-                                        if (out != "") { root.export_anim_glb(root.active_file_path, out); }
-                                    }
+                                    clicked => { let out = root.save_file(); if (out != "") { root.export_anim_glb(root.active_file_path, out); } }
                                 }
 
                                 CustomButton {
@@ -877,10 +1092,7 @@ export component AppWindow inherits Window {
                                     text: "Export to .JSON";
                                     primary-color: #4e5058;
                                     min-w: 130px;
-                                    clicked => {
-                                        let out = root.save_file();
-                                        if (out != "") { root.export_anim_json(root.active_file_path, out); }
-                                    }
+                                    clicked => { let out = root.save_file(); if (out != "") { root.export_anim_json(root.active_file_path, out); } }
                                 }
 
                                 Rectangle {
@@ -902,7 +1114,6 @@ export component AppWindow inherits Window {
                                 border-width: 1px;
                                 border-color: #353535;
                                 vertical-stretch: 1;
-
                                 TextEdit {
                                     text <=> root.mat_json_text;
                                     read-only: true;
@@ -912,47 +1123,19 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        // CONTEXT 9: TERRAIN TEXTURE PALETTE & BIOME
-                        if root.active_kind_id == 9: VerticalLayout {
-                            spacing: 8px;
-                            vertical-stretch: 1;
-
-                            SectionTitle {
-                                text: "TERRAIN TEXTURE PALETTE & BIOME EDITOR";
-                                text-color: #f0b132;
-                            }
-
-                            HorizontalLayout {
-                                spacing: 10px;
-                                CustomButton {
-                                    icon: "💾";
-                                    text: "Save Changes to Terrain Palette";
-                                    primary-color: #23a55a;
-                                    min-w: 220px;
-                                    clicked => { root.save_terrain_palette(root.active_file_path, root.mat_json_text); }
-                                }
-                            }
-
-                            Rectangle {
-                                background: #111214;
-                                border-radius: 4px;
-                                border-width: 1px;
-                                border-color: #353535;
-                                vertical-stretch: 1;
-
-                                TextEdit {
-                                    text <=> root.mat_json_text;
-                                    font-family: "Consolas";
-                                    font-size: 11px;
-                                }
-                            }
+                        // Context 9: Terrain Palette
+                        if root.active_kind_id == 9: JsonEditorView {
+                            title_text: "TERRAIN TEXTURE PALETTE & BIOME EDITOR";
+                            title_color: #f0b132;
+                            save_btn_text: "Save Changes to Terrain Palette";
+                            content <=> root.mat_json_text;
+                            save_clicked => { root.save_terrain_palette(root.active_file_path, root.mat_json_text); }
                         }
 
-                        // CONTEXT 10: 3D COLLISION BOUNDARY EDITOR (.CLB)
+                        // Context 10: 3D Collision (.clb)
                         if root.active_kind_id == 10: VerticalLayout {
                             spacing: 10px;
                             vertical-stretch: 1;
-
                             SectionTitle {
                                 text: "3D COLLISION BOUNDARY EDITOR (.CLB / OBB)";
                                 text-color: #4CAF50;
@@ -965,10 +1148,7 @@ export component AppWindow inherits Window {
                                     text: "Export to 3D .GLB";
                                     primary-color: #3e6a90;
                                     min-w: 145px;
-                                    clicked => {
-                                        let out = root.save_file();
-                                        if (out != "") { root.export_collision_glb(root.active_file_path, out); }
-                                    }
+                                    clicked => { let out = root.save_file(); if (out != "") { root.export_collision_glb(root.active_file_path, out); } }
                                 }
 
                                 CustomButton {
@@ -976,10 +1156,7 @@ export component AppWindow inherits Window {
                                     text: "Replace from 3D .GLB";
                                     primary-color: #23a55a;
                                     min-w: 155px;
-                                    clicked => {
-                                        let inp = root.browse_file();
-                                        if (inp != "") { root.import_collision_glb(root.active_file_path, inp); }
-                                    }
+                                    clicked => { let inp = root.browse_file(); if (inp != "") { root.import_collision_glb(root.active_file_path, inp); } }
                                 }
                             }
 
@@ -989,7 +1166,6 @@ export component AppWindow inherits Window {
                                 border-width: 1px;
                                 border-color: #353535;
                                 vertical-stretch: 1;
-
                                 TextEdit {
                                     text <=> root.mat_json_text;
                                     font-family: "Consolas";
@@ -998,112 +1174,49 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        // CONTEXT 11: ENVIRONMENT (.ENV) PROFILE
-                        if root.active_kind_id == 11: VerticalLayout {
-                            spacing: 8px;
-                            vertical-stretch: 1;
-
-                            SectionTitle {
-                                text: "ENVIRONMENT, SKY & POST-PROCESSING PROFILE (.ENV)";
-                                text-color: #63d297;
-                            }
-
-                            HorizontalLayout {
-                                spacing: 10px;
-                                CustomButton {
-                                    icon: "💾";
-                                    text: "Save Changes to Environment Profile";
-                                    primary-color: #23a55a;
-                                    min-w: 240px;
-                                    clicked => { root.save_environment(root.active_file_path, root.mat_json_text); }
-                                }
-                            }
-
-                            Rectangle {
-                                background: #111214;
-                                border-radius: 4px;
-                                border-width: 1px;
-                                border-color: #353535;
-                                vertical-stretch: 1;
-
-                                TextEdit {
-                                    text <=> root.mat_json_text;
-                                    font-family: "Consolas";
-                                    font-size: 11px;
-                                }
-                            }
+                        // Context 11: Environment (.env)
+                        if root.active_kind_id == 11: JsonEditorView {
+                            title_text: "ENVIRONMENT, SKY & POST-PROCESSING PROFILE (.ENV)";
+                            title_color: #63d297;
+                            save_btn_text: "Save Changes to Environment Profile";
+                            content <=> root.mat_json_text;
+                            save_clicked => { root.save_environment(root.active_file_path, root.mat_json_text); }
                         }
 
-                        // CONTEXT 12: M8LD / LANGUAGE STRINGS XML EDITOR
-                        if root.active_kind_id == 12: VerticalLayout {
-                            spacing: 8px;
-                            vertical-stretch: 1;
-
-                            SectionTitle {
-                                text: "LEVEL LOGIC, DIALOGUES & STRINGS LAYER (.XML / .8LD)";
-                                text-color: #d28e1b;
-                            }
-
-                            HorizontalLayout {
-                                spacing: 10px;
-                                CustomButton {
-                                    icon: "💾";
-                                    text: "Save Changes to Map Strings (.8LD)";
-                                    primary-color: #23a55a;
-                                    min-w: 230px;
-                                    clicked => { root.save_m8ld(root.active_file_path, root.mat_json_text); }
-                                }
-                            }
-
-                            Rectangle {
-                                background: #111214;
-                                border-radius: 4px;
-                                border-width: 1px;
-                                border-color: #353535;
-                                vertical-stretch: 1;
-
-                                TextEdit {
-                                    text <=> root.mat_json_text;
-                                    font-family: "Consolas";
-                                    font-size: 11px;
-                                }
-                            }
+                        // Context 12: M8LD Map XML
+                        if root.active_kind_id == 12: JsonEditorView {
+                            title_text: "LEVEL LOGIC, DIALOGUES & STRINGS LAYER (.XML / .8LD)";
+                            title_color: #d28e1b;
+                            save_btn_text: "Save Changes to Map Strings (.8LD)";
+                            content <=> root.mat_json_text;
+                            save_clicked => { root.save_m8ld(root.active_file_path, root.mat_json_text); }
                         }
 
-                        // CONTEXT 13: UI SPRITE COLLECTION EDITOR
-                        if root.active_kind_id == 13: VerticalLayout {
-                            spacing: 10px;
-                            vertical-stretch: 1;
+                        // Context 13: UI Sprite Collection
+                        if root.active_kind_id == 13: JsonEditorView {
+                            title_text: "UI SPRITE COLLECTION EDITOR (ATLAS MAP)";
+                            title_color: #63d297;
+                            save_btn_text: "Save Changes to Sprite Collection";
+                            content <=> root.mat_json_text;
+                            save_clicked => { root.save_ui_sprite(root.active_file_path, root.mat_json_text); }
+                        }
 
-                            SectionTitle {
-                                text: "UI SPRITE COLLECTION EDITOR (ATLAS MAP)";
-                                text-color: #63d297;
-                            }
+                        // Context 14: Lighting Set (.dta)
+                        if root.active_kind_id == 14: JsonEditorView {
+                            title_text: "LIGHTING SET & BINARY DATA (.DTA)";
+                            title_color: #f0b132;
+                            save_btn_text: "Save Changes to Lighting Set";
+                            content <=> root.mat_json_text;
+                            save_clicked => { root.save_dta(root.active_file_path, root.mat_json_text); }
+                        }
 
-                            HorizontalLayout {
-                                spacing: 8px;
-                                CustomButton {
-                                    icon: "💾";
-                                    text: "Save Changes to Sprite Collection";
-                                    primary-color: #23a55a;
-                                    min-w: 260px;
-                                    clicked => { root.save_ui_sprite(root.active_file_path, root.mat_json_text); }
-                                }
-                            }
-
-                            Rectangle {
-                                background: #111214;
-                                border-radius: 4px;
-                                border-width: 1px;
-                                border-color: #353535;
-                                vertical-stretch: 1;
-
-                                TextEdit {
-                                    text <=> root.mat_json_text;
-                                    font-family: "Consolas";
-                                    font-size: 11px;
-                                }
-                            }
+                        // Context 15: Voice Package (.debug-vpk)
+                        if root.active_kind_id == 15: JsonEditorView {
+                            title_text: "VOICE PACKAGE DESCRIPTOR (.DEBUG-VPK / SPEECH MAPPING)";
+                            title_color: #58a6ff;
+                            save_btn_text: "Save Changes to Voice Package";
+                            content <=> root.mat_json_text;
+                            save_clicked => { root.save_vpk(root.active_file_path, root.mat_json_text); }
                         }
                     }
                 }

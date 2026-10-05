@@ -35,6 +35,14 @@ pub struct ObjectEntityJson {
     pub ragdoll_bone_groups: Vec<BoneGroupJson>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub mesh_bindings: Vec<MeshMaterialBindingJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stand_model: Option<ObjectModelBindingJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placed_object: Option<ObjectModelBindingJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placement_offset: Option<[f32; 3]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placement_config: Option<PlacementConfigJson>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub bones: Vec<FullObjectBoneJson>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -54,6 +62,22 @@ pub struct ObjectEngineMetadataJson {
 
 fn default_true() -> bool {
     true
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ObjectModelBindingJson {
+    pub object_path: String,
+    pub model_name: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PlacementConfigJson {
+    pub physics_material_id: u32,
+    pub is_enabled: bool,
+    pub casts_shadows: bool,
+    pub can_be_carried: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_flags_hex: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -197,8 +221,11 @@ pub fn export_object_to_json(data: &[u8], output_dir: Option<&Path>) -> Result<S
     let (type_id, elements) = parse_typed_container(data)
         .context("Failed to parse Object Entity root typed container")?;
 
+    let is_placement_object = type_id == 0x00464621;
+
     let class_name = match type_id {
         0x0041004B => Some("TREModelResource".to_string()),
+        0x00464621 => Some("TREPlacementObject".to_string()),
         _ => None,
     };
 
@@ -214,6 +241,16 @@ pub fn export_object_to_json(data: &[u8], output_dir: Option<&Path>) -> Result<S
     let mut attachments = Vec::new();
     let mut has_sentinel_terminator = false;
     let mut raw_fallbacks = Vec::new();
+
+    // Placement object (0x00464621) specific properties
+    let mut stand_model = None;
+    let mut placed_object = None;
+    let mut placement_offset = None;
+    let mut pl_material_id = 2u32;
+    let mut pl_is_enabled = true;
+    let mut pl_casts_shadows = true;
+    let mut pl_can_be_carried = true;
+    let mut pl_flags_hex = None;
 
     for (id, chunk) in &elements {
         match *id {
@@ -239,6 +276,20 @@ pub fn export_object_to_json(data: &[u8], output_dir: Option<&Path>) -> Result<S
                     });
                 }
             }
+            22 if is_placement_object && chunk.len() >= 4 => {
+                let mask = u32::from_le_bytes(chunk[0..4].try_into().unwrap_or_default());
+                pl_casts_shadows = (mask & 0x2000_0000) != 0;
+                pl_flags_hex = Some(format!("0x{:08X}", mask));
+            }
+            23 if is_placement_object && !chunk.is_empty() => {
+                pl_is_enabled = chunk[0] != 0;
+            }
+            29 if is_placement_object => {
+                pl_can_be_carried = chunk.len() >= 4 && chunk[0] != 0;
+            }
+            31 if is_placement_object => {
+                stand_model = parse_simple_model_binding(chunk);
+            }
             32 => {
                 if let Some(s) = read_scale_vector(chunk) {
                     scale = Some(s);
@@ -263,6 +314,15 @@ pub fn export_object_to_json(data: &[u8], output_dir: Option<&Path>) -> Result<S
                         });
                     }
                 }
+            }
+            42 if is_placement_object => {
+                placed_object = parse_placed_object(chunk);
+            }
+            46 if is_placement_object && chunk.len() >= 4 => {
+                pl_material_id = u32::from_le_bytes(chunk[0..4].try_into().unwrap_or_default());
+            }
+            300 if is_placement_object && chunk.len() >= 15 => {
+                placement_offset = parse_placement_offset(chunk);
             }
             19 => {
                 has_sentinel_terminator = true;
@@ -340,6 +400,9 @@ pub fn export_object_to_json(data: &[u8], output_dir: Option<&Path>) -> Result<S
                 attachments = parse_attachment_slots(chunk);
             }
             20 | 21 | 32 | 33 | 19 => {}
+            // Handled placement object constants
+            22 | 23 | 28 | 29 | 31 | 38 | 41 | 42 | 44 | 45 | 46 | 300 | 301
+                if is_placement_object => {}
             _ => {
                 raw_fallbacks.push(RawFallbackComponentJson {
                     id: *id,
@@ -356,6 +419,18 @@ pub fn export_object_to_json(data: &[u8], output_dir: Option<&Path>) -> Result<S
         raw_fallbacks,
     };
 
+    let placement_config = if is_placement_object {
+        Some(PlacementConfigJson {
+            physics_material_id: pl_material_id,
+            is_enabled: pl_is_enabled,
+            casts_shadows: pl_casts_shadows,
+            can_be_carried: pl_can_be_carried,
+            raw_flags_hex: pl_flags_hex,
+        })
+    } else {
+        None
+    };
+
     let entity_json = ObjectEntityJson {
         _engine_metadata: metadata,
         group_tag,
@@ -366,6 +441,10 @@ pub fn export_object_to_json(data: &[u8], output_dir: Option<&Path>) -> Result<S
         physics_state,
         ragdoll_bone_groups,
         mesh_bindings,
+        stand_model,
+        placed_object,
+        placement_offset,
+        placement_config,
         bones: bones.clone(),
         attachments,
         has_sentinel_terminator,
@@ -389,6 +468,7 @@ pub fn import_object_from_json(json_str: &str) -> Result<Vec<u8>> {
     let type_id = u32::from_str_radix(&parsed._engine_metadata.type_id_hex, 16)
         .context("Invalid TypeID hex in Object JSON metadata")?;
 
+    let is_placement_object = type_id == 0x00464621;
     let mut elements = Vec::new();
 
     let get_fallback = |id: u32| -> Option<Vec<u8>> {
@@ -412,53 +492,117 @@ pub fn import_object_from_json(json_str: &str) -> Result<Vec<u8>> {
         elements.push((21, raw));
     }
 
-    if !parsed.mesh_bindings.is_empty() {
-        let chunk_30 = rebuild_mesh_material_bindings(&parsed.mesh_bindings)?;
-        elements.push((30, chunk_30));
-    } else if let Some(raw) = get_fallback(30) {
-        elements.push((30, raw));
-    }
+    if is_placement_object {
+        let pl = parsed.placement_config.as_ref();
+        let mat_id = pl.map(|p| p.physics_material_id).unwrap_or(2);
+        let enabled = pl.is_none_or(|p| p.is_enabled);
+        let carry = pl.is_none_or(|p| p.can_be_carried);
+        let shadows = pl.is_none_or(|p| p.casts_shadows);
 
-    if let Some(s) = parsed.scale {
-        elements.push((32, write_scale_vector(s)));
-    } else if let Some(raw) = get_fallback(32) {
-        elements.push((32, raw));
-    }
+        let mut mask = if let Some(raw_h) = pl.and_then(|p| p.raw_flags_hex.as_ref()) {
+            let clean = raw_h
+                .trim()
+                .trim_start_matches("0x")
+                .trim_start_matches("0X");
+            u32::from_str_radix(clean, 16).unwrap_or(0x2440_000C)
+        } else {
+            0x2440_000C
+        };
+        if shadows {
+            mask |= 0x2000_0000;
+        } else {
+            mask &= !0x2000_0000;
+        }
+        elements.push((22, mask.to_le_bytes().to_vec()));
 
-    if !parsed.bones.is_empty() {
-        let chunk_33 = rebuild_full_bones_container(&parsed.bones)?;
-        elements.push((33, chunk_33));
-    } else if let Some(raw) = get_fallback(33) {
-        elements.push((33, raw));
+        elements.push((23, vec![if enabled { 1 } else { 0 }]));
+        elements.push((28, vec![0u8]));
+
+        if carry {
+            elements.push((29, vec![1, 40, 0, 3, 40, 0, 43, 4, 44, 5, 1, 1, 0, 0, 0, 1]));
+        } else {
+            elements.push((29, vec![0u8]));
+        }
+
+        if let Some(ref stand) = parsed.stand_model {
+            elements.push((
+                31,
+                build_simple_model_binding(&stand.object_path, &stand.model_name),
+            ));
+        } else if let Some(raw) = get_fallback(31) {
+            elements.push((31, raw));
+        }
+
+        elements.push((38, vec![1u8]));
+        elements.push((41, vec![1, 1, 0, 0]));
+
+        if let Some(ref placed) = parsed.placed_object {
+            elements.push((42, build_placed_object(placed)));
+        } else if let Some(raw) = get_fallback(42) {
+            elements.push((42, raw));
+        }
+
+        elements.push((44, vec![0u8]));
+        elements.push((45, vec![1, 1, 0, 0]));
+        elements.push((46, mat_id.to_le_bytes().to_vec()));
+
+        if let Some(offset) = parsed.placement_offset {
+            elements.push((300, build_placement_offset(offset)));
+        } else if let Some(raw) = get_fallback(300) {
+            elements.push((300, raw));
+        } else {
+            elements.push((300, build_placement_offset([0.0, 0.5, 0.0])));
+        }
+        elements.push((301, vec![0u8]));
     } else {
-        elements.push((33, vec![0u8]));
-    }
+        if !parsed.mesh_bindings.is_empty() {
+            let chunk_30 = rebuild_mesh_material_bindings(&parsed.mesh_bindings)?;
+            elements.push((30, chunk_30));
+        } else if let Some(raw) = get_fallback(30) {
+            elements.push((30, raw));
+        }
 
-    if let Some(ref bbox) = parsed.bounding_box {
-        elements.push((34, rebuild_bounding_box(bbox)));
-    } else if let Some(raw) = get_fallback(34) {
-        elements.push((34, raw));
-    }
+        if let Some(s) = parsed.scale {
+            elements.push((32, write_scale_vector(s)));
+        } else if let Some(raw) = get_fallback(32) {
+            elements.push((32, raw));
+        }
 
-    if !parsed.ragdoll_bone_groups.is_empty() {
-        let chunk_35 = rebuild_ragdoll_bone_groups(&parsed.ragdoll_bone_groups)?;
-        elements.push((35, chunk_35));
-    } else if let Some(raw) = get_fallback(35) {
-        elements.push((35, raw));
-    }
+        if !parsed.bones.is_empty() {
+            let chunk_33 = rebuild_full_bones_container(&parsed.bones)?;
+            elements.push((33, chunk_33));
+        } else if let Some(raw) = get_fallback(33) {
+            elements.push((33, raw));
+        } else {
+            elements.push((33, vec![0u8]));
+        }
 
-    if let Some(ref anim) = parsed.default_animation {
-        elements.push((36, rebuild_animation_linkage(anim)));
-    } else if let Some(raw) = get_fallback(36) {
-        elements.push((36, raw));
-    } else {
-        elements.push((36, vec![0u8]));
-    }
+        if let Some(ref bbox) = parsed.bounding_box {
+            elements.push((34, rebuild_bounding_box(bbox)));
+        } else if let Some(raw) = get_fallback(34) {
+            elements.push((34, raw));
+        }
 
-    if let Some(ref phys) = parsed.physics_state {
-        elements.push((37, rebuild_physics_state(phys)));
-    } else if let Some(raw) = get_fallback(37) {
-        elements.push((37, raw));
+        if !parsed.ragdoll_bone_groups.is_empty() {
+            let chunk_35 = rebuild_ragdoll_bone_groups(&parsed.ragdoll_bone_groups)?;
+            elements.push((35, chunk_35));
+        } else if let Some(raw) = get_fallback(35) {
+            elements.push((35, raw));
+        }
+
+        if let Some(ref anim) = parsed.default_animation {
+            elements.push((36, rebuild_animation_linkage(anim)));
+        } else if let Some(raw) = get_fallback(36) {
+            elements.push((36, raw));
+        } else {
+            elements.push((36, vec![0u8]));
+        }
+
+        if let Some(ref phys) = parsed.physics_state {
+            elements.push((37, rebuild_physics_state(phys)));
+        } else if let Some(raw) = get_fallback(37) {
+            elements.push((37, raw));
+        }
     }
 
     if parsed.has_sentinel_terminator {
@@ -474,7 +618,11 @@ pub fn import_object_from_json(json_str: &str) -> Result<Vec<u8>> {
     }
 
     for fb in &parsed._engine_metadata.raw_fallbacks {
-        if ![20, 21, 30, 32, 33, 34, 35, 36, 37, 19, 1].contains(&fb.id)
+        if ![
+            20, 21, 30, 32, 33, 34, 35, 36, 37, 19, 1, 22, 23, 28, 29, 31, 38, 41, 42, 44, 45, 46,
+            300, 301,
+        ]
+        .contains(&fb.id)
             && let Ok(raw) = hex::decode(&fb.hex)
         {
             elements.push((fb.id, raw));
@@ -482,8 +630,80 @@ pub fn import_object_from_json(json_str: &str) -> Result<Vec<u8>> {
     }
 
     elements.sort_by_key(|&(id, _)| id);
-
     Ok(build_typed_container(type_id, &elements))
+}
+
+fn parse_simple_model_binding(data: &[u8]) -> Option<ObjectModelBindingJson> {
+    if let Ok((_, elements)) = parse_chunk_elements(data) {
+        let mut obj_path = String::new();
+        let mut model_name = String::new();
+
+        for (id, chunk) in elements {
+            if id == 20
+                && let Some(s) = read_length_prefixed_string(&chunk)
+            {
+                obj_path = s;
+            } else if id == 21
+                && let Some(s) = read_length_prefixed_string(&chunk)
+            {
+                model_name = s;
+            }
+        }
+
+        if !obj_path.is_empty() {
+            return Some(ObjectModelBindingJson {
+                object_path: obj_path,
+                model_name,
+            });
+        }
+    }
+    None
+}
+
+fn build_simple_model_binding(obj_path: &str, model_name: &str) -> Vec<u8> {
+    let elements = vec![
+        (20, write_length_prefixed_string(obj_path)),
+        (21, write_length_prefixed_string(model_name)),
+    ];
+    build_chunk_from_elements(false, &elements)
+}
+
+fn parse_placed_object(chunk: &[u8]) -> Option<ObjectModelBindingJson> {
+    if let Ok((_, elements)) = parse_chunk_elements(chunk) {
+        for (id, data) in elements {
+            if id == 30 {
+                return parse_simple_model_binding(&data);
+            }
+        }
+    }
+    parse_simple_model_binding(chunk)
+}
+
+fn build_placed_object(binding: &ObjectModelBindingJson) -> Vec<u8> {
+    let model_bytes = build_simple_model_binding(&binding.object_path, &binding.model_name);
+    let sub_elements = vec![(30, model_bytes), (35, vec![0u8, 0, 0, 0])];
+    build_chunk_from_elements(false, &sub_elements)
+}
+
+fn parse_placement_offset(chunk: &[u8]) -> Option<[f32; 3]> {
+    if chunk.len() >= 15 && chunk[0] == 1 && chunk[1] == 20 {
+        let mut cur = Cursor::new(&chunk[3..15]);
+        let x = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+        let y = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+        let z = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+        if x.is_finite() && y.is_finite() && z.is_finite() {
+            return Some([x, y, z]);
+        }
+    }
+    None
+}
+
+fn build_placement_offset(offset: [f32; 3]) -> Vec<u8> {
+    let mut out = vec![1u8, 20, 0];
+    let _ = out.write_f32::<LittleEndian>(offset[0]);
+    let _ = out.write_f32::<LittleEndian>(offset[1]);
+    let _ = out.write_f32::<LittleEndian>(offset[2]);
+    out
 }
 
 fn parse_full_bones_container(chunk: &[u8]) -> Vec<FullObjectBoneJson> {

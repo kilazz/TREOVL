@@ -1,4 +1,4 @@
-use super::parse_chunk_elements;
+use super::{parse_chunk_elements, parse_typed_container};
 use crate::engine::common::{magic, read_length_prefixed_string};
 use crate::engine::math::{BoneRotation, Vector3, Vector4};
 use crate::utils::gltf_builder::GltfBuilder;
@@ -72,96 +72,121 @@ impl ObjectBone {
     }
 }
 
-pub fn parse_object_bone_container(data: &[u8]) -> Result<Vec<ObjectBone>> {
-    let mut candidate_offsets = Vec::new();
+fn try_parse_bones(slice: &[u8], min_count: usize) -> Option<Vec<ObjectBone>> {
+    if slice.len() < 144 || !slice.len().is_multiple_of(144) {
+        return None;
+    }
 
-    for (idx, window) in data.windows(5).enumerate() {
-        if window == b"Root\0" || window == b"Root " || window == b"Bip01" {
-            candidate_offsets.push(idx);
+    let count = slice.len() / 144;
+    if count < min_count {
+        return None;
+    }
+
+    let mut bones = Vec::with_capacity(count);
+
+    for chunk in slice.as_chunks::<144>().0 {
+        let raw: RawObjectBone = bytemuck::pod_read_unaligned(chunk);
+
+        let clean_name = String::from_utf8_lossy(&raw.name)
+            .chars()
+            .filter(|c| c.is_ascii_graphic() || *c == ' ' || *c == '_')
+            .collect::<String>();
+
+        let is_valid_name = !clean_name.is_empty()
+            && clean_name.len() >= 2
+            && !clean_name.starts_with('[')
+            && clean_name.is_ascii();
+
+        let is_valid_transform = raw.translation[0].is_finite()
+            && raw.translation[1].is_finite()
+            && raw.translation[2].is_finite()
+            && raw.translation[0].abs() < 50_000.0
+            && raw.rotation[3].is_finite()
+            && raw.rotation[3].abs() <= 2.0;
+
+        let is_valid_hierarchy = raw.parent_index >= -1 && raw.parent_index < count as i32;
+
+        if is_valid_name && is_valid_transform && is_valid_hierarchy {
+            bones.push(ObjectBone {
+                name: clean_name,
+                matrix: raw.matrix,
+                rotation: Vector4 {
+                    x: raw.rotation[0],
+                    y: raw.rotation[1],
+                    z: raw.rotation[2],
+                    w: raw.rotation[3],
+                },
+                translation: Vector3 {
+                    x: raw.translation[0],
+                    y: raw.translation[1],
+                    z: raw.translation[2],
+                },
+                bone_id: raw.bone_id,
+                parent_index: raw.parent_index,
+                first_child_index: raw.first_child_index,
+                next_sibling_index: raw.next_sibling_index,
+                aux_id: raw.aux_id,
+            });
+        } else {
+            return None;
         }
     }
 
-    if let Ok((_, typed_elements)) = super::parse_typed_container(data) {
-        for (id, chunk) in typed_elements {
-            if id == 1
-                && let Ok((_, sub_elems)) = parse_chunk_elements(&chunk)
-            {
-                for (sid, schunk) in sub_elems {
-                    if sid == 13 || sid == 33 || sid == 22 {
-                        for (idx, w) in schunk.windows(5).enumerate() {
-                            if (w == b"Root\0" || w == b"Root " || w == b"Bip01")
-                                && let Some(pos) =
-                                    data.windows(schunk.len()).position(|p| p == schunk)
+    if bones.len() >= min_count {
+        Some(bones)
+    } else {
+        None
+    }
+}
+
+pub fn parse_object_bone_container(data: &[u8]) -> Result<Vec<ObjectBone>> {
+    // 1. Structural inspection via typed container hierarchy (TypeID 0x0041004B, etc.)
+    if let Ok((_type_id, elements)) = parse_typed_container(data) {
+        for (id, chunk) in &elements {
+            if *id == 33 {
+                // Chunk ID 33: OBJECT_BONES container
+                if let Ok((_, sub_elems)) = parse_chunk_elements(chunk)
+                    && let Some((_, blob)) = sub_elems.iter().find(|(sid, _)| *sid == 22)
+                    && let Some(bones) = try_parse_bones(blob, 1)
+                {
+                    return Ok(bones);
+                }
+                if let Some(bones) = try_parse_bones(chunk, 1) {
+                    return Ok(bones);
+                }
+            } else if *id == 1 {
+                // Nested container inspection
+                if let Ok((_, sub_elems)) = parse_chunk_elements(chunk) {
+                    for (sid, schunk) in &sub_elems {
+                        if (*sid == 13 || *sid == 33) && schunk.len() >= 144 {
+                            if let Ok((_, inner_elems)) = parse_chunk_elements(schunk)
+                                && let Some((_, blob)) =
+                                    inner_elems.iter().find(|(isid, _)| *isid == 22)
+                                && let Some(bones) = try_parse_bones(blob, 1)
                             {
-                                candidate_offsets.push(pos + idx);
+                                return Ok(bones);
+                            }
+                            if let Some(bones) = try_parse_bones(schunk, 1) {
+                                return Ok(bones);
                             }
                         }
                     }
                 }
             }
         }
-    }
-
-    candidate_offsets.sort_unstable();
-    candidate_offsets.dedup();
-
-    for start_off in candidate_offsets {
-        let slice = &data[start_off..];
-        let mut bones = Vec::new();
-        let count = slice.len() / 144;
-
-        for i in 0..count {
-            let chunk = &slice[i * 144..(i + 1) * 144];
-            let raw: RawObjectBone = bytemuck::pod_read_unaligned(chunk);
-
-            let clean_name = String::from_utf8_lossy(&raw.name)
-                .chars()
-                .filter(|c| c.is_ascii_graphic() || *c == ' ' || *c == '_')
-                .collect::<String>();
-
-            let is_valid_name = !clean_name.is_empty()
-                && clean_name.len() >= 2
-                && !clean_name.starts_with('[')
-                && clean_name.is_ascii();
-
-            let is_valid_transform = raw.translation[0].is_finite()
-                && raw.translation[1].is_finite()
-                && raw.translation[2].is_finite()
-                && raw.translation[0].abs() < 50_000.0
-                && raw.rotation[3].is_finite()
-                && raw.rotation[3].abs() <= 2.0;
-
-            let is_valid_hierarchy = raw.parent_index >= -1 && raw.parent_index < 512;
-
-            if is_valid_name && is_valid_transform && is_valid_hierarchy {
-                bones.push(ObjectBone {
-                    name: clean_name,
-                    matrix: raw.matrix,
-                    rotation: Vector4 {
-                        x: raw.rotation[0],
-                        y: raw.rotation[1],
-                        z: raw.rotation[2],
-                        w: raw.rotation[3],
-                    },
-                    translation: Vector3 {
-                        x: raw.translation[0],
-                        y: raw.translation[1],
-                        z: raw.translation[2],
-                    },
-                    bone_id: raw.bone_id,
-                    parent_index: raw.parent_index,
-                    first_child_index: raw.first_child_index,
-                    next_sibling_index: raw.next_sibling_index,
-                    aux_id: raw.aux_id,
-                });
-            } else {
-                break;
+    } else if let Ok((_, elements)) = parse_chunk_elements(data) {
+        for (id, chunk) in &elements {
+            if *id == 22
+                && let Some(bones) = try_parse_bones(chunk, 1)
+            {
+                return Ok(bones);
             }
         }
+    }
 
-        if bones.len() >= 2 {
-            return Ok(bones);
-        }
+    // Direct raw slice inspection if data represents a bone block directly
+    if let Some(bones) = try_parse_bones(data, 2) {
+        return Ok(bones);
     }
 
     Ok(Vec::new())
@@ -207,7 +232,7 @@ pub fn export_skeleton_to_glb(bones: &[ObjectBone], rig_name: &str) -> Result<Ve
         let mut rz = sanitize_f32(bone.rotation.z, 0.0);
         let mut rw = sanitize_f32(bone.rotation.w, 1.0);
 
-        // Mathematically correct quaternion normalization without destroying w = 0.0
+        // Quaternion normalization
         let len_sq = rx * rx + ry * ry + rz * rz + rw * rw;
         if len_sq > 1e-4 {
             let inv_len = 1.0 / len_sq.sqrt();
@@ -377,7 +402,6 @@ fn parse_single_bone_track(data: &[u8], total_duration: f32) -> Result<BoneTrack
                 }
             }
             22 | 24 => {
-                // Translation container / stream
                 if let Ok((_, trans_sub)) = parse_chunk_elements(&chunk) {
                     for (tid, tchunk) in trans_sub {
                         if tid == 22 || tid == 21 || tid == 0 {
@@ -389,7 +413,6 @@ fn parse_single_bone_track(data: &[u8], total_duration: f32) -> Result<BoneTrack
                 }
             }
             23 | 25 => {
-                // Rotation stream parsing with Triumph ID 21/23 hierarchy support
                 parse_rotation_container(&chunk, total_duration, &mut rotations);
             }
             _ => {}
@@ -411,7 +434,6 @@ fn parse_rotation_container(
     if let Ok((_, rot_sub)) = parse_chunk_elements(chunk) {
         for (rid, rchunk) in rot_sub {
             match rid {
-                // Nested container with (ID 22: count, ID 23: data stream, ID 24: curves)
                 21 => {
                     if let Ok((_, sub_parts)) = parse_chunk_elements(&rchunk) {
                         let count = sub_parts

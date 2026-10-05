@@ -61,6 +61,165 @@ pub fn register(
         }
     });
 
+    // --- STANDALONE TOOLBOX ACTIONS ---
+    let tx_vpk_dir_exp = tx.clone();
+    ui.on_direct_vpk_to_json(move |src, dst| {
+        let _ = tx_vpk_dir_exp.send(WorkerCommand::DirectVpkToJson {
+            src: PathBuf::from(src.as_str()),
+            dst: PathBuf::from(dst.as_str()),
+        });
+    });
+
+    let tx_vpk_dir_imp = tx.clone();
+    ui.on_direct_json_to_vpk(move |json, base, dst| {
+        let _ = tx_vpk_dir_imp.send(WorkerCommand::DirectJsonToVpk {
+            src_json: PathBuf::from(json.as_str()),
+            baseline_vpk: PathBuf::from(base.as_str()),
+            dst: PathBuf::from(dst.as_str()),
+        });
+    });
+
+    let tx_dta_exp = tx.clone();
+    ui.on_direct_dta_to_json(move |src, dst| {
+        let _ = tx_dta_exp.send(WorkerCommand::DirectDtaToJson {
+            src: PathBuf::from(src.as_str()),
+            dst: PathBuf::from(dst.as_str()),
+        });
+    });
+
+    let tx_dta_imp = tx.clone();
+    ui.on_direct_json_to_dta(move |json, base, dst| {
+        let _ = tx_dta_imp.send(WorkerCommand::DirectJsonToDta {
+            src_json: PathBuf::from(json.as_str()),
+            baseline_dta: PathBuf::from(base.as_str()),
+            dst: PathBuf::from(dst.as_str()),
+        });
+    });
+
+    let tx_env_exp = tx.clone();
+    ui.on_direct_env_to_json(move |src, dst| {
+        let _ = tx_env_exp.send(WorkerCommand::DirectEnvToJson {
+            src: PathBuf::from(src.as_str()),
+            dst: PathBuf::from(dst.as_str()),
+        });
+    });
+
+    let tx_env_imp = tx.clone();
+    ui.on_direct_json_to_env(move |json, base, dst| {
+        let _ = tx_env_imp.send(WorkerCommand::DirectJsonToEnv {
+            src_json: PathBuf::from(json.as_str()),
+            baseline_env: PathBuf::from(base.as_str()),
+            dst: PathBuf::from(dst.as_str()),
+        });
+    });
+
+    let tx_mesh_dir_exp = tx.clone();
+    ui.on_direct_mesh_export(move |src, dst| {
+        let dst_path = PathBuf::from(dst.as_str());
+        let is_glb = dst_path.extension().is_some_and(|e| e == "glb");
+        let _ = tx_mesh_dir_exp.send(WorkerCommand::DirectMeshExport {
+            src: PathBuf::from(src.as_str()),
+            dst: dst_path,
+            is_glb,
+        });
+    });
+
+    let tx_mesh_dir_imp = tx.clone();
+    ui.on_direct_mesh_import(move |chunk, model| {
+        let model_path = PathBuf::from(model.as_str());
+        let is_glb = model_path.extension().is_some_and(|e| e == "glb");
+        let _ = tx_mesh_dir_imp.send(WorkerCommand::DirectMeshImport {
+            chunk_target: PathBuf::from(chunk.as_str()),
+            model_src: model_path,
+            is_glb,
+        });
+    });
+
+    let tx_assemble = tx.clone();
+    ui.on_direct_assemble_level(move |omp, assets, dst| {
+        let _ = tx_assemble.send(WorkerCommand::DirectAssembleLevel {
+            omp_path: PathBuf::from(omp.as_str()),
+            assets_dir: PathBuf::from(assets.as_str()),
+            dst: PathBuf::from(dst.as_str()),
+        });
+    });
+
+    let tx_terr_dir_exp = tx.clone();
+    ui.on_direct_terrain_export(move |src, dst| {
+        let dst_path = PathBuf::from(dst.as_str());
+        let is_glb = dst_path.extension().is_some_and(|e| e == "glb");
+        let _ = tx_terr_dir_exp.send(WorkerCommand::DirectTerrainExport {
+            src: PathBuf::from(src.as_str()),
+            dst: dst_path,
+            is_glb,
+        });
+    });
+
+    let tx_col_dir_exp = tx.clone();
+    ui.on_direct_collision_export(move |src, dst| {
+        let _ = tx_col_dir_exp.send(WorkerCommand::DirectCollisionExport {
+            src: PathBuf::from(src.as_str()),
+            dst: PathBuf::from(dst.as_str()),
+        });
+    });
+
+    let tx_col_dir_imp = tx.clone();
+    ui.on_direct_collision_import(move |chunk, glb| {
+        let _ = tx_col_dir_imp.send(WorkerCommand::DirectCollisionImport {
+            chunk_target: PathBuf::from(chunk.as_str()),
+            glb_src: PathBuf::from(glb.as_str()),
+        });
+    });
+
+    let tx_font_dir_exp = tx.clone();
+    ui.on_direct_font_to_json(move |src, dst| {
+        let _ = tx_font_dir_exp.send(WorkerCommand::DirectFontToJson {
+            src: PathBuf::from(src.as_str()),
+            dst: PathBuf::from(dst.as_str()),
+        });
+    });
+
+    let tx_font_dir_imp = tx.clone();
+    ui.on_direct_json_to_font(move |json, dst| {
+        let _ = tx_font_dir_imp.send(WorkerCommand::DirectJsonToFont {
+            src_json: PathBuf::from(json.as_str()),
+            dst: PathBuf::from(dst.as_str()),
+        });
+    });
+
+    let tx_tex_dir_exp = tx.clone();
+    ui.on_direct_texture_export(move |src, dst| {
+        let _ = tx_tex_dir_exp.send(WorkerCommand::DirectTextureExport {
+            src: PathBuf::from(src.as_str()),
+            dst: PathBuf::from(dst.as_str()),
+        });
+    });
+
+    let tx_tex_dir_imp = tx.clone();
+    ui.on_direct_texture_import(move |chunk, img| {
+        let _ = tx_tex_dir_imp.send(WorkerCommand::DirectTextureImport {
+            chunk_target: PathBuf::from(chunk.as_str()),
+            img_src: PathBuf::from(img.as_str()),
+        });
+    });
+
+    let tx_aud_dir_exp = tx.clone();
+    ui.on_direct_audio_export(move |src, dst| {
+        let _ = tx_aud_dir_exp.send(WorkerCommand::DirectAudioExport {
+            src: PathBuf::from(src.as_str()),
+            dst: PathBuf::from(dst.as_str()),
+        });
+    });
+
+    let tx_aud_dir_imp = tx.clone();
+    ui.on_direct_audio_import(move |chunk, wav| {
+        let _ = tx_aud_dir_imp.send(WorkerCommand::DirectAudioImport {
+            chunk_target: PathBuf::from(chunk.as_str()),
+            wav_src: PathBuf::from(wav.as_str()),
+        });
+    });
+
+    // --- CONTEXTUAL ASSET CALLBACKS ---
     let tx_wav_exp = tx.clone();
     ui.on_export_wav(move |chunk_str, out_str| {
         let _ = tx_wav_exp.send(WorkerCommand::ExportWav {
@@ -130,6 +289,30 @@ pub fn register(
         let _ = tx_uisp.send(WorkerCommand::SaveUiSprite {
             chunk_path: PathBuf::from(chunk_str.as_str()),
             json_data: json_str.to_string(),
+        });
+    });
+
+    let tx_dta = tx.clone();
+    ui.on_save_dta(move |chunk_str, json_str| {
+        let _ = tx_dta.send(WorkerCommand::SaveDta {
+            chunk_path: PathBuf::from(chunk_str.as_str()),
+            json_data: json_str.to_string(),
+        });
+    });
+
+    let tx_vpk = tx.clone();
+    ui.on_save_vpk(move |chunk_str, json_str| {
+        let _ = tx_vpk.send(WorkerCommand::SaveVpk {
+            chunk_path: PathBuf::from(chunk_str.as_str()),
+            json_data: json_str.to_string(),
+        });
+    });
+
+    let tx_dec_8ld = tx.clone();
+    ui.on_decompile_8ld(move |src_str, dst_str| {
+        let _ = tx_dec_8ld.send(WorkerCommand::Decompile8ldDirect {
+            src: PathBuf::from(src_str.as_str()),
+            dst: PathBuf::from(dst_str.as_str()),
         });
     });
 

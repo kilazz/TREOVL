@@ -1,12 +1,14 @@
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
+use walkdir::WalkDir;
 
 use crate::engine::assets::animation::{export_animation_to_glb, export_animation_to_json};
 use crate::engine::assets::audio::{export_wav, replace_wav};
 use crate::engine::assets::collision::{
     export_collision_to_glb, import_collision_from_glb, import_collision_from_json,
 };
+use crate::engine::assets::dta::{export_dta_to_json, import_dta_from_json};
 use crate::engine::assets::environment::import_environment_from_json;
 use crate::engine::assets::font::import_font_from_json;
 use crate::engine::assets::lua::{compile_lua_script, extract_lua_bytecode, replace_lua_bytecode};
@@ -23,6 +25,7 @@ use crate::engine::assets::terrain_palette::import_terrain_palette_from_json;
 use crate::engine::assets::texture::{export_to_dds, replace_texture_in_chunk};
 use crate::engine::assets::ui::import_ui_from_json;
 use crate::engine::assets::ui_sprite::import_ui_sprite_collection;
+use crate::engine::assets::vpk::{export_vpk_to_json, import_vpk_from_json};
 
 pub fn export_texture(chunk_path: &Path, out_path: &Path) -> Result<()> {
     let data = fs::read(chunk_path).with_context(|| format!("Failed to read {:?}", chunk_path))?;
@@ -191,6 +194,35 @@ pub fn save_m8ld(chunk_path: &Path, xml_or_json_data: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn export_dta(chunk_path: &Path, out_path: &Path) -> Result<()> {
+    let data = fs::read(chunk_path).with_context(|| format!("Failed to read {:?}", chunk_path))?;
+    let stem = chunk_path.file_stem().unwrap_or_default().to_string_lossy();
+    let json_str = export_dta_to_json(&data, &stem)?;
+    fs::write(out_path, json_str.as_bytes())?;
+    Ok(())
+}
+
+pub fn save_dta(chunk_path: &Path, json_data: &str) -> Result<()> {
+    let baseline = fs::read(chunk_path)?;
+    let bin = import_dta_from_json(json_data, &baseline)?;
+    fs::write(chunk_path, bin)?;
+    Ok(())
+}
+
+pub fn export_vpk(chunk_path: &Path, out_path: &Path) -> Result<()> {
+    let data = fs::read(chunk_path).with_context(|| format!("Failed to read {:?}", chunk_path))?;
+    let json_str = export_vpk_to_json(&data)?;
+    fs::write(out_path, json_str.as_bytes())?;
+    Ok(())
+}
+
+pub fn save_vpk(chunk_path: &Path, json_data: &str) -> Result<()> {
+    let baseline = fs::read(chunk_path)?;
+    let bin = import_vpk_from_json(json_data, &baseline)?;
+    fs::write(chunk_path, bin)?;
+    Ok(())
+}
+
 pub fn decompile_8ld_file(src_path: &Path, dst_path: &Path) -> Result<PathBuf> {
     let data = fs::read(src_path).with_context(|| format!("Failed to read {:?}", src_path))?;
     let (seed, xml_str) = decompile_8ld_to_xml(&data)?;
@@ -201,6 +233,10 @@ pub fn decompile_8ld_file(src_path: &Path, dst_path: &Path) -> Result<PathBuf> {
     } else {
         dst_path.to_path_buf()
     };
+
+    if let Some(parent) = target_file.parent() {
+        fs::create_dir_all(parent)?;
+    }
 
     // 1. Write clean XML text document
     fs::write(&target_file, xml_str.as_bytes())?;
@@ -231,6 +267,10 @@ pub fn compile_8ld_file(src_path: &Path, dst_path: &Path) -> Result<PathBuf> {
         dst_path.to_path_buf()
     };
 
+    if let Some(parent) = target_file.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
     // Recover seed from companion .meta.json, target container header, or fallback to default
     let meta_path = src_path.with_extension("meta.json");
     let seed = if meta_path.exists()
@@ -253,17 +293,23 @@ pub fn compile_8ld_file(src_path: &Path, dst_path: &Path) -> Result<PathBuf> {
     Ok(target_file)
 }
 
-/// Batch converts all .8ld files in `src_dir` into .xml files in `dst_dir`
+/// Recursively batch-converts all .8ld files in `src_dir` into .xml files in `dst_dir`,
+/// preserving the exact subfolder structure.
 pub fn batch_decompile_8ld(src_dir: &Path, dst_dir: &Path) -> Result<usize> {
     fs::create_dir_all(dst_dir)?;
     let mut count = 0;
 
-    for entry in fs::read_dir(src_dir)?.flatten() {
+    for entry in WalkDir::new(src_dir).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
-        if path.is_file() && path.extension().is_some_and(|ext| ext == "8ld") {
-            let stem = path.file_stem().unwrap_or_default();
-            let out_file = dst_dir.join(format!("{}.xml", stem.to_string_lossy()));
-            if decompile_8ld_file(&path, &out_file).is_ok() {
+        if path.is_file()
+            && path.extension().is_some_and(|ext| ext == "8ld")
+            && let Ok(rel) = path.strip_prefix(src_dir)
+        {
+            let out_file = dst_dir.join(rel).with_extension("xml");
+            if let Some(parent) = out_file.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if decompile_8ld_file(path, &out_file).is_ok() {
                 count += 1;
             }
         }
@@ -272,17 +318,23 @@ pub fn batch_decompile_8ld(src_dir: &Path, dst_dir: &Path) -> Result<usize> {
     Ok(count)
 }
 
-/// Batch converts all .xml files in `src_dir` into .8ld files in `dst_dir`
+/// Recursively batch-converts all .xml files in `src_dir` into .8ld files in `dst_dir`,
+/// preserving the exact subfolder structure.
 pub fn batch_compile_8ld(src_dir: &Path, dst_dir: &Path) -> Result<usize> {
     fs::create_dir_all(dst_dir)?;
     let mut count = 0;
 
-    for entry in fs::read_dir(src_dir)?.flatten() {
+    for entry in WalkDir::new(src_dir).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
-        if path.is_file() && path.extension().is_some_and(|ext| ext == "xml") {
-            let stem = path.file_stem().unwrap_or_default();
-            let out_file = dst_dir.join(format!("{}.8ld", stem.to_string_lossy()));
-            if compile_8ld_file(&path, &out_file).is_ok() {
+        if path.is_file()
+            && path.extension().is_some_and(|ext| ext == "xml")
+            && let Ok(rel) = path.strip_prefix(src_dir)
+        {
+            let out_file = dst_dir.join(rel).with_extension("8ld");
+            if let Some(parent) = out_file.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if compile_8ld_file(path, &out_file).is_ok() {
                 count += 1;
             }
         }

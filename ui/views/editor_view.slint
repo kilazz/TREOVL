@@ -1,0 +1,45 @@
+import { TextEdit } from "std-widgets.slint";
+import { CustomButton } from "../components/buttons.slint";
+import { SectionTitle } from "../components/common.slint";
+
+export component JsonEditorView inherits VerticalLayout {
+    in property <string> title_text: "JSON PROPERTIES EDITOR";
+    in property <color> title_color: #23a55a;
+    in property <string> save_btn_text: "Save Changes";
+    in-out property <string> content <=> te.text;
+    in property <bool> read_only: false;
+    callback save_clicked();
+
+    spacing: 8px;
+    vertical-stretch: 1;
+
+    SectionTitle {
+        text: root.title_text;
+        text-color: root.title_color;
+    }
+
+    if !root.read_only: HorizontalLayout {
+        spacing: 10px;
+        CustomButton {
+            icon: "💾";
+            text: root.save_btn_text;
+            primary-color: #23a55a;
+            min-w: 180px;
+            clicked => { root.save_clicked(); }
+        }
+    }
+
+    Rectangle {
+        background: #111214;
+        border-radius: 4px;
+        border-width: 1px;
+        border-color: #353535;
+        vertical-stretch: 1;
+
+        te := TextEdit {
+            read-only: root.read_only;
+            font-family: "Consolas";
+            font-size: 11px;
+        }
+    }
+}

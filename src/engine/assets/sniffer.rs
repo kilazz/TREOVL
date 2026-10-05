@@ -1,4 +1,4 @@
-use super::parse_typed_container;
+use super::{parse_chunk_elements, parse_typed_container};
 use crate::engine::common::magic;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +26,8 @@ pub enum AssetKind {
     Environment = 20,
     M8ldMap = 21,
     UiSprite = 22,
+    Dta = 23,
+    VoicePackage = 24,
 }
 
 impl AssetKind {
@@ -44,6 +46,8 @@ impl AssetKind {
             Self::Environment => 11,
             Self::M8ldMap => 12,
             Self::UiSprite => 13,
+            Self::Dta => 14,
+            Self::VoicePackage => 15,
             _ => 5,
         }
     }
@@ -75,32 +79,49 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
     {
         (AssetKind::Object, "TREModelResource (Entity/Prop)", "🧊")
 
-    // Priority 2: Character / Actor Controllers (STRUCTURAL VALIDATION)
-    } else if data.len() >= 4 && data[0] == 0x03 && data[1] == 0x40 && data[2] == 0x46 {
+    // Priority 2: Character / Actor / Breakable Controllers (0x00464003 & 0x00463018)
+    } else if data.len() >= 4
+        && ((data[0] == 0x03 && data[1] == 0x40 && data[2] == 0x46)
+            || (data[0] == 0x18 && data[1] == 0x30 && data[2] == 0x46))
+    {
         let mut is_valid = false;
         if let Ok((_, elements)) = parse_typed_container(data) {
             is_valid = elements
                 .iter()
-                .any(|(id, _)| *id == 115 || *id == 112 || *id == 50 || *id == 33);
+                .any(|(id, _)| *id == 115 || *id == 112 || *id == 50 || *id == 37 || *id == 33);
         }
         if is_valid {
-            (
-                AssetKind::Character,
-                "Character / NPC Controller (TREActor)",
-                "🧙‍♂️",
-            )
+            let (label, icon) = if data[0] == 0x18 {
+                ("Breakable Prop / Destructible Object", "💥")
+            } else {
+                ("Character / NPC Controller (TREActor)", "🧙‍♂️")
+            };
+            (AssetKind::Character, label, icon)
         } else {
             (AssetKind::Generic, "Triumph Binary Container", "📦")
         }
 
-    // Priority 3: Attached Items / Equipment (STRUCTURAL VALIDATION)
-    } else if data.windows(4).any(|w| w == b"\x0D\x20\x46\x00") {
+    // Priority 3: Attached Items / Equipment (TypeID 0x0046200D or item table structure)
+    } else if (data.len() >= 4
+        && u32::from_le_bytes(data[0..4].try_into().unwrap_or_default()) == 0x0046200D)
+        || (data.starts_with(magic::CONTAINER_MAGIC)
+            && data.windows(4).any(|w| w == b"\x0D\x20\x46\x00"))
+    {
         let mut is_valid = false;
-        if let Ok((_, elements)) = parse_typed_container(data) {
+        if let Ok((type_id, elements)) = parse_typed_container(data) {
+            if type_id == 0x0046200D {
+                is_valid = true;
+            } else {
+                is_valid = elements
+                    .iter()
+                    .any(|(_, chunk)| chunk.windows(4).any(|w| w == b"OBJ\\" || w == b"MESH"));
+            }
+        } else if let Ok((_, elements)) = parse_chunk_elements(data) {
             is_valid = elements
                 .iter()
-                .any(|(_, chunk)| chunk.windows(4).any(|w| w == b"OBJ\\" || w == b"MESH"));
+                .any(|(id, chunk)| *id == 21 && chunk.windows(4).any(|w| w == b"\x0D\x20\x46\x00"));
         }
+
         if is_valid {
             (
                 AssetKind::Attachment,
@@ -213,7 +234,30 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
             "🌌",
         )
 
-    // Priority 18: Map 8-bit Layer Data (.8ld or headerless sub-chunks)
+    // Priority 18: Lighting Sets & Binary Tables (.dta)
+    } else if filename_hint.to_lowercase().ends_with(".dta")
+        || (data.len() > 64
+            && crate::engine::container::footer::check_footer(data).is_some()
+            && data.len() < 150_000
+            && !data.starts_with(b"PRP")
+            && !data.starts_with(b"OMP"))
+    {
+        (AssetKind::Dta, "Lighting Set / Binary Data (.dta)", "💡")
+
+    // Priority 19: Voice Package Descriptors (.debug-vpk, .vpk)
+    } else if filename_hint.to_lowercase().ends_with(".debug-vpk")
+        || filename_hint.to_lowercase().ends_with(".vpk")
+        || (data.starts_with(b"RPK\0")
+            && data.len() < 50_000
+            && data.windows(12).any(|w| w == b"Voice" || w == b"voice"))
+    {
+        (
+            AssetKind::VoicePackage,
+            "Voice Package Descriptor (.debug-vpk)",
+            "🗣️",
+        )
+
+    // Priority 20: Map 8-bit Layer Data (.8ld or headerless sub-chunks)
     } else if magic_bytes == b"M8LD"
         || filename_hint.to_lowercase().ends_with(".8ld")
         || (!data.is_empty()
@@ -226,7 +270,7 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
     {
         (AssetKind::M8ldMap, "Level Map Logic Layer (.8ld)", "🗺️")
 
-    // Priority 19: UI Sprite Collections & Atlases (e.g., Font14.clb, Ingame10.clb)
+    // Priority 21: UI Sprite Collections & Atlases
     } else if magic_bytes == b"CRL\0"
         || data
             .windows(4)
@@ -234,7 +278,7 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
     {
         (AssetKind::UiSprite, "UI Sprite Collection", "🖼️")
 
-    // Priority 20: Miscellaneous Engine Structures
+    // Priority 22: Miscellaneous Engine Structures
     } else if magic_bytes == b"\x4E\x00\x41\x00" {
         (AssetKind::Generic, "Scene Node / Transform", "📍")
     } else if data[..data.len().min(1024)]
@@ -289,6 +333,9 @@ fn extract_internal_strings(data: &[u8]) -> Option<String> {
                     || clean.ends_with(".xml")
                     || clean.ends_with(".clb")
                     || clean.ends_with(".env")
+                    || clean.ends_with(".dta")
+                    || clean.ends_with(".debug-vpk")
+                    || clean.ends_with(".vpk")
                     || clean.ends_with(".8ld")
                     || clean.ends_with(".fxe")
                     || clean.ends_with(".fxa")

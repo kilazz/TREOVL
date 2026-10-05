@@ -4,6 +4,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::engine::assets::animation::parse_animation_clip;
+use crate::engine::assets::dta::{
+    decompress_dta_payload, export_dta_to_json, import_dta_from_json,
+};
 use crate::engine::assets::lua::{disassemble_lua_bytecode, inspect_lua_bytecode};
 use crate::engine::assets::map::{assemble_level_scene_glb, export_level_to_glb, parse_omp_map};
 use crate::engine::assets::shader::{ShaderType, export_shader};
@@ -30,7 +33,7 @@ pub struct Cli {
 pub enum Commands {
     /// Extract PRP/RPK archive into a project folder and populate smart assets
     Unpack {
-        /// Source .prp or .rpk archive path
+        /// Source .prp, .pvp, .psp, or .rpk archive path
         archive: PathBuf,
         /// Target project output directory
         out_dir: PathBuf,
@@ -155,6 +158,27 @@ pub enum Commands {
     InspectMap {
         /// Input map package (.omp)
         level: PathBuf,
+    },
+    /// Export Lighting Set (.dta) to structured JSON
+    ExportDta {
+        /// Input .dta file
+        input: PathBuf,
+        /// Output .json file
+        output: PathBuf,
+    },
+    /// Recompile structured JSON back into a Lighting Set binary (.dta)
+    ImportDta {
+        /// Input .json file
+        input: PathBuf,
+        /// Baseline original .dta file
+        baseline: PathBuf,
+        /// Output .dta file
+        output: PathBuf,
+    },
+    /// Inspect Lighting Set (.dta) headers, block counts, and light records
+    InspectDta {
+        /// Input .dta file
+        dta: PathBuf,
     },
     /// Verify Lua 5.0.2 bytecode and extract string constants
     InspectLua {
@@ -344,6 +368,48 @@ pub fn handle_cli() -> Result<()> {
                 println!(
                     "Player Start: X={:.2}, Y={:.2}, Z={:.2}",
                     pos.x, pos.y, pos.z
+                );
+            }
+        }
+        Commands::ExportDta { input, output } => {
+            let data = fs::read(&input).with_context(|| format!("Failed to read {:?}", input))?;
+            let stem = input.file_stem().unwrap_or_default().to_string_lossy();
+            let json_str = export_dta_to_json(&data, &stem)?;
+            fs::write(&output, json_str.as_bytes())?;
+            println!("[+] Lighting set (.dta) exported to JSON: {:?}", output);
+        }
+        Commands::ImportDta {
+            input,
+            baseline,
+            output,
+        } => {
+            let json_str = fs::read_to_string(&input)
+                .with_context(|| format!("Failed to read {:?}", input))?;
+            let base_data = fs::read(&baseline)
+                .with_context(|| format!("Failed to read baseline {:?}", baseline))?;
+            let bin = import_dta_from_json(&json_str, &base_data)?;
+            fs::write(&output, bin)?;
+            println!(
+                "[+] Successfully compiled Lighting Set (.dta): {:?}",
+                output
+            );
+        }
+        Commands::InspectDta { dta } => {
+            let data = fs::read(&dta).with_context(|| format!("Failed to read {:?}", dta))?;
+            let (decompressed, hdr, meta) = decompress_dta_payload(&data)?;
+            println!("--- DTA LIGHTING SET PACKAGE INFO ---");
+            println!("File Type:           {}", meta.file_type);
+            println!("Decompressed Size:   {} bytes", meta.uncompressed_size);
+            println!("Compressed Size:     {} bytes", meta.compressed_size);
+            println!("Block Count:         {} blocks", meta.block_count);
+            println!("Max Chunk Size:      {} bytes", hdr.max_block_size);
+            println!("Checksum:            {}", meta.checksum_hex);
+            println!("Footer CRC:          {}", meta.footer_crc_hex);
+            println!("Footer Hash2:        {}", meta.footer_hash2_hex);
+            if decompressed.len() >= 32 {
+                println!(
+                    "Point Light Records: ~{} potential candidates",
+                    decompressed.len() / 32
                 );
             }
         }

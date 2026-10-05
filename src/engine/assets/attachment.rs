@@ -223,7 +223,8 @@ pub fn export_attachment_to_json(data: &[u8]) -> Result<String> {
 }
 
 pub fn import_attachment_from_json(json_str: &str) -> Result<Vec<u8>> {
-    let parsed: ItemAttachmentJson = serde_json::from_str(json_str)?;
+    let parsed: ItemAttachmentJson =
+        serde_json::from_str(json_str).context("Syntax error in Item Attachment JSON format")?;
 
     let mut item_sub = Vec::new();
     item_sub.push((
@@ -232,8 +233,20 @@ pub fn import_attachment_from_json(json_str: &str) -> Result<Vec<u8>> {
     ));
     item_sub.push((21, write_length_prefixed_string(&parsed.item_name)));
 
-    let mut flag_bits = u32::from_str_radix(parsed.flags.raw_mask_hex.trim_start_matches("0x"), 16)
-        .unwrap_or(0x2100_0000);
+    // Strict hexadecimal parsing without silent fallbacks
+    let raw_hex = parsed
+        .flags
+        .raw_mask_hex
+        .trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X");
+    let mut flag_bits = u32::from_str_radix(raw_hex, 16).with_context(|| {
+        format!(
+            "Invalid hex representation in flags.raw_mask_hex: '{}'",
+            parsed.flags.raw_mask_hex
+        )
+    })?;
+
     if parsed.flags.is_pickable {
         flag_bits |= 0x01;
     }
@@ -286,12 +299,27 @@ pub fn import_attachment_from_json(json_str: &str) -> Result<Vec<u8>> {
     ));
     item_sub.push((140, vec![1u8, 1, 0, 0]));
     item_sub.push((141, vec![1u8, 1, 0, 0]));
+
+    // Strict numerical coordinate verification
+    for (i, val) in parsed.hold_offset.iter().enumerate() {
+        if !val.is_finite() {
+            bail!(
+                "hold_offset[{}] must be a finite floating-point value, encountered: {}",
+                i,
+                val
+            );
+        }
+    }
     item_sub.push((143, build_transform_offset(parsed.hold_offset)));
 
     for prop in parsed._engine_metadata.unmapped_properties {
-        if let Ok(b) = hex::decode(&prop.hex) {
-            item_sub.push((prop.id, b));
-        }
+        let b = hex::decode(&prop.hex).with_context(|| {
+            format!(
+                "Invalid hex sequence in unmapped property ID {}: '{}'",
+                prop.id, prop.hex
+            )
+        })?;
+        item_sub.push((prop.id, b));
     }
 
     item_sub.push((19, vec![0xFF, 0xFF, 0xFF, 0xFF]));

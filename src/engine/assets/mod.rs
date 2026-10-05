@@ -9,6 +9,7 @@ pub mod attachment;
 pub mod audio;
 pub mod character;
 pub mod collision;
+pub mod dta;
 pub mod environment;
 pub mod event;
 pub mod facefx;
@@ -28,6 +29,7 @@ pub mod texture;
 pub mod ui;
 pub mod ui_sprite;
 pub mod vfx;
+pub mod vpk;
 pub mod xml;
 
 pub type ChunkElement = (u32, Vec<u8>);
