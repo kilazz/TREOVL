@@ -20,6 +20,12 @@ export struct AssetItem {
     is_modified: bool,
 }
 
+export struct BoneLabel {
+    name: string,
+    x: length,
+    y: length,
+}
+
 export component AppWindow inherits Window {
     title: "Overlord Modding Studio — Workspace";
     min-width: 1080px;
@@ -53,6 +59,13 @@ export component AppWindow inherits Window {
     in-out property <bool> has_composite_available: false;
     in-out property <bool> is_composite_active: false;
     in-out property <bool> is_skinning_enabled: true;
+    in-out property <bool> is_root_motion_enabled: false;
+    in-out property <bool> show_mesh: true;
+    in-out property <bool> show_skeleton: true;
+    in-out property <bool> show_bone_names: false;
+    in-out property <bool> show_wireframe: false;
+    in-out property <bool> show_grid: true;
+    in-out property <[BoneLabel]> bone_labels: [];
 
     // Real-Time Viewport Animation Playback States
     in-out property <bool> has_animations: false;
@@ -98,6 +111,12 @@ export component AppWindow inherits Window {
     callback reset_viewport_camera();
     callback toggle_composite_view();
     callback toggle_skinning();
+    callback toggle_root_motion();
+    callback toggle_mesh_vis();
+    callback toggle_skeleton_vis();
+    callback toggle_bone_names();
+    callback toggle_wireframe();
+    callback toggle_grid();
 
     // Real-Time Viewport Animation Playback Callbacks
     callback select_active_animation(int);
@@ -1043,17 +1062,72 @@ export component AppWindow inherits Window {
                                     min-w: 140px;
                                     clicked => { root.toggle_composite_view(); }
                                 }
+                            }
 
-                                if root.has_animations: CustomButton {
+                            // --- ROW 2: VIEWPORT DEBUG VISIBILITY TOGGLES ---
+                            if root.has_animations: HorizontalLayout {
+                                spacing: 6px;
+                                alignment: start;
+                                height: 28px;
+
+                                CustomButton {
                                     icon: "🦴";
                                     text: root.is_skinning_enabled ? "Skinning: ON" : "Skinning: OFF";
                                     primary-color: root.is_skinning_enabled ? #23a55a : #4e5058;
                                     min-w: 130px;
                                     clicked => { root.toggle_skinning(); }
                                 }
+
+                                CustomButton {
+                                    icon: "🌐";
+                                    text: root.is_root_motion_enabled ? "Root Motion: ON" : "Root Motion: OFF";
+                                    primary-color: root.is_root_motion_enabled ? #23a55a : #4e5058;
+                                    min-w: 145px;
+                                    clicked => { root.toggle_root_motion(); }
+                                }
+
+                                CustomButton {
+                                    icon: "📦";
+                                    text: root.show_mesh ? "Mesh: ON" : "Mesh: OFF";
+                                    primary-color: root.show_mesh ? #23a55a : #4e5058;
+                                    min-w: 105px;
+                                    clicked => { root.toggle_mesh_vis(); }
+                                }
+
+                                CustomButton {
+                                    icon: "🦴";
+                                    text: root.show_skeleton ? "Skeleton: ON" : "Skeleton: OFF";
+                                    primary-color: root.show_skeleton ? #3e6a90 : #4e5058;
+                                    min-w: 125px;
+                                    clicked => { root.toggle_skeleton_vis(); }
+                                }
+
+                                CustomButton {
+                                    icon: "🏷️";
+                                    text: root.show_bone_names ? "Names: ON" : "Names: OFF";
+                                    primary-color: root.show_bone_names ? #d28e1b : #4e5058;
+                                    min-w: 110px;
+                                    clicked => { root.toggle_bone_names(); }
+                                }
+
+                                CustomButton {
+                                    icon: "🕸️";
+                                    text: root.show_wireframe ? "Wire: ON" : "Wire: OFF";
+                                    primary-color: root.show_wireframe ? #5865f2 : #4e5058;
+                                    min-w: 105px;
+                                    clicked => { root.toggle_wireframe(); }
+                                }
+
+                                CustomButton {
+                                    icon: "🔲";
+                                    text: root.show_grid ? "Grid: ON" : "Grid: OFF";
+                                    primary-color: root.show_grid ? #4e5058 : #2b303c;
+                                    min-w: 95px;
+                                    clicked => { root.toggle_grid(); }
+                                }
                             }
 
-                            // --- ROW 2: VIEWPORT NAVIGATION & SHADING TOOLBAR ---
+                            // --- ROW 3: CAMERA & SHADING TOOLBAR ---
                             Rectangle {
                                 background: #20242c;
                                 border-radius: 6px;
@@ -1294,15 +1368,47 @@ export component AppWindow inherits Window {
                                 }
                             }
 
-                            Viewport3DView {
-                                preview_image: root.mesh_preview;
-                                has_mesh: root.has_mesh;
-                                stats_lines: root.mesh_stats_lines;
-                                rotate_viewport(dyaw, dpitch) => { root.rotate_mesh_viewport(dyaw, dpitch); }
-                                zoom_viewport(delta) => { root.zoom_mesh_viewport(delta); }
+                            // --- VIEWPORT WITH BONE LABELS OVERLAY ---
+                            Rectangle {
+                                background: #111214;
+                                border-radius: 4px;
+                                border-width: 1px;
+                                border-color: #353535;
+                                clip: true;
+                                vertical-stretch: 1;
+
+                                Viewport3DView {
+                                    preview_image: root.mesh_preview;
+                                    has_mesh: root.has_mesh;
+                                    stats_lines: root.mesh_stats_lines;
+                                    rotate_viewport(dyaw, dpitch) => { root.rotate_mesh_viewport(dyaw, dpitch); }
+                                    zoom_viewport(delta) => { root.zoom_mesh_viewport(delta); }
+                                }
+
+                                // Overlay Bone Names
+                                for label in root.bone_labels: Rectangle {
+                                    x: label.x - 32px;
+                                    y: label.y - 10px;
+                                    width: 64px;
+                                    height: 20px;
+                                    background: #0f1115f0;
+                                    border-radius: 3px;
+                                    border-width: 1px;
+                                    border-color: #3e6a90;
+
+                                    Text {
+                                        text: label.name;
+                                        font-family: "Consolas";
+                                        font-size: 9.5px;
+                                        color: #58a6ff;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+                                }
                             }
 
-                            // --- REAL-TIME ANIMATION TIMELINE PLAYER HUD (ALWAYS VISIBLE) ---
+                            // --- ANIMATION PLAYER HUD ---
                             Rectangle {
                                 height: 44px;
                                 background: #20242c;
@@ -1335,9 +1441,7 @@ export component AppWindow inherits Window {
                                         TouchArea {
                                             enabled: root.has_animations;
                                             mouse-cursor: root.has_animations ? pointer : default;
-                                            clicked => {
-                                                root.is_anim_playing = !root.is_anim_playing;
-                                            }
+                                            clicked => { root.is_anim_playing = !root.is_anim_playing; }
                                         }
                                     }
 
@@ -1396,9 +1500,7 @@ export component AppWindow inherits Window {
                                             minimum: 0.0;
                                             maximum: root.anim_duration;
                                             value <=> root.anim_current_time;
-                                            changed(val) => {
-                                                root.scrub_animation_timeline(val);
-                                            }
+                                            changed(val) => { root.scrub_animation_timeline(val); }
                                         }
                                     }
                                 }

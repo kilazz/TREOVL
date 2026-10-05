@@ -24,19 +24,19 @@ fn gltf_basis_quat() -> Quat {
 }
 
 /// Zero-copy C-representation for an Overlord bone (exactly 144 bytes).
-/// Reflects the true Left-Child Right-Sibling (LCRS) tree layout of Triumph Engine.
+/// Layout strictly synchronized with official Triumph Engine / RPK format.
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 #[repr(C)]
 pub struct RawObjectBone {
     pub name: [u8; 32],
-    pub matrix: [f32; 16],     // Local transform matrix relative to parent
-    pub rotation: [f32; 4],    // Local rotation quaternion
-    pub translation: [f32; 3], // Local translation vector
-    pub bone_id: i32,
-    pub parent_index: i32,       // True parent bone index (-1 for Root)
-    pub first_child_index: i32,  // Pointer to the first child bone
-    pub next_sibling_index: i32, // Pointer to the next sibling bone sharing the same parent
-    pub aux_id: i32,             // Auxiliary ID or flags
+    pub matrix: [f32; 16],       // Local transform matrix relative to parent
+    pub rotation: [f32; 4],      // Local rotation quaternion
+    pub translation: [f32; 3],   // Local translation vector
+    pub bone_id: i32,            // Bone ID / skin index (offset 124)
+    pub parent_index: i32,       // True parent bone index (-1 for Root) (offset 128)
+    pub next_sibling_index: i32, // Pointer to next sibling (offset 132)
+    pub first_child_index: i32,  // Pointer to first child (offset 136)
+    pub aux_id: i32,             // Auxiliary flags (offset 140)
 }
 
 const _: () = assert!(std::mem::size_of::<RawObjectBone>() == 144);
@@ -49,8 +49,8 @@ pub struct ObjectBone {
     pub translation: Vector3,
     pub bone_id: i32,
     pub parent_index: i32,
-    pub first_child_index: i32,
     pub next_sibling_index: i32,
+    pub first_child_index: i32,
     pub aux_id: i32,
 }
 
@@ -73,8 +73,8 @@ impl ObjectBone {
             translation: [self.translation.x, self.translation.y, self.translation.z],
             bone_id: self.bone_id,
             parent_index: self.parent_index,
-            first_child_index: self.first_child_index,
             next_sibling_index: self.next_sibling_index,
+            first_child_index: self.first_child_index,
             aux_id: self.aux_id,
         };
         bytemuck::cast::<RawObjectBone, [u8; 144]>(raw)
@@ -132,8 +132,8 @@ fn try_parse_bones(slice: &[u8], min_count: usize) -> Option<Vec<ObjectBone>> {
                 },
                 bone_id: raw.bone_id,
                 parent_index: raw.parent_index,
-                first_child_index: raw.first_child_index,
                 next_sibling_index: raw.next_sibling_index,
+                first_child_index: raw.first_child_index,
                 aux_id: raw.aux_id,
             });
         } else {
@@ -533,10 +533,10 @@ fn parse_rotation_stream(
 
             let mut q = Quat::from_xyzw(x, y, z, w).normalize();
 
-            if let Some(prev) = previous_q {
-                if prev.dot(q) < 0.0 {
-                    q = -q;
-                }
+            if let Some(prev) = previous_q
+                && prev.dot(q) < 0.0
+            {
+                q = -q;
             }
             previous_q = Some(q);
 
@@ -908,41 +908,12 @@ pub fn compute_skinning_matrices(
         bind_scales.push(scale);
     }
 
-    // 2. Sample Local Animated Matrices as a RELATIVE DELTA from animation frame 0
     let mut local_animated = Vec::with_capacity(num_bones);
 
     for (i, bone) in bones.iter().enumerate() {
         let track_opt = clip.bone_tracks.iter().find(|t| t.bone_name == bone.name);
 
-        // Base transform at animation frame 0 (t = 0.0)
-        let base_trans = if let Some(track) = track_opt
-            && !track.translations.is_empty()
-        {
-            Vec3::new(
-                track.translations[0].position.x,
-                track.translations[0].position.y,
-                track.translations[0].position.z,
-            )
-        } else {
-            Vec3::ZERO
-        };
-
-        let base_rot = if let Some(track) = track_opt
-            && !track.rotations.is_empty()
-        {
-            Quat::from_xyzw(
-                track.rotations[0].rotation_quat.x,
-                track.rotations[0].rotation_quat.y,
-                track.rotations[0].rotation_quat.z,
-                track.rotations[0].rotation_quat.w,
-            )
-            .normalize()
-        } else {
-            Quat::IDENTITY
-        };
-
-        // Current sampled transform at time_seconds
-        let current_trans = if let Some(track) = track_opt
+        let translation = if let Some(track) = track_opt
             && !track.translations.is_empty()
         {
             sample_translation(&track.translations, time_seconds)
@@ -950,7 +921,7 @@ pub fn compute_skinning_matrices(
             Vec3::new(bone.translation.x, bone.translation.y, bone.translation.z)
         };
 
-        let current_rot = if let Some(track) = track_opt
+        let rotation = if let Some(track) = track_opt
             && !track.rotations.is_empty()
         {
             sample_rotation(&track.rotations, time_seconds)
@@ -963,32 +934,12 @@ pub fn compute_skinning_matrices(
             )
         };
 
-        // Bind pose local transform
-        let bind_rot = Quat::from_xyzw(
-            bone.rotation.x,
-            bone.rotation.y,
-            bone.rotation.z,
-            bone.rotation.w,
-        )
-        .normalize();
-        let bind_pos = Vec3::new(bone.translation.x, bone.translation.y, bone.translation.z);
-
-        // Apply animation as a relative delta from frame 0 (locks root translation to prevent flying away)
-        let translation = if bone.parent_index < 0 {
-            bind_pos
-        } else {
-            bind_pos + (current_trans - base_trans)
-        };
-
-        let rotation = bind_rot * (base_rot.inverse() * current_rot);
-
         let scale = bind_scales[i];
         let local_m =
             Mat4::from_scale_rotation_translation(scale, rotation.normalize(), translation);
         local_animated.push(local_m);
     }
 
-    // 3. Compute Global Animated Matrices recursively
     let mut global_animated = vec![None; num_bones];
 
     fn calc_anim_global(
@@ -1029,7 +980,6 @@ pub fn compute_skinning_matrices(
         );
     }
 
-    // Generate debug skeleton lines in Skin Space (x, z, -y)
     let mut debug_lines = Vec::new();
     let magenta = [1.0, 0.0, 1.0, 1.0];
     let cyan = [0.0, 1.0, 1.0, 1.0];

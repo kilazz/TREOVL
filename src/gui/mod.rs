@@ -66,12 +66,24 @@ pub struct AppState {
     pub active_mesh: Option<ActiveMeshPreview>,
     pub filter_generation: u64,
     pub is_skinning_enabled: bool,
+    pub is_root_motion_enabled: bool,
+    pub show_mesh: bool,
+    pub show_skeleton: bool,
+    pub show_bone_names: bool,
+    pub show_wireframe: bool,
+    pub show_grid: bool,
 }
 
 impl AppState {
     pub fn new() -> Self {
         Self {
             is_skinning_enabled: true,
+            is_root_motion_enabled: false,
+            show_mesh: true,
+            show_skeleton: true,
+            show_bone_names: false,
+            show_wireframe: false,
+            show_grid: true,
             ..Default::default()
         }
     }

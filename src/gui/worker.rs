@@ -737,6 +737,115 @@ impl BackgroundWorker {
                 }
             }
 
+            WorkerCommand::ToggleRootMotion => {
+                let mut re_render_opt = None;
+                let is_enabled = {
+                    let mut st = self.state.lock().unwrap();
+                    st.is_root_motion_enabled = !st.is_root_motion_enabled;
+                    if let Some(ref mut preview) = st.active_mesh {
+                        re_render_opt = Some((preview.clone(), st.camera));
+                    }
+                    st.is_root_motion_enabled
+                };
+
+                let ui_h = self.ui_handle.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_h.upgrade() {
+                        ui.set_is_root_motion_enabled(is_enabled);
+                    }
+                });
+
+                if let Some((mut preview, cam)) = re_render_opt {
+                    self.evaluate_and_render_animated_frame(&mut preview, &cam);
+                }
+            }
+
+            WorkerCommand::ToggleMeshVis => {
+                let (preview_opt, val) = {
+                    let mut st = self.state.lock().unwrap();
+                    st.show_mesh = !st.show_mesh;
+                    (st.active_mesh.clone(), st.show_mesh)
+                };
+                let ui_h = self.ui_handle.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_h.upgrade() {
+                        ui.set_show_mesh(val);
+                    }
+                });
+                if let Some(mut p) = preview_opt {
+                    let cam = self.state.lock().unwrap().camera;
+                    self.evaluate_and_render_animated_frame(&mut p, &cam);
+                }
+            }
+            WorkerCommand::ToggleSkeletonVis => {
+                let (preview_opt, val) = {
+                    let mut st = self.state.lock().unwrap();
+                    st.show_skeleton = !st.show_skeleton;
+                    (st.active_mesh.clone(), st.show_skeleton)
+                };
+                let ui_h = self.ui_handle.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_h.upgrade() {
+                        ui.set_show_skeleton(val);
+                    }
+                });
+                if let Some(mut p) = preview_opt {
+                    let cam = self.state.lock().unwrap().camera;
+                    self.evaluate_and_render_animated_frame(&mut p, &cam);
+                }
+            }
+            WorkerCommand::ToggleBoneNames => {
+                let (preview_opt, val) = {
+                    let mut st = self.state.lock().unwrap();
+                    st.show_bone_names = !st.show_bone_names;
+                    (st.active_mesh.clone(), st.show_bone_names)
+                };
+                let ui_h = self.ui_handle.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_h.upgrade() {
+                        ui.set_show_bone_names(val);
+                    }
+                });
+                if let Some(mut p) = preview_opt {
+                    let cam = self.state.lock().unwrap().camera;
+                    self.evaluate_and_render_animated_frame(&mut p, &cam);
+                }
+            }
+            WorkerCommand::ToggleWireframe => {
+                let (preview_opt, val) = {
+                    let mut st = self.state.lock().unwrap();
+                    st.show_wireframe = !st.show_wireframe;
+                    (st.active_mesh.clone(), st.show_wireframe)
+                };
+                let ui_h = self.ui_handle.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_h.upgrade() {
+                        ui.set_show_wireframe(val);
+                    }
+                });
+                if let Some(mut p) = preview_opt {
+                    let cam = self.state.lock().unwrap().camera;
+                    self.evaluate_and_render_animated_frame(&mut p, &cam);
+                }
+            }
+            WorkerCommand::ToggleGrid => {
+                let (preview_opt, val) = {
+                    let mut st = self.state.lock().unwrap();
+                    st.show_grid = !st.show_grid;
+                    (st.active_mesh.clone(), st.show_grid)
+                };
+                let ui_h = self.ui_handle.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_h.upgrade() {
+                        ui.set_show_grid(val);
+                    }
+                });
+                if let Some(mut p) = preview_opt {
+                    let cam = self.state.lock().unwrap().camera;
+                    self.evaluate_and_render_animated_frame(&mut p, &cam);
+                }
+            }
+
             WorkerCommand::RotateMeshViewport {
                 delta_yaw,
                 delta_pitch,
@@ -1664,8 +1773,28 @@ impl BackgroundWorker {
         cam: &ViewportCamera,
     ) {
         let mut debug_lines = Vec::new();
+        let mut bone_labels = Vec::new();
 
-        let is_skinning = self.state.lock().unwrap().is_skinning_enabled;
+        let (
+            is_skinning,
+            _is_root_motion,
+            show_mesh,
+            show_skeleton,
+            show_names,
+            show_wire,
+            show_grid,
+        ) = {
+            let st = self.state.lock().unwrap();
+            (
+                st.is_skinning_enabled,
+                st.is_root_motion_enabled,
+                st.show_mesh,
+                st.show_skeleton,
+                st.show_bone_names,
+                st.show_wireframe,
+                st.show_grid,
+            )
+        };
 
         if let Some(clip_idx) = preview.current_clip_index
             && let Some(clip) = preview.available_clips.get(clip_idx)
@@ -1676,19 +1805,21 @@ impl BackgroundWorker {
                 if !sm.bones.is_empty() && !sm.weights.is_empty() {
                     let (skin_matrices, lines) = compute_skinning_matrices(&sm.bones, clip, t);
 
-                    for mut line_vert in lines {
-                        let p = Vector3 {
-                            x: line_vert.position[0],
-                            y: line_vert.position[1],
-                            z: line_vert.position[2],
-                        };
-                        let tp = match cam.up_axis {
-                            1 => [p.x, -p.z, p.y],
-                            2 => [p.x, p.z, -p.y],
-                            _ => [p.x, p.y, p.z],
-                        };
-                        line_vert.position = tp;
-                        debug_lines.push(line_vert);
+                    if show_skeleton {
+                        for mut line_vert in lines {
+                            let p = Vector3 {
+                                x: line_vert.position[0],
+                                y: line_vert.position[1],
+                                z: line_vert.position[2],
+                            };
+                            let tp = match cam.up_axis {
+                                1 => [p.x, -p.z, p.y],
+                                2 => [p.x, p.z, -p.y],
+                                _ => [p.x, p.y, p.z],
+                            };
+                            line_vert.position = tp;
+                            debug_lines.push(line_vert);
+                        }
                     }
 
                     if is_skinning {
@@ -1709,32 +1840,100 @@ impl BackgroundWorker {
             }
         }
 
-        let draw_data: Vec<SubmeshDrawData> = preview
-            .submeshes
-            .iter()
-            .map(|sm| SubmeshDrawData {
-                positions: &sm.positions,
-                indices: &sm.indices,
-                normals: &sm.normals,
-                uvs: &sm.uvs,
-                texture: sm.texture.as_ref().map(|t| TextureData {
-                    width: t.0,
-                    height: t.1,
-                    rgba: &t.2,
-                }),
-            })
-            .collect();
+        if show_names && !preview.submeshes.is_empty() {
+            let width = 1024.0f32;
+            let height = 1024.0f32;
+            let aspect = width / height;
+            let fov_rad = cam.fov_degrees.to_radians();
+            let proj = perspective_rh_zo(fov_rad, aspect, 0.1, 2000.0);
 
-        let buf =
-            self.gpu_renderer
-                .as_mut()
-                .unwrap()
-                .render(&draw_data, &debug_lines, (1024, 1024), cam);
+            let mut min = glam::Vec3::splat(f32::INFINITY);
+            let mut max = glam::Vec3::splat(f32::NEG_INFINITY);
+            for sm in &preview.submeshes {
+                for &p in &sm.positions {
+                    let tp = match cam.up_axis {
+                        1 => glam::Vec3::new(p.x, -p.z, p.y),
+                        2 => glam::Vec3::new(p.x, p.z, -p.y),
+                        _ => glam::Vec3::new(p.x, p.y, p.z),
+                    };
+                    min = min.min(tp);
+                    max = max.max(tp);
+                }
+            }
+            let center = if min.x.is_finite() {
+                (min + max) * 0.5
+            } else {
+                glam::Vec3::ZERO
+            };
+            let eye = center
+                + glam::Vec3::new(
+                    cam.yaw.sin() * cam.pitch.cos() * cam.distance,
+                    cam.pitch.sin() * cam.distance,
+                    cam.yaw.cos() * cam.pitch.cos() * cam.distance,
+                );
+            let view = look_at_rh(eye, center, glam::Vec3::Y);
+            let view_proj = proj * view;
+
+            if let Some(clip_idx) = preview.current_clip_index
+                && let Some(clip) = preview.available_clips.get(clip_idx)
+                && let Some(sm) = preview.submeshes.first()
+            {
+                let (_, lines) =
+                    compute_skinning_matrices(&sm.bones, clip, preview.current_time_seconds);
+                for (b_idx, bone) in sm.bones.iter().enumerate() {
+                    if b_idx * 2 < lines.len() {
+                        let bp = lines[b_idx * 2].position;
+                        let world_pos = glam::Vec4::new(bp[0], bp[1], bp[2], 1.0);
+                        let clip_pos = view_proj * world_pos;
+                        if clip_pos.w > 0.0 {
+                            let ndc = clip_pos.truncate() / clip_pos.w;
+                            let sx = (ndc.x * 0.5 + 0.5) * width;
+                            let sy = (1.0 - (ndc.y * 0.5 + 0.5)) * height;
+                            bone_labels.push(crate::BoneLabel {
+                                name: bone.name.clone().into(),
+                                x: sx,
+                                y: sy,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        let draw_data: Vec<SubmeshDrawData> = if show_mesh {
+            preview
+                .submeshes
+                .iter()
+                .map(|sm| SubmeshDrawData {
+                    positions: &sm.positions,
+                    indices: &sm.indices,
+                    normals: &sm.normals,
+                    uvs: &sm.uvs,
+                    texture: sm.texture.as_ref().map(|t| TextureData {
+                        width: t.0,
+                        height: t.1,
+                        rgba: &t.2,
+                    }),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let buf = self.gpu_renderer.as_mut().unwrap().render(
+            &draw_data,
+            &debug_lines,
+            show_grid,
+            show_wire,
+            (1024, 1024),
+            cam,
+        );
 
         let ui_h = self.ui_handle.clone();
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(ui) = ui_h.upgrade() {
                 ui.set_mesh_preview(Image::from_rgba8(buf));
+                ui.set_bone_labels(ModelRc::from(std::rc::Rc::new(VecModel::from(bone_labels))));
             }
         });
     }
@@ -1835,6 +2034,53 @@ impl BackgroundWorker {
             }
         });
     }
+}
+
+// Helper projections for bone name overlay
+fn perspective_rh_zo(fov_y_radians: f32, aspect_ratio: f32, z_near: f32, z_far: f32) -> glam::Mat4 {
+    let f = 1.0 / (fov_y_radians / 2.0).tan();
+    glam::Mat4::from_cols_array(&[
+        f / aspect_ratio,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        f,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        z_far / (z_near - z_far),
+        -1.0,
+        0.0,
+        0.0,
+        (z_far * z_near) / (z_near - z_far),
+        0.0,
+    ])
+}
+
+fn look_at_rh(eye: glam::Vec3, center: glam::Vec3, up: glam::Vec3) -> glam::Mat4 {
+    let f = (center - eye).normalize();
+    let s = f.cross(up).normalize();
+    let u = s.cross(f);
+    glam::Mat4::from_cols_array(&[
+        s.x,
+        u.x,
+        -f.x,
+        0.0,
+        s.y,
+        u.y,
+        -f.y,
+        0.0,
+        s.z,
+        u.z,
+        -f.z,
+        0.0,
+        -eye.dot(s),
+        -eye.dot(u),
+        eye.dot(f),
+        1.0,
+    ])
 }
 
 // -----------------------------------------------------------------------------

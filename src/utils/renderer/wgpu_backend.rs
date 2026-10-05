@@ -198,7 +198,6 @@ impl WgpuRenderer {
             ..Default::default()
         });
 
-        // 1x1 neutral gray fallback texture
         let fallback_extent = wgpu::Extent3d {
             width: 1,
             height: 1,
@@ -424,11 +423,13 @@ impl WgpuRenderer {
         });
     }
 
-    /// Renders single or multiple submeshes (composite character/object) in a single pass.
+    /// Renders single or multiple submeshes with support for wireframe, grid, and skeleton debug lines.
     pub fn render(
         &mut self,
         submeshes: &[SubmeshDrawData],
         debug_lines: &[GridVertex],
+        show_grid: bool,
+        show_wire: bool,
         size: (u32, u32),
         cam: &ViewportCamera,
     ) -> SharedPixelBuffer<Rgba8Pixel> {
@@ -512,7 +513,10 @@ impl WgpuRenderer {
             2.0
         };
 
-        let mut all_lines = build_gpu_grid_vertices(center, floor_y, model_radius);
+        let mut all_lines = Vec::new();
+        if show_grid {
+            all_lines = build_gpu_grid_vertices(center, floor_y, model_radius);
+        }
         all_lines.extend_from_slice(debug_lines);
 
         let grid_buffer = self
@@ -526,7 +530,9 @@ impl WgpuRenderer {
         struct PreparedSubmesh {
             vertex_buffer: wgpu::Buffer,
             index_buffer: wgpu::Buffer,
+            wire_buffer: Option<wgpu::Buffer>,
             index_count: u32,
+            wire_count: u32,
             bind_group: wgpu::BindGroup,
         }
 
@@ -571,6 +577,52 @@ impl WgpuRenderer {
                     contents: bytemuck::cast_slice(sm.indices),
                     usage: wgpu::BufferUsages::INDEX,
                 });
+
+            // Generate wireframe edges if requested
+            let (wire_buffer, wire_count) = if show_wire {
+                let mut wire_vertices = Vec::with_capacity(sm.indices.len() * 2);
+                for tri in sm.indices.as_chunks::<3>().0 {
+                    let p0 = transform_pos(sm.positions[tri[0] as usize]);
+                    let p1 = transform_pos(sm.positions[tri[1] as usize]);
+                    let p2 = transform_pos(sm.positions[tri[2] as usize]);
+                    let color = [0.85, 0.9, 1.0, 0.85];
+                    wire_vertices.push(GridVertex {
+                        position: p0,
+                        color,
+                    });
+                    wire_vertices.push(GridVertex {
+                        position: p1,
+                        color,
+                    });
+                    wire_vertices.push(GridVertex {
+                        position: p1,
+                        color,
+                    });
+                    wire_vertices.push(GridVertex {
+                        position: p2,
+                        color,
+                    });
+                    wire_vertices.push(GridVertex {
+                        position: p2,
+                        color,
+                    });
+                    wire_vertices.push(GridVertex {
+                        position: p0,
+                        color,
+                    });
+                }
+                let w_buf = self
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("Submesh Wireframe Buffer"),
+                        contents: bytemuck::cast_slice(&wire_vertices),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    });
+                let count = wire_vertices.len() as u32;
+                (Some(w_buf), count)
+            } else {
+                (None, 0)
+            };
 
             let bind_group = if let Some(ref t) = sm.texture {
                 let texture_extent = wgpu::Extent3d {
@@ -628,7 +680,9 @@ impl WgpuRenderer {
             prepared_submeshes.push(PreparedSubmesh {
                 vertex_buffer,
                 index_buffer,
+                wire_buffer,
                 index_count: sm.indices.len() as u32,
+                wire_count,
                 bind_group,
             });
         }
@@ -678,14 +732,27 @@ impl WgpuRenderer {
                 render_pass.draw(0..all_lines.len() as u32, 0..1);
             }
 
-            render_pass.set_pipeline(&self.mesh_pipeline);
-            render_pass.set_bind_group(0, &self.scene_bind_group, &[]);
+            if !show_wire {
+                render_pass.set_pipeline(&self.mesh_pipeline);
+                render_pass.set_bind_group(0, &self.scene_bind_group, &[]);
 
-            for psm in &prepared_submeshes {
-                render_pass.set_bind_group(1, &psm.bind_group, &[]);
-                render_pass.set_vertex_buffer(0, psm.vertex_buffer.slice(..));
-                render_pass.set_index_buffer(psm.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..psm.index_count, 0, 0..1);
+                for psm in &prepared_submeshes {
+                    render_pass.set_bind_group(1, &psm.bind_group, &[]);
+                    render_pass.set_vertex_buffer(0, psm.vertex_buffer.slice(..));
+                    render_pass
+                        .set_index_buffer(psm.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    render_pass.draw_indexed(0..psm.index_count, 0, 0..1);
+                }
+            } else {
+                render_pass.set_pipeline(&self.grid_pipeline);
+                render_pass.set_bind_group(0, &self.scene_bind_group, &[]);
+
+                for psm in &prepared_submeshes {
+                    if let Some(ref w_buf) = psm.wire_buffer {
+                        render_pass.set_vertex_buffer(0, w_buf.slice(..));
+                        render_pass.draw(0..psm.wire_count, 0..1);
+                    }
+                }
             }
         }
 

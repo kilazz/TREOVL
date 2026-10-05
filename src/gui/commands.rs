@@ -54,7 +54,13 @@ pub enum WorkerCommand {
     },
     ResetViewportCamera,
     ToggleCompositeView,
-    ToggleSkinning, // Allows debugging rig independently from mesh deformation
+    ToggleSkinning,
+    ToggleRootMotion,
+    ToggleMeshVis,
+    ToggleSkeletonVis,
+    ToggleBoneNames,
+    ToggleWireframe,
+    ToggleGrid,
     FilterAssets {
         query: String,
         generation: u64,

@@ -85,6 +85,36 @@ pub fn register(
         let _ = tx_skin.send(WorkerCommand::ToggleSkinning);
     });
 
+    let tx_root_motion = tx.clone();
+    ui.on_toggle_root_motion(move || {
+        let _ = tx_root_motion.send(WorkerCommand::ToggleRootMotion);
+    });
+
+    let tx_m_vis = tx.clone();
+    ui.on_toggle_mesh_vis(move || {
+        let _ = tx_m_vis.send(WorkerCommand::ToggleMeshVis);
+    });
+
+    let tx_s_vis = tx.clone();
+    ui.on_toggle_skeleton_vis(move || {
+        let _ = tx_s_vis.send(WorkerCommand::ToggleSkeletonVis);
+    });
+
+    let tx_b_names = tx.clone();
+    ui.on_toggle_bone_names(move || {
+        let _ = tx_b_names.send(WorkerCommand::ToggleBoneNames);
+    });
+
+    let tx_wire = tx.clone();
+    ui.on_toggle_wireframe(move || {
+        let _ = tx_wire.send(WorkerCommand::ToggleWireframe);
+    });
+
+    let tx_grid = tx.clone();
+    ui.on_toggle_grid(move || {
+        let _ = tx_grid.send(WorkerCommand::ToggleGrid);
+    });
+
     // Real-Time Viewport Animation Playback Callbacks
     let tx_anim_sel = tx.clone();
     ui.on_select_active_animation(move |clip_idx| {
