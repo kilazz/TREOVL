@@ -24,6 +24,15 @@ struct SceneUniform {
     params: [f32; 4], // x: lighting_mode, y: ambient_boost, z, w: padding
 }
 
+/// Render descriptor for an individual submesh in a single or composite draw call
+pub struct SubmeshDrawData<'a> {
+    pub positions: &'a [Vector3],
+    pub indices: &'a [u32],
+    pub normals: &'a [Vector3],
+    pub uvs: &'a [Vector2],
+    pub texture: Option<TextureData<'a>>,
+}
+
 fn perspective_rh_zo(fov_y_radians: f32, aspect_ratio: f32, z_near: f32, z_far: f32) -> Mat4 {
     let f = 1.0 / (fov_y_radians / 2.0).tan();
     Mat4::from_cols_array(&[
@@ -118,7 +127,6 @@ impl WgpuRenderer {
             .await
             .expect("TREOVL: Failed to create WGPU device");
 
-        // Compile-time embedded shader with full IDE syntax support
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("TREOVL Main Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
@@ -187,13 +195,14 @@ impl WgpuRenderer {
             ..Default::default()
         });
 
+        // 1x1 neutral gray fallback texture
         let fallback_extent = wgpu::Extent3d {
             width: 1,
             height: 1,
             depth_or_array_layers: 1,
         };
         let fallback_tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("1x1 Fallback Texture"),
+            label: Some("1x1 Neutral Gray Texture"),
             size: fallback_extent,
             mip_level_count: 1,
             sample_count: 1,
@@ -210,7 +219,7 @@ impl WgpuRenderer {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            &[200u8, 200, 200, 255],
+            &[185u8, 190, 200, 255],
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(4),
@@ -236,7 +245,6 @@ impl WgpuRenderer {
             ],
         });
 
-        // 1. Mesh Pipeline (Double-Sided)
         let mesh_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Mesh Pipeline Layout"),
             bind_group_layouts: &[
@@ -271,7 +279,7 @@ impl WgpuRenderer {
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None, // Double-Sided rendering
+                cull_mode: None,
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
@@ -286,7 +294,6 @@ impl WgpuRenderer {
             cache: None,
         });
 
-        // 2. 3D Ground Grid Line Pipeline
         let grid_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Grid Pipeline Layout"),
             bind_group_layouts: &[Some(&scene_bind_group_layout)],
@@ -412,69 +419,34 @@ impl WgpuRenderer {
         });
     }
 
-    /// Renders the 3D model, the 3D depth-tested ground grid, and the orientation gizmo.
-    #[allow(clippy::too_many_arguments)]
+    /// Renders single or multiple submeshes (composite character/object) in a single pass.
     pub fn render(
         &mut self,
-        positions: &[Vector3],
-        indices: &[u32],
-        normals: &[Vector3],
-        uvs: &[Vector2],
-        texture: Option<&TextureData>,
+        submeshes: &[SubmeshDrawData],
         size: (u32, u32),
         cam: &ViewportCamera,
     ) -> SharedPixelBuffer<Rgba8Pixel> {
         let (width, height) = size;
         self.ensure_render_targets(width, height);
 
-        let vertices: Vec<Vertex> = positions
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                let n = normals.get(i).copied().unwrap_or(Vector3 {
-                    x: 0.0,
-                    y: 1.0,
-                    z: 0.0,
-                });
-                let uv = uvs.get(i).copied().unwrap_or(Vector2 { x: 0.0, y: 0.0 });
-                Vertex {
-                    position: [p.x, p.y, p.z],
-                    normal: [n.x, n.y, n.z],
-                    tex_coords: [uv.x, uv.y],
-                }
-            })
-            .collect();
-
-        let vertex_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Mesh Vertex Buffer"),
-                contents: bytemuck::cast_slice(&vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-
-        let index_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Mesh Index Buffer"),
-                contents: bytemuck::cast_slice(indices),
-                usage: wgpu::BufferUsages::INDEX,
-            });
-
         let mut min = Vec3::splat(f32::INFINITY);
         let mut max = Vec3::splat(f32::NEG_INFINITY);
-        for p in positions {
-            min.x = min.x.min(p.x);
-            min.y = min.y.min(p.y);
-            min.z = min.z.min(p.z);
-            max.x = max.x.max(p.x);
-            max.y = max.y.max(p.y);
-            max.z = max.z.max(p.z);
+
+        for sm in submeshes {
+            for p in sm.positions {
+                min.x = min.x.min(p.x);
+                min.y = min.y.min(p.y);
+                min.z = min.z.min(p.z);
+                max.x = max.x.max(p.x);
+                max.y = max.y.max(p.y);
+                max.z = max.z.max(p.z);
+            }
         }
-        let center = if positions.is_empty() {
-            Vec3::ZERO
-        } else {
+
+        let center = if min.x.is_finite() {
             (min + max) * 0.5
+        } else {
+            Vec3::ZERO
         };
 
         let aspect = width as f32 / height as f32;
@@ -516,59 +488,115 @@ impl WgpuRenderer {
                 usage: wgpu::BufferUsages::VERTEX,
             });
 
-        let custom_tex_bind_group = texture.map(|t| {
-            let texture_extent = wgpu::Extent3d {
-                width: t.width,
-                height: t.height,
-                depth_or_array_layers: 1,
+        struct PreparedSubmesh {
+            vertex_buffer: wgpu::Buffer,
+            index_buffer: wgpu::Buffer,
+            index_count: u32,
+            bind_group: wgpu::BindGroup,
+        }
+
+        let mut prepared_submeshes = Vec::with_capacity(submeshes.len());
+
+        for sm in submeshes {
+            if sm.indices.is_empty() {
+                continue;
+            }
+
+            let vertices: Vec<Vertex> = sm
+                .positions
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let n = sm.normals.get(i).copied().unwrap_or(Vector3 {
+                        x: 0.0,
+                        y: 1.0,
+                        z: 0.0,
+                    });
+                    let uv = sm.uvs.get(i).copied().unwrap_or(Vector2 { x: 0.0, y: 0.0 });
+                    Vertex {
+                        position: [p.x, p.y, p.z],
+                        normal: [n.x, n.y, n.z],
+                        tex_coords: [uv.x, uv.y],
+                    }
+                })
+                .collect();
+
+            let vertex_buffer = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Submesh Vertex Buffer"),
+                    contents: bytemuck::cast_slice(&vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+
+            let index_buffer = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Submesh Index Buffer"),
+                    contents: bytemuck::cast_slice(sm.indices),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+
+            let bind_group = if let Some(ref t) = sm.texture {
+                let texture_extent = wgpu::Extent3d {
+                    width: t.width,
+                    height: t.height,
+                    depth_or_array_layers: 1,
+                };
+                let wgpu_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("Submesh Texture"),
+                    size: texture_extent,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+
+                self.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &wgpu_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    t.rgba,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(t.width * 4),
+                        rows_per_image: Some(t.height),
+                    },
+                    texture_extent,
+                );
+
+                let texture_view =
+                    wgpu_texture.create_view(&wgpu::TextureViewDescriptor::default());
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Submesh Texture Bind Group"),
+                    layout: &self.texture_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&texture_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&self.default_sampler),
+                        },
+                    ],
+                })
+            } else {
+                self.default_texture_bind_group.clone()
             };
-            let wgpu_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Model Diffuse Texture"),
-                size: texture_extent,
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
+
+            prepared_submeshes.push(PreparedSubmesh {
+                vertex_buffer,
+                index_buffer,
+                index_count: sm.indices.len() as u32,
+                bind_group,
             });
-
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &wgpu_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                t.rgba,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(t.width * 4),
-                    rows_per_image: Some(t.height),
-                },
-                texture_extent,
-            );
-
-            let texture_view = wgpu_texture.create_view(&wgpu::TextureViewDescriptor::default());
-            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Custom Texture Bind Group"),
-                layout: &self.texture_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&texture_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.default_sampler),
-                    },
-                ],
-            })
-        });
-
-        let active_tex_bind_group = custom_tex_bind_group
-            .as_ref()
-            .unwrap_or(&self.default_texture_bind_group);
+        }
 
         let targets = self.target_cache.as_ref().unwrap();
 
@@ -608,7 +636,7 @@ impl WgpuRenderer {
                 multiview_mask: None,
             });
 
-            // 1. Render 3D Ground Grid (Hardware Depth-tested)
+            // 1. Render Ground Grid
             if !grid_verts.is_empty() {
                 render_pass.set_pipeline(&self.grid_pipeline);
                 render_pass.set_bind_group(0, &self.scene_bind_group, &[]);
@@ -616,14 +644,15 @@ impl WgpuRenderer {
                 render_pass.draw(0..grid_verts.len() as u32, 0..1);
             }
 
-            // 2. Render 3D Mesh (Double-Sided, naturally occluding grid)
-            if !indices.is_empty() {
-                render_pass.set_pipeline(&self.mesh_pipeline);
-                render_pass.set_bind_group(0, &self.scene_bind_group, &[]);
-                render_pass.set_bind_group(1, active_tex_bind_group, &[]);
-                render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-                render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
+            // 2. Render all submeshes in composite
+            render_pass.set_pipeline(&self.mesh_pipeline);
+            render_pass.set_bind_group(0, &self.scene_bind_group, &[]);
+
+            for psm in &prepared_submeshes {
+                render_pass.set_bind_group(1, &psm.bind_group, &[]);
+                render_pass.set_vertex_buffer(0, psm.vertex_buffer.slice(..));
+                render_pass.set_index_buffer(psm.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..psm.index_count, 0, 0..1);
             }
         }
 
@@ -684,7 +713,7 @@ impl WgpuRenderer {
         drop(data);
         targets.output_buffer.unmap();
 
-        // 3. Render 3D coordinate orientation gizmo in top-right corner
+        // 3. Render 3D coordinate orientation gizmo
         render_axis_gizmo(dst, width, height, cam);
 
         pixel_buffer

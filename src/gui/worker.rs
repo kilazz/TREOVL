@@ -8,11 +8,12 @@ use crate::engine::assets::sniffer::AssetKind;
 use crate::engine::math::Vector3;
 use crate::engine::service;
 use crate::gui::commands::WorkerCommand;
-use crate::gui::{ActiveMeshPreview, AppState, resolve_project_dir, scan_project_folder};
+use crate::gui::{
+    ActiveMeshPreview, AppState, RenderSubmesh, resolve_project_dir, scan_project_folder,
+};
 use crate::utils::dds_decoder;
 use crate::utils::logger::UiLogger;
-use crate::utils::renderer::TextureData;
-use crate::utils::renderer::wgpu_backend::WgpuRenderer;
+use crate::utils::renderer::{SubmeshDrawData, TextureData, ViewportCamera, WgpuRenderer};
 
 pub struct ResolvedTexture {
     pub filename: String,
@@ -129,7 +130,10 @@ impl BackgroundWorker {
                 let bytes = fs::read(&path).unwrap_or_default();
                 let path_str = path.to_string_lossy().to_string();
 
-                if kind != AssetKind::Mesh {
+                if kind != AssetKind::Mesh
+                    && kind != AssetKind::Object
+                    && kind != AssetKind::Character
+                {
                     let mut st = self.state.lock().unwrap();
                     st.active_mesh = None;
                 }
@@ -176,151 +180,158 @@ impl BackgroundWorker {
                         });
                     }
                     AssetKind::Mesh => {
-                        let mut mesh_info = String::from("Failed to parse mesh buffer");
-                        let mut mesh_buf = None;
-                        let mut has_mesh = false;
-                        let mut stats_lines: Vec<slint::SharedString> = Vec::new();
+                        let proj_dir = {
+                            let st = self.state.lock().unwrap();
+                            st.current_proj_dir.clone()
+                        };
 
-                        if let Ok(parsed) =
-                            crate::engine::assets::mesh::extract_mesh_geometry(&bytes)
+                        let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+                        if let Some(submesh) =
+                            load_mesh_with_smart_texture(&bytes, &stem, proj_dir.as_deref())
                         {
-                            let mut min = Vector3 {
-                                x: f32::INFINITY,
-                                y: f32::INFINITY,
-                                z: f32::INFINITY,
-                            };
-                            let mut max = Vector3 {
-                                x: f32::NEG_INFINITY,
-                                y: f32::NEG_INFINITY,
-                                z: f32::NEG_INFINITY,
-                            };
-                            for p in &parsed.positions {
-                                min.x = min.x.min(p.x);
-                                min.y = min.y.min(p.y);
-                                min.z = min.z.min(p.z);
-                                max.x = max.x.max(p.x);
-                                max.y = max.y.max(p.y);
-                                max.z = max.z.max(p.z);
-                            }
+                            let (_, has_composite) =
+                                build_composite_mesh_assembly(&stem, proj_dir.as_deref());
 
-                            let sx = (max.x - min.x).abs();
-                            let sy = (max.y - min.y).abs();
-                            let sz = (max.z - min.z).abs();
-
-                            let resolved_tex = {
-                                let st = self.state.lock().unwrap();
-                                resolve_diffuse_texture(st.current_proj_dir.as_deref())
-                            };
-
-                            let tex_desc = if let Some(ref t) = resolved_tex {
-                                let clean_name =
-                                    t.filename.split("_chunk_").next().unwrap_or(&t.filename);
-                                format!("Texture: {} ({}×{})", clean_name, t.width, t.height)
-                            } else {
-                                "Texture: None (Hardware Unlit)".to_string()
-                            };
-
-                            mesh_info = format!(
-                                "Verts: {} | Tris: {} | Size: {:.2}m × {:.2}m × {:.2}m",
-                                parsed.positions.len(),
-                                parsed.indices.len() / 3,
-                                sx,
-                                sy,
-                                sz
+                            let stats_lines = build_stats_lines(std::slice::from_ref(&submesh));
+                            let mesh_info = format!(
+                                "Verts: {} | Tris: {}",
+                                submesh.positions.len(),
+                                submesh.indices.len() / 3
                             );
 
-                            stats_lines
-                                .push(format!("Vertices: {}", parsed.positions.len()).into());
-                            stats_lines
-                                .push(format!("Triangles: {}", parsed.indices.len() / 3).into());
-                            stats_lines
-                                .push(format!("Size: {:.2}m × {:.2}m × {:.2}m", sx, sy, sz).into());
-                            stats_lines.push(
-                                format!("Bounds Min: [{:.2}, {:.2}, {:.2}]", min.x, min.y, min.z)
-                                    .into(),
-                            );
-                            stats_lines.push(
-                                format!("Bounds Max: [{:.2}, {:.2}, {:.2}]", max.x, max.y, max.z)
-                                    .into(),
-                            );
-                            stats_lines.push(format!("Stride: {} bytes", parsed.stride).into());
-                            stats_lines.push(
-                                format!(
-                                    "Skinning: {}",
-                                    if parsed.is_skinned {
-                                        "Skinned Rig"
-                                    } else {
-                                        "Static Mesh"
-                                    }
-                                )
-                                .into(),
-                            );
-                            stats_lines.push(tex_desc.into());
-
-                            let tex_arc =
-                                resolved_tex.map(|t| Arc::new((t.width, t.height, t.rgba)));
-
-                            // Auto-fit camera distance based on bounding box
-                            let max_dim = sx.max(sy).max(sz).max(1.0);
-                            let auto_dist = (max_dim * 1.75).clamp(1.5, 300.0);
-
-                            let cam = {
-                                let mut st = self.state.lock().unwrap();
-                                st.camera.distance = auto_dist;
-                                st.camera.target = Vector3 {
-                                    x: (min.x + max.x) * 0.5,
-                                    y: (min.y + max.y) * 0.5,
-                                    z: (min.z + max.z) * 0.5,
-                                };
-                                st.active_mesh = Some(ActiveMeshPreview {
-                                    positions: parsed.positions.clone(),
-                                    indices: parsed.indices.clone(),
-                                    normals: parsed.normals.clone(),
-                                    uvs: parsed.uvs.clone(),
-                                    texture: tex_arc.clone(),
-                                });
-                                st.camera
+                            let preview = ActiveMeshPreview {
+                                submeshes: vec![submesh],
+                                is_composite: false,
+                                composite_name: stem.to_string(),
                             };
 
-                            let tex_ref = tex_arc.as_ref().map(|t| TextureData {
-                                width: t.0,
-                                height: t.1,
-                                rgba: &t.2,
-                            });
+                            let cam = self.center_camera_for_preview(&preview);
 
-                            // --- GPU Accelerated WGPU Render ---
+                            let draw_data: Vec<SubmeshDrawData> = preview
+                                .submeshes
+                                .iter()
+                                .map(|sm| SubmeshDrawData {
+                                    positions: &sm.positions,
+                                    indices: &sm.indices,
+                                    normals: &sm.normals,
+                                    uvs: &sm.uvs,
+                                    texture: sm.texture.as_ref().map(|t| TextureData {
+                                        width: t.0,
+                                        height: t.1,
+                                        rgba: &t.2,
+                                    }),
+                                })
+                                .collect();
+
                             let buf = self.gpu_renderer.as_mut().unwrap().render(
-                                &parsed.positions,
-                                &parsed.indices,
-                                &parsed.normals,
-                                &parsed.uvs,
-                                tex_ref.as_ref(),
+                                &draw_data,
                                 (1024, 1024),
                                 &cam,
                             );
 
-                            mesh_buf = Some(buf);
-                            has_mesh = true;
-                        }
+                            {
+                                let mut st = self.state.lock().unwrap();
+                                st.active_mesh = Some(preview);
+                            }
 
-                        let ui_h = self.ui_handle.clone();
-                        let _ = slint::invoke_from_event_loop(move || {
-                            if let Some(ui) = ui_h.upgrade() {
-                                ui.set_selected_index(filtered_index);
-                                ui.set_active_file_path(path_str.into());
-                                ui.set_active_kind_id(3);
-                                ui.set_mesh_info(mesh_info.into());
-                                ui.set_mesh_stats_lines(ModelRc::from(std::rc::Rc::new(
-                                    VecModel::from(stats_lines),
-                                )));
-                                if let Some(buf) = mesh_buf {
+                            let ui_h = self.ui_handle.clone();
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(ui) = ui_h.upgrade() {
+                                    ui.set_selected_index(filtered_index);
+                                    ui.set_active_file_path(path_str.into());
+                                    ui.set_active_kind_id(3);
+                                    ui.set_mesh_info(mesh_info.into());
+                                    ui.set_has_composite_available(has_composite);
+                                    ui.set_is_composite_active(false);
+                                    ui.set_mesh_stats_lines(ModelRc::from(std::rc::Rc::new(
+                                        VecModel::from(stats_lines),
+                                    )));
                                     ui.set_mesh_preview(Image::from_rgba8(buf));
                                     ui.set_has_mesh(true);
-                                } else {
-                                    ui.set_has_mesh(has_mesh);
                                 }
+                            });
+                        }
+                    }
+                    AssetKind::Object | AssetKind::Character => {
+                        let proj_dir = {
+                            let st = self.state.lock().unwrap();
+                            st.current_proj_dir.clone()
+                        };
+
+                        let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+                        let (composite_submeshes, has_composite) =
+                            build_composite_mesh_assembly(&stem, proj_dir.as_deref());
+
+                        let json = if kind == AssetKind::Character {
+                            crate::engine::assets::character::export_character_to_json(
+                                &bytes, None, &stem,
+                            )
+                            .unwrap_or_default()
+                        } else {
+                            crate::engine::assets::object::export_object_to_json(&bytes, None)
+                                .unwrap_or_default()
+                        };
+
+                        if has_composite && !composite_submeshes.is_empty() {
+                            let preview = ActiveMeshPreview {
+                                submeshes: composite_submeshes,
+                                is_composite: true,
+                                composite_name: stem.to_string(),
+                            };
+                            let cam = self.center_camera_for_preview(&preview);
+
+                            let draw_data: Vec<SubmeshDrawData> = preview
+                                .submeshes
+                                .iter()
+                                .map(|sm| SubmeshDrawData {
+                                    positions: &sm.positions,
+                                    indices: &sm.indices,
+                                    normals: &sm.normals,
+                                    uvs: &sm.uvs,
+                                    texture: sm.texture.as_ref().map(|t| TextureData {
+                                        width: t.0,
+                                        height: t.1,
+                                        rgba: &t.2,
+                                    }),
+                                })
+                                .collect();
+
+                            let buf = self.gpu_renderer.as_mut().unwrap().render(
+                                &draw_data,
+                                (1024, 1024),
+                                &cam,
+                            );
+
+                            {
+                                let mut st = self.state.lock().unwrap();
+                                st.active_mesh = Some(preview);
                             }
-                        });
+
+                            let ui_h = self.ui_handle.clone();
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(ui) = ui_h.upgrade() {
+                                    ui.set_selected_index(filtered_index);
+                                    ui.set_active_file_path(path_str.into());
+                                    ui.set_active_kind_id(7);
+                                    ui.set_mat_json_text(json.into());
+                                    ui.set_mesh_preview(Image::from_rgba8(buf));
+                                    ui.set_has_mesh(true);
+                                    ui.set_has_composite_available(true);
+                                    ui.set_is_composite_active(true);
+                                }
+                            });
+                        } else {
+                            let ui_h = self.ui_handle.clone();
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(ui) = ui_h.upgrade() {
+                                    ui.set_selected_index(filtered_index);
+                                    ui.set_active_file_path(path_str.into());
+                                    ui.set_active_kind_id(7);
+                                    ui.set_mat_json_text(json.into());
+                                    ui.set_has_composite_available(false);
+                                }
+                            });
+                        }
                     }
                     AssetKind::Audio => {
                         let ui_h = self.ui_handle.clone();
@@ -371,9 +382,9 @@ impl BackgroundWorker {
                             }
                         });
                     }
-                    AssetKind::Object | AssetKind::Character | AssetKind::Attachment => {
+                    AssetKind::Attachment => {
                         let json =
-                            crate::engine::assets::object::export_object_to_json(&bytes, None)
+                            crate::engine::assets::attachment::export_attachment_to_json(&bytes)
                                 .unwrap_or_default();
                         let ui_h = self.ui_handle.clone();
                         let _ = slint::invoke_from_event_loop(move || {
@@ -526,6 +537,70 @@ impl BackgroundWorker {
                 }
             }
 
+            WorkerCommand::ToggleCompositeView => {
+                let (proj_dir, active_preview_opt) = {
+                    let st = self.state.lock().unwrap();
+                    (st.current_proj_dir.clone(), st.active_mesh.clone())
+                };
+
+                if let Some(mut preview) = active_preview_opt {
+                    let stem = preview.composite_name.clone();
+                    let (composite_submeshes, has_composite) =
+                        build_composite_mesh_assembly(&stem, proj_dir.as_deref());
+
+                    if has_composite && !composite_submeshes.is_empty() {
+                        preview.is_composite = !preview.is_composite;
+                        if preview.is_composite {
+                            preview.submeshes = composite_submeshes;
+                        } else {
+                            preview.submeshes.truncate(1);
+                        }
+
+                        let cam = self.center_camera_for_preview(&preview);
+                        let is_comp_active = preview.is_composite;
+                        let stats_lines = build_stats_lines(&preview.submeshes);
+
+                        let draw_data: Vec<SubmeshDrawData> = preview
+                            .submeshes
+                            .iter()
+                            .map(|sm| SubmeshDrawData {
+                                positions: &sm.positions,
+                                indices: &sm.indices,
+                                normals: &sm.normals,
+                                uvs: &sm.uvs,
+                                texture: sm.texture.as_ref().map(|t| TextureData {
+                                    width: t.0,
+                                    height: t.1,
+                                    rgba: &t.2,
+                                }),
+                            })
+                            .collect();
+
+                        let buf = self.gpu_renderer.as_mut().unwrap().render(
+                            &draw_data,
+                            (1024, 1024),
+                            &cam,
+                        );
+
+                        {
+                            let mut st = self.state.lock().unwrap();
+                            st.active_mesh = Some(preview);
+                        }
+
+                        let ui_h = self.ui_handle.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_h.upgrade() {
+                                ui.set_is_composite_active(is_comp_active);
+                                ui.set_mesh_stats_lines(ModelRc::from(std::rc::Rc::new(
+                                    VecModel::from(stats_lines),
+                                )));
+                                ui.set_mesh_preview(Image::from_rgba8(buf));
+                            }
+                        });
+                    }
+                }
+            }
+
             WorkerCommand::RotateMeshViewport {
                 delta_yaw,
                 delta_pitch,
@@ -536,23 +611,27 @@ impl BackgroundWorker {
                     st.camera.pitch = (st.camera.pitch + delta_pitch).clamp(-1.45, 1.45);
                     let cam = st.camera;
 
-                    st.active_mesh.as_ref().map(|mesh| {
-                        let tex_ref = mesh.texture.as_ref().map(|t| TextureData {
-                            width: t.0,
-                            height: t.1,
-                            rgba: &t.2,
-                        });
+                    st.active_mesh.as_ref().map(|mesh_prev| {
+                        let draw_data: Vec<SubmeshDrawData> = mesh_prev
+                            .submeshes
+                            .iter()
+                            .map(|sm| SubmeshDrawData {
+                                positions: &sm.positions,
+                                indices: &sm.indices,
+                                normals: &sm.normals,
+                                uvs: &sm.uvs,
+                                texture: sm.texture.as_ref().map(|t| TextureData {
+                                    width: t.0,
+                                    height: t.1,
+                                    rgba: &t.2,
+                                }),
+                            })
+                            .collect();
 
-                        // Fast GPU render using persistent render targets & uniform updates
-                        self.gpu_renderer.as_mut().unwrap().render(
-                            &mesh.positions,
-                            &mesh.indices,
-                            &mesh.normals,
-                            &mesh.uvs,
-                            tex_ref.as_ref(),
-                            (1024, 1024),
-                            &cam,
-                        )
+                        self.gpu_renderer
+                            .as_mut()
+                            .unwrap()
+                            .render(&draw_data, (1024, 1024), &cam)
                     })
                 };
 
@@ -574,22 +653,27 @@ impl BackgroundWorker {
                     st.camera.zoom(factor);
                     let cam = st.camera;
 
-                    st.active_mesh.as_ref().map(|mesh| {
-                        let tex_ref = mesh.texture.as_ref().map(|t| TextureData {
-                            width: t.0,
-                            height: t.1,
-                            rgba: &t.2,
-                        });
+                    st.active_mesh.as_ref().map(|mesh_prev| {
+                        let draw_data: Vec<SubmeshDrawData> = mesh_prev
+                            .submeshes
+                            .iter()
+                            .map(|sm| SubmeshDrawData {
+                                positions: &sm.positions,
+                                indices: &sm.indices,
+                                normals: &sm.normals,
+                                uvs: &sm.uvs,
+                                texture: sm.texture.as_ref().map(|t| TextureData {
+                                    width: t.0,
+                                    height: t.1,
+                                    rgba: &t.2,
+                                }),
+                            })
+                            .collect();
 
-                        self.gpu_renderer.as_mut().unwrap().render(
-                            &mesh.positions,
-                            &mesh.indices,
-                            &mesh.normals,
-                            &mesh.uvs,
-                            tex_ref.as_ref(),
-                            (1024, 1024),
-                            &cam,
-                        )
+                        self.gpu_renderer
+                            .as_mut()
+                            .unwrap()
+                            .render(&draw_data, (1024, 1024), &cam)
                     })
                 };
 
@@ -609,22 +693,27 @@ impl BackgroundWorker {
                     st.camera.fov_degrees = fov_degrees.clamp(20.0, 90.0);
                     let cam = st.camera;
 
-                    st.active_mesh.as_ref().map(|mesh| {
-                        let tex_ref = mesh.texture.as_ref().map(|t| TextureData {
-                            width: t.0,
-                            height: t.1,
-                            rgba: &t.2,
-                        });
+                    st.active_mesh.as_ref().map(|mesh_prev| {
+                        let draw_data: Vec<SubmeshDrawData> = mesh_prev
+                            .submeshes
+                            .iter()
+                            .map(|sm| SubmeshDrawData {
+                                positions: &sm.positions,
+                                indices: &sm.indices,
+                                normals: &sm.normals,
+                                uvs: &sm.uvs,
+                                texture: sm.texture.as_ref().map(|t| TextureData {
+                                    width: t.0,
+                                    height: t.1,
+                                    rgba: &t.2,
+                                }),
+                            })
+                            .collect();
 
-                        self.gpu_renderer.as_mut().unwrap().render(
-                            &mesh.positions,
-                            &mesh.indices,
-                            &mesh.normals,
-                            &mesh.uvs,
-                            tex_ref.as_ref(),
-                            (1024, 1024),
-                            &cam,
-                        )
+                        self.gpu_renderer
+                            .as_mut()
+                            .unwrap()
+                            .render(&draw_data, (1024, 1024), &cam)
                     })
                 };
 
@@ -644,22 +733,27 @@ impl BackgroundWorker {
                     st.camera.lighting_mode = mode;
                     let cam = st.camera;
 
-                    st.active_mesh.as_ref().map(|mesh| {
-                        let tex_ref = mesh.texture.as_ref().map(|t| TextureData {
-                            width: t.0,
-                            height: t.1,
-                            rgba: &t.2,
-                        });
+                    st.active_mesh.as_ref().map(|mesh_prev| {
+                        let draw_data: Vec<SubmeshDrawData> = mesh_prev
+                            .submeshes
+                            .iter()
+                            .map(|sm| SubmeshDrawData {
+                                positions: &sm.positions,
+                                indices: &sm.indices,
+                                normals: &sm.normals,
+                                uvs: &sm.uvs,
+                                texture: sm.texture.as_ref().map(|t| TextureData {
+                                    width: t.0,
+                                    height: t.1,
+                                    rgba: &t.2,
+                                }),
+                            })
+                            .collect();
 
-                        self.gpu_renderer.as_mut().unwrap().render(
-                            &mesh.positions,
-                            &mesh.indices,
-                            &mesh.normals,
-                            &mesh.uvs,
-                            tex_ref.as_ref(),
-                            (1024, 1024),
-                            &cam,
-                        )
+                        self.gpu_renderer
+                            .as_mut()
+                            .unwrap()
+                            .render(&draw_data, (1024, 1024), &cam)
                     })
                 };
 
@@ -680,55 +774,28 @@ impl BackgroundWorker {
                     st.camera.pitch = 0.35;
                     st.camera.fov_degrees = 45.0;
 
-                    if let Some(ref mesh) = st.active_mesh {
-                        let mut min = Vector3 {
-                            x: f32::INFINITY,
-                            y: f32::INFINITY,
-                            z: f32::INFINITY,
-                        };
-                        let mut max = Vector3 {
-                            x: f32::NEG_INFINITY,
-                            y: f32::NEG_INFINITY,
-                            z: f32::NEG_INFINITY,
-                        };
-                        for p in &mesh.positions {
-                            min.x = min.x.min(p.x);
-                            min.y = min.y.min(p.y);
-                            min.z = min.z.min(p.z);
-                            max.x = max.x.max(p.x);
-                            max.y = max.y.max(p.y);
-                            max.z = max.z.max(p.z);
-                        }
-                        let sx = (max.x - min.x).abs();
-                        let sy = (max.y - min.y).abs();
-                        let sz = (max.z - min.z).abs();
-                        let max_dim = sx.max(sy).max(sz).max(1.0);
-                        st.camera.distance = (max_dim * 1.75).clamp(1.5, 300.0);
-                        st.camera.target = Vector3 {
-                            x: (min.x + max.x) * 0.5,
-                            y: (min.y + max.y) * 0.5,
-                            z: (min.z + max.z) * 0.5,
-                        };
-                    }
-
                     let cam = st.camera;
+                    st.active_mesh.as_ref().map(|mesh_prev| {
+                        let draw_data: Vec<SubmeshDrawData> = mesh_prev
+                            .submeshes
+                            .iter()
+                            .map(|sm| SubmeshDrawData {
+                                positions: &sm.positions,
+                                indices: &sm.indices,
+                                normals: &sm.normals,
+                                uvs: &sm.uvs,
+                                texture: sm.texture.as_ref().map(|t| TextureData {
+                                    width: t.0,
+                                    height: t.1,
+                                    rgba: &t.2,
+                                }),
+                            })
+                            .collect();
 
-                    st.active_mesh.as_ref().map(|mesh| {
-                        let tex_ref = mesh.texture.as_ref().map(|t| TextureData {
-                            width: t.0,
-                            height: t.1,
-                            rgba: &t.2,
-                        });
-
-                        self.gpu_renderer.as_mut().unwrap().render(
-                            &mesh.positions,
-                            &mesh.indices,
-                            &mesh.normals,
-                            &mesh.uvs,
-                            tex_ref.as_ref(),
-                            (1024, 1024),
-                            &cam,
-                        )
+                        self.gpu_renderer
+                            .as_mut()
+                            .unwrap()
+                            .render(&draw_data, (1024, 1024), &cam)
                     })
                 };
 
@@ -1565,6 +1632,45 @@ impl BackgroundWorker {
         }
     }
 
+    fn center_camera_for_preview(&self, preview: &ActiveMeshPreview) -> ViewportCamera {
+        let mut min = Vector3 {
+            x: f32::INFINITY,
+            y: f32::INFINITY,
+            z: f32::INFINITY,
+        };
+        let mut max = Vector3 {
+            x: f32::NEG_INFINITY,
+            y: f32::NEG_INFINITY,
+            z: f32::NEG_INFINITY,
+        };
+
+        for sm in &preview.submeshes {
+            for p in &sm.positions {
+                min.x = min.x.min(p.x);
+                min.y = min.y.min(p.y);
+                min.z = min.z.min(p.z);
+                max.x = max.x.max(p.x);
+                max.y = max.y.max(p.y);
+                max.z = max.z.max(p.z);
+            }
+        }
+
+        let sx = (max.x - min.x).abs();
+        let sy = (max.y - min.y).abs();
+        let sz = (max.z - min.z).abs();
+        let max_dim = sx.max(sy).max(sz).max(1.0);
+        let auto_dist = (max_dim * 1.75).clamp(1.5, 300.0);
+
+        let mut st = self.state.lock().unwrap();
+        st.camera.distance = auto_dist;
+        st.camera.target = Vector3 {
+            x: (min.x + max.x) * 0.5,
+            y: (min.y + max.y) * 0.5,
+            z: (min.z + max.z) * 0.5,
+        };
+        st.camera
+    }
+
     fn refresh_project_state(&self, project_dir: &Path, status_msg: &'static str) {
         let (items, cached, haystacks) = scan_project_folder(project_dir);
         {
@@ -1605,43 +1711,276 @@ impl BackgroundWorker {
     }
 }
 
-fn resolve_diffuse_texture(project_dir: Option<&Path>) -> Option<ResolvedTexture> {
-    let base_dir = project_dir?;
-    let tex_dir = base_dir.join("assets").join("textures");
-    if !tex_dir.exists() {
-        return None;
-    }
+// -----------------------------------------------------------------------------
+// SMART TEXTURE RESOLUTION & COMPOSITE ASSEMBLY
+// -----------------------------------------------------------------------------
 
-    let mut candidate_file: Option<PathBuf> = None;
-    if let Ok(entries) = fs::read_dir(&tex_dir) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_file() && p.extension().is_some_and(|e| e == "dds") {
-                candidate_file = Some(p);
-                break;
+fn load_mesh_with_smart_texture(
+    bytes: &[u8],
+    mesh_stem: &str,
+    project_dir: Option<&Path>,
+) -> Option<RenderSubmesh> {
+    let parsed = crate::engine::assets::mesh::extract_mesh_geometry(bytes).ok()?;
+    let resolved_tex = resolve_smart_texture_for_mesh(project_dir, mesh_stem);
+    let tex_arc = resolved_tex.map(|t| Arc::new((t.width, t.height, t.rgba)));
+
+    Some(RenderSubmesh {
+        name: mesh_stem.to_string(),
+        positions: parsed.positions,
+        indices: parsed.indices,
+        normals: parsed.normals,
+        uvs: parsed.uvs,
+        texture: tex_arc,
+    })
+}
+
+/// Resolves the exact matching diffuse texture for a mesh using normalized path matching
+fn resolve_smart_texture_for_mesh(
+    project_dir: Option<&Path>,
+    mesh_stem: &str,
+) -> Option<ResolvedTexture> {
+    let base_dir = project_dir?;
+    let assets_dir = base_dir.join("assets");
+    let textures_dir = assets_dir.join("textures");
+    let objects_dir = assets_dir.join("objects");
+    let materials_dir = assets_dir.join("materials");
+
+    let norm_mesh = s_normalize(mesh_stem);
+
+    // 1. Check objects/*.json to find which material is bound to this mesh
+    let mut bound_material_name: Option<String> = None;
+    if objects_dir.exists()
+        && let Ok(entries) = fs::read_dir(&objects_dir)
+    {
+        for e in entries.flatten() {
+            if e.path().extension().is_some_and(|ext| ext == "json")
+                && let Ok(content) = fs::read_to_string(e.path())
+                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&content)
+                && let Some(bindings) = v["mesh_bindings"].as_array()
+            {
+                for b in bindings {
+                    let m_path = b["mesh_path"].as_str().unwrap_or_default();
+                    let m_name = b["mesh_part_name"].as_str().unwrap_or_default();
+                    let norm_path = s_normalize(m_path);
+                    let norm_name = s_normalize(m_name);
+
+                    if (norm_mesh.contains(&norm_path)
+                        || norm_mesh.contains(&norm_name)
+                        || norm_path.contains(&norm_mesh))
+                        && let Some(mat_path) = b["material_path"].as_str()
+                    {
+                        bound_material_name = Some(mat_path.to_string());
+                        break;
+                    }
+                }
             }
         }
     }
 
-    let file_path = candidate_file?;
-    let dds_bytes = fs::read(&file_path).ok()?;
-    let parsed_tex = crate::engine::assets::texture::parse_texture_chunk(&dds_bytes).ok()?;
-    let rgba = dds_decoder::decode_to_rgba(
-        parsed_tex.width,
-        parsed_tex.height,
-        parsed_tex.format,
-        &parsed_tex.pixel_data,
-    );
+    // 2. Check materials/*.json to find the diffuse texture linked to this material
+    let mut matched_texture_filename: Option<String> = None;
+    if let Some(ref mat_target) = bound_material_name
+        && materials_dir.exists()
+        && let Ok(entries) = fs::read_dir(&materials_dir)
+    {
+        for e in entries.flatten() {
+            if e.path().extension().is_some_and(|ext| ext == "json")
+                && let Ok(content) = fs::read_to_string(e.path())
+                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&content)
+            {
+                let mat_val = v["blocks"]
+                    .as_array()
+                    .and_then(|blocks| {
+                        blocks
+                            .iter()
+                            .find(|b| b["id"] == 20)
+                            .and_then(|b| b["value"].as_str())
+                    })
+                    .unwrap_or_default();
 
-    let filename = file_path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-    Some(ResolvedTexture {
-        filename,
-        width: parsed_tex.width,
-        height: parsed_tex.height,
-        rgba,
-    })
+                if s_normalize(mat_val) == s_normalize(mat_target)
+                    && let Some(blocks) = v["blocks"].as_array()
+                {
+                    for b in blocks {
+                        let role = b["role"].as_str().unwrap_or_default();
+                        if (role.contains("Diffuse")
+                            || role.contains("Base Color")
+                            || b["id"] == 30)
+                            && let Some(tex_name) = b["name"].as_str()
+                        {
+                            matched_texture_filename = Some(tex_name.to_string());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Load matched texture or fallback to primary diffuse DDS in assets/textures/
+    if textures_dir.exists()
+        && let Ok(entries) = fs::read_dir(&textures_dir)
+    {
+        let mut fallback_dds: Option<PathBuf> = None;
+        let mut diff_dds: Option<PathBuf> = None;
+        let clean_target = matched_texture_filename.as_deref().map(s_normalize);
+
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_file() && p.extension().is_some_and(|ext| ext == "dds") {
+                let fname = p.file_name().unwrap_or_default().to_string_lossy();
+                let norm_fname = s_normalize(&fname);
+
+                if fallback_dds.is_none() {
+                    fallback_dds = Some(p.clone());
+                }
+                if norm_fname.contains("diff") || norm_fname.contains("base") {
+                    diff_dds = Some(p.clone());
+                }
+
+                if let Some(ref target) = clean_target
+                    && (norm_fname.contains(target) || target.contains(&norm_fname))
+                {
+                    diff_dds = Some(p);
+                    break;
+                }
+            }
+        }
+
+        let chosen_texture = diff_dds.or(fallback_dds)?;
+        if let Ok(dds_bytes) = fs::read(&chosen_texture)
+            && let Ok(parsed_tex) = crate::engine::assets::texture::parse_texture_chunk(&dds_bytes)
+        {
+            let rgba = dds_decoder::decode_to_rgba(
+                parsed_tex.width,
+                parsed_tex.height,
+                parsed_tex.format,
+                &parsed_tex.pixel_data,
+            );
+            return Some(ResolvedTexture {
+                filename: chosen_texture
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+                width: parsed_tex.width,
+                height: parsed_tex.height,
+                rgba,
+            });
+        }
+    }
+
+    None
+}
+
+fn s_normalize(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect()
+}
+
+/// Builds a composite multi-mesh assembly combining all submeshes of a character/object
+fn build_composite_mesh_assembly(
+    _stem: &str,
+    project_dir: Option<&Path>,
+) -> (Vec<RenderSubmesh>, bool) {
+    let base_dir = match project_dir {
+        Some(d) => d,
+        None => return (Vec::new(), false),
+    };
+
+    let assets_dir = base_dir.join("assets");
+    let meshes_dir = assets_dir.join("meshes");
+    let chunks_dir = base_dir.join("chunks");
+
+    let mut submeshes = Vec::new();
+
+    if meshes_dir.exists()
+        && let Ok(entries) = fs::read_dir(&meshes_dir)
+    {
+        let mut mesh_paths: Vec<_> = entries
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "glb"))
+            .map(|e| e.path())
+            .collect();
+        mesh_paths.sort();
+
+        for m_path in mesh_paths {
+            let m_stem = m_path.file_stem().unwrap_or_default().to_string_lossy();
+            if m_stem.ends_with("_MASTER_RIG") {
+                continue;
+            }
+
+            let chunk_name = m_stem.split('_').find(|s| s.starts_with("chunk"));
+            let chunk_file = chunk_name.map(|c| chunks_dir.join(format!("{}.bin", c)));
+
+            let bytes_opt = if let Some(ref cf) = chunk_file
+                && cf.exists()
+            {
+                fs::read(cf).ok()
+            } else {
+                fs::read(&m_path).ok()
+            };
+
+            if let Some(bytes) = bytes_opt
+                && let Some(sm) = load_mesh_with_smart_texture(&bytes, &m_stem, project_dir)
+            {
+                submeshes.push(sm);
+            }
+        }
+    }
+
+    let has_composite = submeshes.len() > 1;
+    (submeshes, has_composite)
+}
+
+fn build_stats_lines(submeshes: &[RenderSubmesh]) -> Vec<slint::SharedString> {
+    let mut stats_lines: Vec<slint::SharedString> = Vec::new();
+    let total_verts: usize = submeshes.iter().map(|s| s.positions.len()).sum();
+    let total_tris: usize = submeshes.iter().map(|s| s.indices.len() / 3).sum();
+
+    let mut min = Vector3 {
+        x: f32::INFINITY,
+        y: f32::INFINITY,
+        z: f32::INFINITY,
+    };
+    let mut max = Vector3 {
+        x: f32::NEG_INFINITY,
+        y: f32::NEG_INFINITY,
+        z: f32::NEG_INFINITY,
+    };
+
+    for sm in submeshes {
+        for p in &sm.positions {
+            min.x = min.x.min(p.x);
+            min.y = min.y.min(p.y);
+            min.z = min.z.min(p.z);
+            max.x = max.x.max(p.x);
+            max.y = max.y.max(p.y);
+            max.z = max.z.max(p.z);
+        }
+    }
+
+    let sx = (max.x - min.x).abs();
+    let sy = (max.y - min.y).abs();
+    let sz = (max.z - min.z).abs();
+
+    stats_lines.push(format!("Total Vertices: {}", total_verts).into());
+    stats_lines.push(format!("Total Triangles: {}", total_tris).into());
+    stats_lines.push(format!("Submesh Count: {}", submeshes.len()).into());
+    stats_lines.push(format!("Size: {:.2}m × {:.2}m × {:.2}m", sx, sy, sz).into());
+    stats_lines.push(format!("Bounds Min: [{:.2}, {:.2}, {:.2}]", min.x, min.y, min.z).into());
+    stats_lines.push(format!("Bounds Max: [{:.2}, {:.2}, {:.2}]", max.x, max.y, max.z).into());
+
+    for (i, sm) in submeshes.iter().enumerate() {
+        let tex_status = if sm.texture.is_some() {
+            "Texture: Linked"
+        } else {
+            "Texture: Neutral Slate"
+        };
+        stats_lines.push(format!("Submesh [{}]: {} ({})", i, sm.name, tex_status).into());
+    }
+
+    stats_lines
 }

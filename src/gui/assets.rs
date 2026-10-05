@@ -68,6 +68,11 @@ pub fn register(
         let _ = tx_reset_cam.send(WorkerCommand::ResetViewportCamera);
     });
 
+    let tx_comp = tx.clone();
+    ui.on_toggle_composite_view(move || {
+        let _ = tx_comp.send(WorkerCommand::ToggleCompositeView);
+    });
+
     let tx_revert = tx.clone();
     let state_revert = state;
     ui.on_revert_asset(move |chunk_str| {

@@ -39,7 +39,7 @@ pub struct ItemFlagsJson {
 }
 
 fn default_unmapped_flags() -> String {
-    "0x21000000".to_string()
+    "0x21400000".to_string()
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -73,7 +73,7 @@ pub fn export_attachment_to_json(data: &[u8]) -> Result<String> {
         parse_chunk_elements(data).context("Failed to parse root Attachment container")?;
 
     let mut resource_tag = String::new();
-    let mut item_name = String::from("Unnamed_Item");
+    let mut item_name = String::from("Plate");
     let mut internal_model_slot = String::new();
     let mut mesh_package = String::new();
     let mut submesh_name = String::new();
@@ -84,13 +84,13 @@ pub fn export_attachment_to_json(data: &[u8]) -> Result<String> {
         is_pickable: true,
         cast_shadows: true,
         drop_physics: true,
-        raw_mask_hex: "0x21000000".into(),
+        raw_mask_hex: "0x21400000".into(),
     };
 
     let mut socket = ItemSocketConfigJson {
-        mount_point: "Right_Hand".into(),
+        mount_point: "Right_Hand_Carry".into(),
         primary_slot: 40,
-        secondary_slot: None,
+        secondary_slot: Some(43),
     };
 
     let mut physics = ItemPhysicsConfigJson {
@@ -111,11 +111,14 @@ pub fn export_attachment_to_json(data: &[u8]) -> Result<String> {
 
     // 2. Item Resource (0x0046200D) in Chunk ID 21
     if let Some((_, item_bytes)) = root_elements.iter().find(|(id, _)| *id == 21) {
-        let payload = if item_bytes.starts_with(b"\x01\x01\x00") && item_bytes.len() > 6 {
-            &item_bytes[6..]
-        } else {
-            item_bytes
-        };
+        let payload =
+            if let Some(pos) = item_bytes.windows(4).position(|w| w == b"\x0D\x20\x46\x00") {
+                &item_bytes[pos..]
+            } else if item_bytes.starts_with(b"\x01\x01\x00") && item_bytes.len() > 6 {
+                &item_bytes[6..]
+            } else {
+                item_bytes
+            };
 
         if let Ok((_type_id, elements)) = parse_typed_container(payload) {
             for (id, chunk) in elements {
@@ -233,7 +236,6 @@ pub fn import_attachment_from_json(json_str: &str) -> Result<Vec<u8>> {
     ));
     item_sub.push((21, write_length_prefixed_string(&parsed.item_name)));
 
-    // Strict hexadecimal parsing without silent fallbacks
     let raw_hex = parsed
         .flags
         .raw_mask_hex
@@ -300,7 +302,6 @@ pub fn import_attachment_from_json(json_str: &str) -> Result<Vec<u8>> {
     item_sub.push((140, vec![1u8, 1, 0, 0]));
     item_sub.push((141, vec![1u8, 1, 0, 0]));
 
-    // Strict numerical coordinate verification
     for (i, val) in parsed.hold_offset.iter().enumerate() {
         if !val.is_finite() {
             bail!(
@@ -334,12 +335,23 @@ pub fn import_attachment_from_json(json_str: &str) -> Result<Vec<u8>> {
     ];
     let sound_blob = build_typed_container(0x0400_0057, &sound_elems);
 
+    let mut prefix_21 = Vec::new();
+    let slot_tag = parsed
+        .internal_model_slot
+        .split('\\')
+        .next()
+        .unwrap_or("17040")
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    prefix_21.extend_from_slice(&write_length_prefixed_string(slot_tag));
+    prefix_21.extend_from_slice(&item_resource_blob);
+
     let root_elements = vec![
         (
             20,
             write_length_prefixed_string(&parsed._engine_metadata.resource_tag),
         ),
-        (21, item_resource_blob),
+        (21, prefix_21),
         (30, sound_blob),
     ];
 
@@ -361,9 +373,9 @@ fn parse_transform_offset(chunk: &[u8]) -> Option<[f32; 3]> {
 
 fn build_transform_offset(offset: [f32; 3]) -> Vec<u8> {
     let mut out = Vec::with_capacity(15);
-    out.push(1); // 1 entry in micro-table
-    out.push(20); // ID 20
-    out.push(0); // offset 0
+    out.push(1);
+    out.push(20);
+    out.push(0);
     let _ = out.write_f32::<LittleEndian>(offset[0]);
     let _ = out.write_f32::<LittleEndian>(offset[1]);
     let _ = out.write_f32::<LittleEndian>(offset[2]);

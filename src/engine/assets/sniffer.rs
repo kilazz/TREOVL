@@ -1,4 +1,4 @@
-use super::{parse_chunk_elements, parse_typed_container};
+use super::parse_typed_container;
 use crate::engine::common::magic;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,36 +101,16 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
             (AssetKind::Generic, "Triumph Binary Container", "📦")
         }
 
-    // Priority 3: Attached Items / Equipment (TypeID 0x0046200D or item table structure)
-    } else if (data.len() >= 4
-        && u32::from_le_bytes(data[0..4].try_into().unwrap_or_default()) == 0x0046200D)
-        || (data.starts_with(magic::CONTAINER_MAGIC)
-            && data.windows(4).any(|w| w == b"\x0D\x20\x46\x00"))
+    // Priority 3: Attached Items / Equipment (TREItemResource, TypeID 0x0046200D)
+    } else if data.windows(4).any(|w| w == b"\x0D\x20\x46\x00")
+        || (data.len() >= 4
+            && u32::from_le_bytes(data[0..4].try_into().unwrap_or_default()) == 0x0046200D)
     {
-        let mut is_valid = false;
-        if let Ok((type_id, elements)) = parse_typed_container(data) {
-            if type_id == 0x0046200D {
-                is_valid = true;
-            } else {
-                is_valid = elements
-                    .iter()
-                    .any(|(_, chunk)| chunk.windows(4).any(|w| w == b"OBJ\\" || w == b"MESH"));
-            }
-        } else if let Ok((_, elements)) = parse_chunk_elements(data) {
-            is_valid = elements
-                .iter()
-                .any(|(id, chunk)| *id == 21 && chunk.windows(4).any(|w| w == b"\x0D\x20\x46\x00"));
-        }
-
-        if is_valid {
-            (
-                AssetKind::Attachment,
-                "Attached Item / Prop (TREItemResource)",
-                "🍽️",
-            )
-        } else {
-            (AssetKind::Generic, "Triumph Binary Container", "📦")
-        }
+        (
+            AssetKind::Attachment,
+            "Attached Item / Prop (TREItemResource)",
+            "🍽️",
+        )
 
     // Priority 4: Textures and Surface Maps
     } else if magic_bytes == magic::TEX_3D {
@@ -312,7 +292,7 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
     }
 }
 
-/// Fast header metadata scanner inspecting the first 4 KB to prevent CPU stalls on large assets.
+/// Fast header metadata scanner inspecting the first 4 KB
 fn extract_internal_strings(data: &[u8]) -> Option<String> {
     let scan_limit = data.len().min(4096);
     let header_slice = &data[..scan_limit];
@@ -343,7 +323,7 @@ fn extract_internal_strings(data: &[u8]) -> Option<String> {
                     return Some(clean.to_string());
                 }
                 if (clean.starts_with('[') && clean.contains(']'))
-                    || (best_candidate.is_none() && clean.len() >= 3)
+                    || (best_candidate.is_none() && clean.len() >= 3 && clean != "17040")
                 {
                     best_candidate = Some(clean.to_string());
                 }

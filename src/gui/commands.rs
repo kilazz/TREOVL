@@ -50,6 +50,7 @@ pub enum WorkerCommand {
         mode: u32,
     },
     ResetViewportCamera,
+    ToggleCompositeView,
     FilterAssets {
         query: String,
         generation: u64,

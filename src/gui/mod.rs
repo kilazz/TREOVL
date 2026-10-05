@@ -28,12 +28,20 @@ pub struct CachedAsset {
 }
 
 #[derive(Clone)]
-pub struct ActiveMeshPreview {
+pub struct RenderSubmesh {
+    pub name: String,
     pub positions: Vec<Vector3>,
     pub indices: Vec<u32>,
     pub normals: Vec<Vector3>,
     pub uvs: Vec<Vector2>,
     pub texture: Option<Arc<(u32, u32, Vec<u8>)>>,
+}
+
+#[derive(Clone)]
+pub struct ActiveMeshPreview {
+    pub submeshes: Vec<RenderSubmesh>,
+    pub is_composite: bool,
+    pub composite_name: String,
 }
 
 #[derive(Default)]
@@ -179,7 +187,6 @@ pub fn run_gui() -> Result<(), slint::PlatformError> {
     let worker = BackgroundWorker::new(ui_weak.clone(), logger.clone(), app_state.clone());
     thread::spawn(move || worker.run(worker_rx));
 
-    // Non-blocking filter dispatch with sequential generation tracking
     let filter_tx = worker_tx.clone();
     static FILTER_GEN: AtomicU64 = AtomicU64::new(0);
 
