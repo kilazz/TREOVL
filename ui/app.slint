@@ -49,6 +49,7 @@ export component AppWindow inherits Window {
     // 3D Viewport Controls & Composite State
     in-out property <float> viewport_fov: 45.0;
     in-out property <int> viewport_lighting: 0;
+    in-out property <int> viewport_up_axis: 1; // 1: Game (+90° Upright), 0: Raw (As-is), 2: Invert (-90°)
     in-out property <bool> has_composite_available: false;
     in-out property <bool> is_composite_active: false;
 
@@ -84,6 +85,7 @@ export component AppWindow inherits Window {
     callback zoom_mesh_viewport(float);
     callback set_viewport_fov(float);
     callback set_viewport_lighting(int);
+    callback set_viewport_up_axis(int);
     callback reset_viewport_camera();
     callback toggle_composite_view();
 
@@ -970,7 +972,7 @@ export component AppWindow inherits Window {
                             save_clicked => { root.save_material(root.active_file_path, root.mat_json_text); }
                         }
 
-                        // Context 3: 3D Mesh / Composite Viewport (Clean 2-Row Header Layout)
+                        // Context 3: 3D Mesh / Composite Viewport
                         if root.active_kind_id == 3: VerticalLayout {
                             spacing: 8px;
                             vertical-stretch: 1;
@@ -1033,7 +1035,7 @@ export component AppWindow inherits Window {
                                     spacing: 12px;
                                     alignment: space-between;
 
-                                    // Left: Camera Controls (Fit, Zoom +, -)
+                                    // Left: Camera Controls (Fit, Zoom +, -, Axis Mode)
                                     HorizontalLayout {
                                         spacing: 6px;
                                         alignment: center;
@@ -1105,6 +1107,39 @@ export component AppWindow inherits Window {
                                             zout_ta := TouchArea {
                                                 mouse-cursor: pointer;
                                                 clicked => { root.zoom_mesh_viewport(-1.0); }
+                                            }
+                                        }
+
+                                        // 3-way axis cycler: Mode 1 (+90° Upright) -> Mode 0 (Raw) -> Mode 2 (-90° Invert)
+                                        Rectangle {
+                                            width: 130px;
+                                            height: 26px;
+                                            y: (parent.height - self.height) / 2;
+                                            background: root.viewport_up_axis == 1 ? #23a55a : (root.viewport_up_axis == 2 ? #d28e1b : #2b303c);
+                                            border-radius: 4px;
+                                            border-width: 1px;
+                                            border-color: root.viewport_up_axis == 1 ? #57f287 : (root.viewport_up_axis == 2 ? #f0b132 : #3e4450);
+                                            Text {
+                                                text: root.viewport_up_axis == 1 ? "📐 Game (+90°)" : (root.viewport_up_axis == 2 ? "📐 Invert (-90°)" : "📐 Raw (As-is)");
+                                                font-size: 11px;
+                                                font-weight: 700;
+                                                color: #ffffff;
+                                                vertical-alignment: center;
+                                                horizontal-alignment: center;
+                                            }
+
+                                            up_ta := TouchArea {
+                                                mouse-cursor: pointer;
+                                                clicked => {
+                                                    if (root.viewport_up_axis == 1) {
+                                                        root.viewport_up_axis = 0;
+                                                    } else if (root.viewport_up_axis == 0) {
+                                                        root.viewport_up_axis = 2;
+                                                    } else {
+                                                        root.viewport_up_axis = 1;
+                                                    }
+                                                    root.set_viewport_up_axis(root.viewport_up_axis);
+                                                }
                                             }
                                         }
                                     }

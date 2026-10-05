@@ -8,6 +8,7 @@ pub struct ViewportCamera {
     pub target: Vector3,
     pub fov_degrees: f32,
     pub lighting_mode: u32, // 0 = Studio Lit, 1 = Bright Fill, 2 = Unlit
+    pub up_axis: u32,       // 0 = Y-Up (Raw), 1 = Z-Up to Y-Up (Triumph Engine / 3ds Max)
 }
 
 impl Default for ViewportCamera {
@@ -17,8 +18,9 @@ impl Default for ViewportCamera {
             pitch: 0.35,
             distance: 3.5,
             target: Vector3::default(),
-            fov_degrees: 45.0, // Natural perspective without fish-eye distortion
+            fov_degrees: 45.0,
             lighting_mode: 0,
+            up_axis: 1, // Default to 1 (Z-Up to Y-Up conversion)
         }
     }
 }

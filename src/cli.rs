@@ -105,6 +105,13 @@ pub enum Commands {
         /// Output .glb file
         output: PathBuf,
     },
+    /// Inject terrain heightmap from 3D glTF 2.0 Binary (.glb) into terrain chunk
+    ImportTerrainGlb {
+        /// Target terrain chunk (.bin)
+        terrain: PathBuf,
+        /// Input .glb file
+        input: PathBuf,
+    },
     /// Export 3D collision boundary (.clb) to glTF 2.0 Binary (.glb)
     ExportCollisionGlb {
         /// Input collision chunk (.bin or .clb)
@@ -301,6 +308,10 @@ pub fn handle_cli() -> Result<()> {
                 "[+] Terrain exported to .glb with Vertex Colors ({} vertices, {} triangles).",
                 v_count, tri_count
             );
+        }
+        Commands::ImportTerrainGlb { terrain, input } => {
+            service::import_terrain_from_glb_file(&terrain, &input)?;
+            println!("[+] Terrain chunk successfully updated with heights from .glb!");
         }
         Commands::ExportCollisionGlb { collision, output } => {
             let size = service::export_collision_glb(&collision, &output)?;

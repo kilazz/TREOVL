@@ -20,12 +20,15 @@ use crate::engine::assets::mesh::{
     MeshStats, export_mesh_to_glb, export_mesh_to_obj, import_glb_to_mesh, import_obj_to_mesh,
 };
 use crate::engine::assets::object::import_object_from_json;
-use crate::engine::assets::terrain::{export_terrain_to_glb, export_terrain_to_obj};
+use crate::engine::assets::terrain::{
+    export_terrain_to_glb, export_terrain_to_obj, import_terrain_from_glb, import_terrain_heightmap,
+};
 use crate::engine::assets::terrain_palette::import_terrain_palette_from_json;
 use crate::engine::assets::texture::{export_to_dds, replace_texture_in_chunk};
 use crate::engine::assets::ui::import_ui_from_json;
 use crate::engine::assets::ui_sprite::import_ui_sprite_collection;
 use crate::engine::assets::vpk::{export_vpk_to_json, import_vpk_from_json};
+use crate::engine::common::Endian;
 
 pub fn export_texture(chunk_path: &Path, out_path: &Path) -> Result<()> {
     let data = fs::read(chunk_path).with_context(|| format!("Failed to read {:?}", chunk_path))?;
@@ -94,6 +97,29 @@ pub fn export_terrain(chunk_path: &Path, out_path: &Path, is_glb: bool) -> Resul
         fs::write(out_path, obj)?;
         Ok((v_count, tri_count))
     }
+}
+
+pub fn import_terrain_from_glb_file(chunk_path: &Path, in_glb_path: &Path) -> Result<()> {
+    let original =
+        fs::read(chunk_path).with_context(|| format!("Failed to read {:?}", chunk_path))?;
+    let glb_bytes =
+        fs::read(in_glb_path).with_context(|| format!("Failed to read {:?}", in_glb_path))?;
+    let updated = import_terrain_from_glb(&original, &glb_bytes, Endian::Little)?;
+    fs::write(chunk_path, updated)?;
+    Ok(())
+}
+
+pub fn import_terrain_heights(
+    chunk_path: &Path,
+    height_grid: &[f32],
+    width: usize,
+    height: usize,
+) -> Result<()> {
+    let original =
+        fs::read(chunk_path).with_context(|| format!("Failed to read {:?}", chunk_path))?;
+    let updated = import_terrain_heightmap(&original, height_grid, width, height, Endian::Little)?;
+    fs::write(chunk_path, updated)?;
+    Ok(())
 }
 
 pub fn export_collision_glb(chunk_path: &Path, out_path: &Path) -> Result<usize> {

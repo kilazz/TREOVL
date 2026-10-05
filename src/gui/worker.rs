@@ -767,6 +767,46 @@ impl BackgroundWorker {
                 }
             }
 
+            WorkerCommand::SetViewportUpAxis { mode } => {
+                let buf_opt = {
+                    let mut st = self.state.lock().unwrap();
+                    st.camera.up_axis = mode;
+                    let cam = st.camera;
+
+                    st.active_mesh.as_ref().map(|mesh_prev| {
+                        let draw_data: Vec<SubmeshDrawData> = mesh_prev
+                            .submeshes
+                            .iter()
+                            .map(|sm| SubmeshDrawData {
+                                positions: &sm.positions,
+                                indices: &sm.indices,
+                                normals: &sm.normals,
+                                uvs: &sm.uvs,
+                                texture: sm.texture.as_ref().map(|t| TextureData {
+                                    width: t.0,
+                                    height: t.1,
+                                    rgba: &t.2,
+                                }),
+                            })
+                            .collect();
+
+                        self.gpu_renderer
+                            .as_mut()
+                            .unwrap()
+                            .render(&draw_data, (1024, 1024), &cam)
+                    })
+                };
+
+                if let Some(buf) = buf_opt {
+                    let ui_h = self.ui_handle.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = ui_h.upgrade() {
+                            ui.set_mesh_preview(Image::from_rgba8(buf));
+                        }
+                    });
+                }
+            }
+
             WorkerCommand::ResetViewportCamera => {
                 let buf_opt = {
                     let mut st = self.state.lock().unwrap();
@@ -1000,9 +1040,10 @@ impl BackgroundWorker {
             WorkerCommand::DirectMeshExport { src, dst, is_glb } => {
                 match service::export_mesh(&src, &dst, is_glb) {
                     Ok(stats) => {
+                        let kind = if is_glb { "glTF" } else { "OBJ" };
                         self.logger.log(&format!(
-                            "[+] Exported 3D mesh: {:?} ({} verts, {} tris)",
-                            dst, stats.vertex_count, stats.triangle_count
+                            "[+] Exported {} mesh: {:?} ({} verts, {} tris)",
+                            kind, dst, stats.vertex_count, stats.triangle_count
                         ));
                         self.set_ui_status("Mesh exported successfully.", false);
                     }
@@ -1633,6 +1674,9 @@ impl BackgroundWorker {
     }
 
     fn center_camera_for_preview(&self, preview: &ActiveMeshPreview) -> ViewportCamera {
+        let mut st = self.state.lock().unwrap();
+        let up_axis = st.camera.up_axis;
+
         let mut min = Vector3 {
             x: f32::INFINITY,
             y: f32::INFINITY,
@@ -1644,14 +1688,27 @@ impl BackgroundWorker {
             z: f32::NEG_INFINITY,
         };
 
+        let transform = |p: Vector3| -> Vector3 {
+            if up_axis == 1 {
+                Vector3 {
+                    x: p.x,
+                    y: p.z,
+                    z: -p.y,
+                }
+            } else {
+                p
+            }
+        };
+
         for sm in &preview.submeshes {
-            for p in &sm.positions {
-                min.x = min.x.min(p.x);
-                min.y = min.y.min(p.y);
-                min.z = min.z.min(p.z);
-                max.x = max.x.max(p.x);
-                max.y = max.y.max(p.y);
-                max.z = max.z.max(p.z);
+            for &p in &sm.positions {
+                let tp = transform(p);
+                min.x = min.x.min(tp.x);
+                min.y = min.y.min(tp.y);
+                min.z = min.z.min(tp.z);
+                max.x = max.x.max(tp.x);
+                max.y = max.y.max(tp.y);
+                max.z = max.z.max(tp.z);
             }
         }
 
@@ -1661,7 +1718,6 @@ impl BackgroundWorker {
         let max_dim = sx.max(sy).max(sz).max(1.0);
         let auto_dist = (max_dim * 1.75).clamp(1.5, 300.0);
 
-        let mut st = self.state.lock().unwrap();
         st.camera.distance = auto_dist;
         st.camera.target = Vector3 {
             x: (min.x + max.x) * 0.5,
@@ -1734,7 +1790,6 @@ fn load_mesh_with_smart_texture(
     })
 }
 
-/// Resolves the exact matching diffuse texture for a mesh using normalized path matching
 fn resolve_smart_texture_for_mesh(
     project_dir: Option<&Path>,
     mesh_stem: &str,
@@ -1747,7 +1802,6 @@ fn resolve_smart_texture_for_mesh(
 
     let norm_mesh = s_normalize(mesh_stem);
 
-    // 1. Check objects/*.json to find which material is bound to this mesh
     let mut bound_material_name: Option<String> = None;
     if objects_dir.exists()
         && let Ok(entries) = fs::read_dir(&objects_dir)
@@ -1777,7 +1831,6 @@ fn resolve_smart_texture_for_mesh(
         }
     }
 
-    // 2. Check materials/*.json to find the diffuse texture linked to this material
     let mut matched_texture_filename: Option<String> = None;
     if let Some(ref mat_target) = bound_material_name
         && materials_dir.exists()
@@ -1817,7 +1870,6 @@ fn resolve_smart_texture_for_mesh(
         }
     }
 
-    // 3. Load matched texture or fallback to primary diffuse DDS in assets/textures/
     if textures_dir.exists()
         && let Ok(entries) = fs::read_dir(&textures_dir)
     {
@@ -1880,7 +1932,6 @@ fn s_normalize(s: &str) -> String {
         .collect()
 }
 
-/// Builds a composite multi-mesh assembly combining all submeshes of a character/object
 fn build_composite_mesh_assembly(
     _stem: &str,
     project_dir: Option<&Path>,

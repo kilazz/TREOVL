@@ -6,6 +6,7 @@ use crate::engine::math::{Vector2, Vector3};
 use glam::{Mat4, Vec3};
 use slint::{Rgba8Pixel, SharedPixelBuffer};
 use std::iter;
+use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
 
 /// Internal Mesh vertex format aligned for WGPU buffer layouts
@@ -102,6 +103,8 @@ pub struct WgpuRenderer {
     default_sampler: wgpu::Sampler,
     default_texture_bind_group: wgpu::BindGroup,
     target_cache: Option<PersistentRenderTarget>,
+    last_frame_time: Instant,
+    last_pixel_buffer: Option<SharedPixelBuffer<Rgba8Pixel>>,
 }
 
 impl Default for WgpuRenderer {
@@ -351,6 +354,8 @@ impl WgpuRenderer {
             default_sampler,
             default_texture_bind_group,
             target_cache: None,
+            last_frame_time: Instant::now(),
+            last_pixel_buffer: None,
         }
     }
 
@@ -427,19 +432,49 @@ impl WgpuRenderer {
         cam: &ViewportCamera,
     ) -> SharedPixelBuffer<Rgba8Pixel> {
         let (width, height) = size;
+
+        let now = Instant::now();
+        if now.duration_since(self.last_frame_time) < Duration::from_millis(15)
+            && let Some(ref prev) = self.last_pixel_buffer
+        {
+            return prev.clone();
+        }
+        self.last_frame_time = now;
+
         self.ensure_render_targets(width, height);
+
+        // Transformation closures:
+        // Mode 1 (Default): Upright (+90° X) -> X'=X, Y'=-Z (shell UP, feet DOWN), Z'=Y (head FORWARD)
+        // Mode 2: Inverted (-90° X) -> X'=X, Y'=Z, Z'=-Y
+        // Mode 0: Raw as-is -> X'=X, Y'=Y, Z'=Z
+        let transform_pos = |p: Vector3| -> [f32; 3] {
+            match cam.up_axis {
+                1 => [p.x, -p.z, p.y],
+                2 => [p.x, p.z, -p.y],
+                _ => [p.x, p.y, p.z],
+            }
+        };
+
+        let transform_norm = |n: Vector3| -> [f32; 3] {
+            match cam.up_axis {
+                1 => [n.x, -n.z, n.y],
+                2 => [n.x, n.z, -n.y],
+                _ => [n.x, n.y, n.z],
+            }
+        };
 
         let mut min = Vec3::splat(f32::INFINITY);
         let mut max = Vec3::splat(f32::NEG_INFINITY);
 
         for sm in submeshes {
-            for p in sm.positions {
-                min.x = min.x.min(p.x);
-                min.y = min.y.min(p.y);
-                min.z = min.z.min(p.z);
-                max.x = max.x.max(p.x);
-                max.y = max.y.max(p.y);
-                max.z = max.z.max(p.z);
+            for &p in sm.positions {
+                let tp = transform_pos(p);
+                min.x = min.x.min(tp[0]);
+                min.y = min.y.min(tp[1]);
+                min.z = min.z.min(tp[2]);
+                max.x = max.x.max(tp[0]);
+                max.y = max.y.max(tp[1]);
+                max.z = max.z.max(tp[2]);
             }
         }
 
@@ -506,7 +541,7 @@ impl WgpuRenderer {
                 .positions
                 .iter()
                 .enumerate()
-                .map(|(i, p)| {
+                .map(|(i, &p)| {
                     let n = sm.normals.get(i).copied().unwrap_or(Vector3 {
                         x: 0.0,
                         y: 1.0,
@@ -514,8 +549,8 @@ impl WgpuRenderer {
                     });
                     let uv = sm.uvs.get(i).copied().unwrap_or(Vector2 { x: 0.0, y: 0.0 });
                     Vertex {
-                        position: [p.x, p.y, p.z],
-                        normal: [n.x, n.y, n.z],
+                        position: transform_pos(p),
+                        normal: transform_norm(n),
                         tex_coords: [uv.x, uv.y],
                     }
                 })
@@ -716,6 +751,7 @@ impl WgpuRenderer {
         // 3. Render 3D coordinate orientation gizmo
         render_axis_gizmo(dst, width, height, cam);
 
+        self.last_pixel_buffer = Some(pixel_buffer.clone());
         pixel_buffer
     }
 }

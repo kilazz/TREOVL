@@ -49,6 +49,9 @@ pub enum WorkerCommand {
     SetViewportLighting {
         mode: u32,
     },
+    SetViewportUpAxis {
+        mode: u32,
+    },
     ResetViewportCamera,
     ToggleCompositeView,
     FilterAssets {

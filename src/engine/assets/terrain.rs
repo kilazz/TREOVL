@@ -1,5 +1,5 @@
-use super::parse_chunk_elements;
-use crate::engine::common::chunk_id;
+use super::{build_chunk_from_elements, parse_chunk_elements};
+use crate::engine::common::{Endian, chunk_id};
 use crate::utils::gltf_builder::GltfBuilder;
 use anyhow::{Context, Result, bail};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -37,6 +37,23 @@ impl TerrainPoint {
             cliff_texture_idx,
         }
     }
+
+    /// Packs point values into Triumph's 32-bit bitfield format
+    pub fn to_u32(&self) -> u32 {
+        let packed_height = ((self.height * 32.0).round() as i32).clamp(0, 4095) as u32;
+        let low = packed_height & 0x0F;
+        let mid = (packed_height >> 4) & 0x0F;
+        let high = (packed_height >> 8) & 0x0F;
+
+        let b0 = (mid << 4) | low;
+        let b1 = high & 0x0F;
+
+        let main_tex = (self.main_texture_idx as u32 & 0x0F) << 16;
+        let foliage = (self.foliage_value as u32 & 0x0F) << 20;
+        let cliff_tex = (self.cliff_texture_idx as u32 & 0x0F) << 24;
+
+        b0 | (b1 << 8) | main_tex | foliage | cliff_tex
+    }
 }
 
 pub struct TerrainGeometry {
@@ -52,6 +69,13 @@ pub struct TerrainGeometry {
 }
 
 pub fn parse_terrain_geometry(chunk_data: &[u8]) -> Result<TerrainGeometry> {
+    parse_terrain_geometry_with_endian(chunk_data, Endian::Little)
+}
+
+pub fn parse_terrain_geometry_with_endian(
+    chunk_data: &[u8],
+    endian: Endian,
+) -> Result<TerrainGeometry> {
     let (_, elements) = parse_chunk_elements(chunk_data)?;
 
     let width_bytes = elements
@@ -70,13 +94,13 @@ pub fn parse_terrain_geometry(chunk_data: &[u8]) -> Result<TerrainGeometry> {
         .map(|(_, d)| d)
         .context("Missing TerrainPoints chunk (ID 33)")?;
 
-    let width = Cursor::new(width_bytes).read_u32::<LittleEndian>()? as usize;
-    let height = Cursor::new(height_bytes).read_u32::<LittleEndian>()? as usize;
+    let width = endian.read_u32(&mut Cursor::new(width_bytes.as_slice()))? as usize;
+    let height = endian.read_u32(&mut Cursor::new(height_bytes.as_slice()))? as usize;
 
     let mut points = Vec::with_capacity(width * height);
-    let mut cur = Cursor::new(raw_points);
+    let mut cur = Cursor::new(raw_points.as_slice());
     while (cur.position() as usize) + 4 <= raw_points.len() {
-        let raw = cur.read_u32::<LittleEndian>()?;
+        let raw = endian.read_u32(&mut cur)?;
         points.push(TerrainPoint::from_u32(raw));
     }
 
@@ -232,10 +256,143 @@ pub fn export_terrain_to_obj(chunk_data: &[u8]) -> Result<(String, usize, usize)
     }
 
     obj.push_str("\ns 1\n");
-    // Clippy idiomatic chunking with as_chunks::<3>().0
     for tri in geom.indices.as_chunks::<3>().0 {
         obj.push_str(&format!("f {} {} {}\n", tri[0] + 1, tri[1] + 1, tri[2] + 1));
     }
 
     Ok((obj, geom.vertex_count, geom.triangle_count))
+}
+
+/// Injects a new 2D array of height values into an existing terrain chunk.
+pub fn import_terrain_heightmap(
+    original_chunk: &[u8],
+    height_grid: &[f32],
+    new_width: usize,
+    new_height: usize,
+    endian: Endian,
+) -> Result<Vec<u8>> {
+    if height_grid.len() < new_width * new_height {
+        bail!("Provided height array is smaller than the specified dimensions (width x height)");
+    }
+
+    let (has_magic, mut elements) = parse_chunk_elements(original_chunk)?;
+
+    let existing_points: Vec<TerrainPoint> =
+        if let Some((_, raw_points)) = elements.iter().find(|(id, _)| *id == 33) {
+            let mut pts = Vec::new();
+            let mut cur = Cursor::new(raw_points.as_slice());
+            while (cur.position() as usize) + 4 <= raw_points.len() {
+                if let Ok(raw) = endian.read_u32(&mut cur) {
+                    pts.push(TerrainPoint::from_u32(raw));
+                }
+            }
+            pts
+        } else {
+            Vec::new()
+        };
+
+    let total_points = new_width * new_height;
+    let mut packed_points_data = Vec::with_capacity(total_points * 4);
+
+    for (i, &h) in height_grid.iter().take(total_points).enumerate() {
+        let (main_tex, foliage, cliff_tex) = if let Some(orig) = existing_points.get(i) {
+            (
+                orig.main_texture_idx,
+                orig.foliage_value,
+                orig.cliff_texture_idx,
+            )
+        } else {
+            (0, 0, 1)
+        };
+
+        let pt = TerrainPoint {
+            height: h,
+            main_texture_idx: main_tex,
+            foliage_value: foliage,
+            cliff_texture_idx: cliff_tex,
+        };
+
+        let raw = pt.to_u32();
+        endian.write_u32(&mut packed_points_data, raw)?;
+    }
+
+    let mut w_bytes = Vec::new();
+    endian.write_u32(&mut w_bytes, new_width as u32)?;
+
+    let mut h_bytes = Vec::new();
+    endian.write_u32(&mut h_bytes, new_height as u32)?;
+
+    elements.retain(|(id, _)| *id != chunk_id::WIDTH && *id != chunk_id::HEIGHT && *id != 33);
+    elements.push((chunk_id::WIDTH, w_bytes));
+    elements.push((chunk_id::HEIGHT, h_bytes));
+    elements.push((33, packed_points_data));
+    elements.sort_by_key(|&(id, _)| id);
+
+    Ok(build_chunk_from_elements(has_magic, &elements))
+}
+
+/// Imports height values from a glTF 2.0 Binary (.glb) file back into a terrain chunk
+pub fn import_terrain_from_glb(
+    original_chunk: &[u8],
+    glb_bytes: &[u8],
+    endian: Endian,
+) -> Result<Vec<u8>> {
+    let geom = parse_terrain_geometry_with_endian(original_chunk, endian)?;
+    let width = geom.width;
+    let height = geom.height;
+
+    if glb_bytes.len() < 20 || &glb_bytes[0..4] != b"glTF" {
+        bail!("Invalid .glb binary file (missing 'glTF' header)");
+    }
+
+    let mut cur = Cursor::new(&glb_bytes[12..]);
+    let json_len = cur.read_u32::<LittleEndian>()? as usize;
+    let mut json_type = [0u8; 4];
+    std::io::Read::read_exact(&mut cur, &mut json_type)?;
+
+    let json_slice = &glb_bytes[20..20 + json_len];
+    let gltf: serde_json::Value = serde_json::from_slice(json_slice)?;
+
+    let bin_header_pos = 20 + json_len;
+    let bin_pos = bin_header_pos + 8;
+    let bin_data = &glb_bytes[bin_pos..];
+
+    let prim = gltf["meshes"]
+        .get(0)
+        .and_then(|m| m["primitives"].get(0))
+        .context("No primitives found in terrain glTF mesh")?;
+
+    let accessors = gltf["accessors"]
+        .as_array()
+        .context("Missing accessors array")?;
+    let buffer_views = gltf["bufferViews"]
+        .as_array()
+        .context("Missing bufferViews array")?;
+
+    let pos_acc_idx = prim["attributes"]["POSITION"]
+        .as_u64()
+        .context("Primitive missing POSITION")? as usize;
+    let acc = &accessors[pos_acc_idx];
+    let count = acc["count"].as_u64().unwrap_or(0) as usize;
+    let bv_idx = acc["bufferView"].as_u64().unwrap_or(0) as usize;
+    let bv = &buffer_views[bv_idx];
+
+    let total_offset = bv["byteOffset"].as_u64().unwrap_or(0) as usize
+        + acc["byteOffset"].as_u64().unwrap_or(0) as usize;
+
+    if total_offset + count * 12 > bin_data.len() {
+        bail!("Accessor points beyond the binary payload");
+    }
+
+    let mut pos_cur = Cursor::new(&bin_data[total_offset..]);
+    let mut heights = vec![0.0f32; width * height];
+
+    for h in heights.iter_mut().take(count) {
+        let _px = pos_cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+        let py = pos_cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+        let _pz = pos_cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+        *h = py;
+    }
+
+    import_terrain_heightmap(original_chunk, &heights, width, height, endian)
 }

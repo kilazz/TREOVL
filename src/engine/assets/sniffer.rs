@@ -120,8 +120,13 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
     } else if magic_bytes == magic::TEX_INTERFACE {
         (AssetKind::Texture, "TREInterfaceImage (TGA)", "🖼️")
 
-    // Priority 5: Audio Containers
-    } else if magic_bytes == magic::AUDIO_WAV {
+    // Priority 5: Audio Containers (Direct or wrapped in typed container tables)
+    } else if magic_bytes == magic::AUDIO_WAV
+        || magic_bytes == b"\x00\x00\xA1\x00"
+        || data[..data.len().min(512)]
+            .windows(4)
+            .any(|w| w == magic::AUDIO_WAV || w == b"RIFF")
+    {
         (AssetKind::Audio, "Sound / Voice (WAV)", "🎵")
 
     // Priority 6: 3D Meshes & Geometry

@@ -2,7 +2,6 @@ use anyhow::{Result, bail};
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
 use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
-use std::io::Cursor;
 
 #[allow(dead_code)]
 pub mod magic {
@@ -42,24 +41,73 @@ pub enum Endian {
 }
 
 impl Endian {
-    pub fn read_u16(self, cur: &mut Cursor<&[u8]>) -> Result<u16, std::io::Error> {
+    pub fn read_i16<R: std::io::Read>(self, reader: &mut R) -> Result<i16, std::io::Error> {
         match self {
-            Endian::Little => cur.read_u16::<LittleEndian>(),
-            Endian::Big => cur.read_u16::<BigEndian>(),
+            Endian::Little => reader.read_i16::<LittleEndian>(),
+            Endian::Big => reader.read_i16::<BigEndian>(),
         }
     }
 
-    pub fn read_u32(self, cur: &mut Cursor<&[u8]>) -> Result<u32, std::io::Error> {
+    pub fn read_u16<R: std::io::Read>(self, reader: &mut R) -> Result<u16, std::io::Error> {
         match self {
-            Endian::Little => cur.read_u32::<LittleEndian>(),
-            Endian::Big => cur.read_u32::<BigEndian>(),
+            Endian::Little => reader.read_u16::<LittleEndian>(),
+            Endian::Big => reader.read_u16::<BigEndian>(),
         }
     }
 
-    pub fn read_f32(self, cur: &mut Cursor<&[u8]>) -> Result<f32, std::io::Error> {
+    pub fn read_i32<R: std::io::Read>(self, reader: &mut R) -> Result<i32, std::io::Error> {
         match self {
-            Endian::Little => cur.read_f32::<LittleEndian>(),
-            Endian::Big => cur.read_f32::<BigEndian>(),
+            Endian::Little => reader.read_i32::<LittleEndian>(),
+            Endian::Big => reader.read_i32::<BigEndian>(),
+        }
+    }
+
+    pub fn read_u32<R: std::io::Read>(self, reader: &mut R) -> Result<u32, std::io::Error> {
+        match self {
+            Endian::Little => reader.read_u32::<LittleEndian>(),
+            Endian::Big => reader.read_u32::<BigEndian>(),
+        }
+    }
+
+    pub fn read_f32<R: std::io::Read>(self, reader: &mut R) -> Result<f32, std::io::Error> {
+        match self {
+            Endian::Little => reader.read_f32::<LittleEndian>(),
+            Endian::Big => reader.read_f32::<BigEndian>(),
+        }
+    }
+
+    pub fn f32_from_bytes(self, b: [u8; 4]) -> f32 {
+        match self {
+            Endian::Little => f32::from_le_bytes(b),
+            Endian::Big => f32::from_be_bytes(b),
+        }
+    }
+
+    pub fn u32_from_bytes(self, b: [u8; 4]) -> u32 {
+        match self {
+            Endian::Little => u32::from_le_bytes(b),
+            Endian::Big => u32::from_be_bytes(b),
+        }
+    }
+
+    pub fn i32_from_bytes(self, b: [u8; 4]) -> i32 {
+        match self {
+            Endian::Little => i32::from_le_bytes(b),
+            Endian::Big => i32::from_be_bytes(b),
+        }
+    }
+
+    pub fn u16_from_bytes(self, b: [u8; 2]) -> u16 {
+        match self {
+            Endian::Little => u16::from_le_bytes(b),
+            Endian::Big => u16::from_be_bytes(b),
+        }
+    }
+
+    pub fn i16_from_bytes(self, b: [u8; 2]) -> i16 {
+        match self {
+            Endian::Little => i16::from_le_bytes(b),
+            Endian::Big => i16::from_be_bytes(b),
         }
     }
 
@@ -77,7 +125,21 @@ impl Endian {
         }
     }
 
+    pub fn write_f32(self, cur: &mut impl std::io::Write, val: f32) -> Result<(), std::io::Error> {
+        match self {
+            Endian::Little => byteorder::WriteBytesExt::write_f32::<LittleEndian>(cur, val),
+            Endian::Big => byteorder::WriteBytesExt::write_f32::<BigEndian>(cur, val),
+        }
+    }
+
     pub fn u32_to_bytes(self, val: u32) -> [u8; 4] {
+        match self {
+            Endian::Little => val.to_le_bytes(),
+            Endian::Big => val.to_be_bytes(),
+        }
+    }
+
+    pub fn f32_to_bytes(self, val: f32) -> [u8; 4] {
         match self {
             Endian::Little => val.to_le_bytes(),
             Endian::Big => val.to_be_bytes(),
@@ -183,7 +245,7 @@ pub fn parse_raw_container_table_with_endian(
         if pos + 4 > data.len() {
             bail!("Corrupted container header: truncated large count");
         }
-        let mut cur = Cursor::new(&data[pos..pos + 4]);
+        let mut cur = std::io::Cursor::new(&data[pos..pos + 4]);
         large_count = endian.read_u32(&mut cur)? as usize;
         pos += 4;
     }
@@ -199,7 +261,7 @@ pub fn parse_raw_container_table_with_endian(
         bail!("Table offsets exceed data bounds");
     }
 
-    let mut cur = Cursor::new(&data[pos..data_start]);
+    let mut cur = std::io::Cursor::new(&data[pos..data_start]);
     let mut entries = Vec::with_capacity(total_entries);
 
     for _ in 0..small_count {

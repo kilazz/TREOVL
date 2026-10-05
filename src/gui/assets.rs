@@ -63,6 +63,13 @@ pub fn register(
         });
     });
 
+    let tx_axis = tx.clone();
+    ui.on_set_viewport_up_axis(move |mode_idx| {
+        let _ = tx_axis.send(WorkerCommand::SetViewportUpAxis {
+            mode: mode_idx as u32,
+        });
+    });
+
     let tx_reset_cam = tx.clone();
     ui.on_reset_viewport_camera(move || {
         let _ = tx_reset_cam.send(WorkerCommand::ResetViewportCamera);
