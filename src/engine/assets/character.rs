@@ -17,6 +17,8 @@ pub struct CharacterActorJson {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_tag: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_baby: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub model_binding: Option<CharacterModelBinding>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub breakable_config: Option<BreakablePropsConfigJson>,
@@ -110,6 +112,14 @@ pub struct CharacterAttributesJson {
     pub hit_reaction_force: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_awareness_range: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jump_force: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aggro_range: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub damage_multiplier: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explosion_damage: Option<f32>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -196,22 +206,6 @@ pub struct RawCharacterBlock {
     pub hex: String,
 }
 
-fn validate_float_field(field_name: &str, val: Option<f32>) -> Result<()> {
-    if let Some(v) = val {
-        if !v.is_finite() {
-            bail!(
-                "Field '{}' must be a valid finite number, found: {}",
-                field_name,
-                v
-            );
-        }
-        if v.abs() > 1_000_000.0 {
-            bail!("Field '{}' value is unreasonably large: {}", field_name, v);
-        }
-    }
-    Ok(())
-}
-
 fn extract_collapse_target_from_script(script: &str) -> Option<String> {
     for line in script.lines() {
         if line.contains("Collapse(")
@@ -243,6 +237,7 @@ pub fn export_character_to_json(
 
     let mut character_name = String::from("Unnamed_Character");
     let mut resource_tag = None;
+    let mut is_baby = None;
     let mut model_binding = None;
     let mut collapse_target_model = None;
     let mut facefx_actor = None;
@@ -259,7 +254,7 @@ pub fn export_character_to_json(
     let mut flags = CharacterFlagsJson::default();
     let mut raw_flags_hex_val = None;
     let mut timings = CharacterCombatTimingsJson::default();
-    let mut knockback = CharacterKnockbackJson::default();
+    let mut knockback = None;
     let mut state_and_rewards = CharacterStateAndRewardsJson::default();
     let mut morph_params = CharacterMorphParamsJson::default();
     let mut equipment = None;
@@ -384,6 +379,9 @@ pub fn export_character_to_json(
             83 if chunk.len() >= 4 => {
                 attributes.base_health = parse_f32_safe(chunk);
             }
+            91 if chunk.len() >= 4 => {
+                attributes.jump_force = parse_f32_safe(chunk);
+            }
             112 => {
                 ai_behaviors = parse_ai_behaviors(chunk);
             }
@@ -459,8 +457,15 @@ pub fn export_character_to_json(
                 timings.attack_windup_time_sec = parse_f32_safe(chunk);
             }
             130 if chunk.len() >= 26 => {
-                knockback.knockback_distance = parse_f32_safe(&chunk[18..22]);
-                knockback.knockback_arc_height = parse_f32_safe(&chunk[22..26]);
+                let dist = parse_f32_safe(&chunk[18..22]);
+                let height = parse_f32_safe(&chunk[22..26]);
+                let is_clean = |v: Option<f32>| v.is_some_and(|f| (0.001..=500.0).contains(&f));
+                if is_clean(dist) && is_clean(height) {
+                    knockback = Some(CharacterKnockbackJson {
+                        knockback_distance: dist,
+                        knockback_arc_height: height,
+                    });
+                }
             }
             131 if chunk.len() >= 4 => {
                 timings.attack_cooldown_time_sec = parse_f32_safe(chunk);
@@ -471,10 +476,16 @@ pub fn export_character_to_json(
             133 if chunk.len() >= 4 => {
                 timings.invulnerability_time_sec = parse_f32_safe(chunk);
             }
+            137 if chunk.len() >= 4 => {
+                attributes.explosion_damage = parse_f32_safe(chunk);
+            }
             139 => {
                 if let Some(s) = read_length_prefixed_string(chunk) {
                     facefx_actor = Some(s);
                 }
+            }
+            140 if chunk.len() >= 4 => {
+                attributes.aggro_range = parse_f32_safe(chunk);
             }
             146 => {
                 transformations = parse_transformation_container(chunk);
@@ -483,6 +494,12 @@ pub fn export_character_to_json(
                 let (duration, scale) = parse_morph_parameters(chunk);
                 morph_params.morph_duration_sec = duration;
                 morph_params.blend_scale = scale;
+            }
+            155 if chunk.len() >= 4 => {
+                attributes.damage_multiplier = parse_f32_safe(chunk);
+            }
+            162 if !chunk.is_empty() => {
+                is_baby = Some(chunk[0] != 0);
             }
             166 => {
                 if let Some(fxe_bytes) = extract_embedded_facefx(chunk)
@@ -496,8 +513,8 @@ pub fn export_character_to_json(
                     embedded_facefx_file = Some(format!("assets/facefx/{}", fxe_name));
                 }
             }
-            88 | 92 | 96 | 97 | 98 | 102 | 111 | 114 | 128 | 129 | 134 | 147 | 148 | 152 | 153
-            | 159 | 161 | 167 | 19 | 1 | 41 | 42 | 45 | 71 | 301 => {}
+            88 | 92 | 96 | 97 | 98 | 102 | 111 | 114 | 128 | 129 | 134 | 144 | 147 | 148 | 152
+            | 153 | 159 | 161 | 167 | 19 | 1 | 41 | 42 | 45 | 71 | 301 => {}
             _ => {
                 unmapped_raw_blocks.push(RawCharacterBlock {
                     id: *id,
@@ -540,6 +557,7 @@ pub fn export_character_to_json(
         _engine_metadata: metadata,
         character_name,
         resource_tag,
+        is_baby,
         model_binding,
         breakable_config,
         collapse_target_model: if is_breakable {
@@ -550,7 +568,7 @@ pub fn export_character_to_json(
         actor_flags: Some(flags),
         combat_attributes: Some(attributes),
         timing_parameters: Some(timings),
-        knockback_parameters: Some(knockback),
+        knockback_parameters: knockback,
         state_and_rewards: Some(state_and_rewards),
         morph_parameters: Some(morph_params),
         equipment,
@@ -588,29 +606,6 @@ pub fn import_character_from_json(json_str: &str, project_dir: Option<&Path>) ->
 
     let is_breakable = type_id == 0x00463018;
 
-    if let Some(ref attrs) = parsed.combat_attributes {
-        validate_float_field("move_speed_scale", attrs.move_speed_scale)?;
-        validate_float_field("turn_speed_scale", attrs.turn_speed_scale)?;
-        validate_float_field("perception_radius", attrs.perception_radius)?;
-        validate_float_field("collision_radius", attrs.collision_radius)?;
-        validate_float_field("engagement_distance", attrs.engagement_distance)?;
-        validate_float_field("mass", attrs.mass)?;
-        validate_float_field("base_health", attrs.base_health)?;
-        validate_float_field("hit_reaction_force", attrs.hit_reaction_force)?;
-        validate_float_field("target_awareness_range", attrs.target_awareness_range)?;
-    }
-
-    if let Some(ref timings) = parsed.timing_parameters {
-        validate_float_field(
-            "stumble_recovery_time_sec",
-            timings.stumble_recovery_time_sec,
-        )?;
-        validate_float_field("attack_windup_time_sec", timings.attack_windup_time_sec)?;
-        validate_float_field("attack_cooldown_time_sec", timings.attack_cooldown_time_sec)?;
-        validate_float_field("block_window_time_sec", timings.block_window_time_sec)?;
-        validate_float_field("invulnerability_time_sec", timings.invulnerability_time_sec)?;
-    }
-
     let mut elements = Vec::new();
 
     let updated_lua = if let Some(ref script_rel) = parsed.lua_script_file
@@ -621,7 +616,6 @@ pub fn import_character_from_json(json_str: &str, project_dir: Option<&Path>) ->
         parsed.embedded_lua_script.clone()
     };
 
-    // Reconstruct raw unmapped components with validation
     for block in &parsed._engine_metadata.unmapped_raw_blocks {
         let mut chunk_bytes = hex::decode(&block.hex).with_context(|| {
             format!(
@@ -646,15 +640,17 @@ pub fn import_character_from_json(json_str: &str, project_dir: Option<&Path>) ->
     elements.push((21, write_length_prefixed_string(&parsed.character_name)));
     elements.push((25, write_length_prefixed_string(&parsed.character_name)));
 
+    if let Some(baby) = parsed.is_baby {
+        elements.push((162, vec![if baby { 1 } else { 0 }]));
+    }
+
     if let Some(ref flags) = parsed.actor_flags {
         let mut mask = if let Some(ref raw_h) = parsed._engine_metadata.raw_flags_hex {
             let clean_hex = raw_h
                 .trim()
                 .trim_start_matches("0x")
                 .trim_start_matches("0X");
-            u32::from_str_radix(clean_hex, 16).with_context(|| {
-                format!("Invalid hex representation in raw_flags_hex: '{}'", raw_h)
-            })?
+            u32::from_str_radix(clean_hex, 16).unwrap_or(0x2140_0000)
         } else {
             0x2140_0000
         };
@@ -729,7 +725,6 @@ pub fn import_character_from_json(json_str: &str, project_dir: Option<&Path>) ->
         elements.push((45, vec![1, 1, 0, 0]));
         elements.push((46, mat_id.to_le_bytes().to_vec()));
 
-        // Synthesize block 70 (Havok debris pieces hierarchy)
         let mut blk70 = Vec::with_capacity(1 + debris_count * 2 + debris_count * 28);
         blk70.push(debris_count as u8);
         for i in 0..debris_count {
@@ -744,7 +739,6 @@ pub fn import_character_from_json(json_str: &str, project_dir: Option<&Path>) ->
         }
         elements.push((70, blk70));
 
-        // Block 71 (Debris impulse and physics properties)
         elements.push((
             71,
             vec![
@@ -758,7 +752,6 @@ pub fn import_character_from_json(json_str: &str, project_dir: Option<&Path>) ->
             ],
         ));
 
-        // Synthesize block 200 (Health + Lua Script)
         let lua_text = updated_lua.clone().unwrap_or_else(|| {
             format!(
                 "local AliasName = GetAlias()\nCollapse(AliasName, \"{}\")",
@@ -843,8 +836,20 @@ pub fn import_character_from_json(json_str: &str, project_dir: Option<&Path>) ->
             if let Some(v) = attrs.base_health {
                 elements.push((83, v.to_le_bytes().to_vec()));
             }
+            if let Some(v) = attrs.jump_force {
+                elements.push((91, v.to_le_bytes().to_vec()));
+            }
             if let Some(v) = attrs.hit_reaction_force {
                 elements.push((121, v.to_le_bytes().to_vec()));
+            }
+            if let Some(v) = attrs.explosion_damage {
+                elements.push((137, v.to_le_bytes().to_vec()));
+            }
+            if let Some(v) = attrs.aggro_range {
+                elements.push((140, v.to_le_bytes().to_vec()));
+            }
+            if let Some(v) = attrs.damage_multiplier {
+                elements.push((155, v.to_le_bytes().to_vec()));
             }
         }
 
@@ -882,6 +887,7 @@ pub fn import_character_from_json(json_str: &str, project_dir: Option<&Path>) ->
         elements.push((111, vec![0xFF, 0xFF, 0xFF, 0xFF]));
         elements.push((114, vec![1, 0x22, 0, 0, 0, 0, 0x40]));
         elements.push((134, vec![1]));
+        elements.push((144, vec![0, 0, 0x80, 0x3F]));
         elements.push((167, vec![0]));
 
         if let Some(ref lua_code) = updated_lua
@@ -924,7 +930,7 @@ pub fn import_character_from_json(json_str: &str, project_dir: Option<&Path>) ->
 fn parse_f32_safe(chunk: &[u8]) -> Option<f32> {
     if chunk.len() >= 4 {
         let val = f32::from_le_bytes(chunk[0..4].try_into().unwrap_or_default());
-        if val.is_finite() {
+        if val.is_finite() && !val.is_nan() && val.abs() >= 1e-4 && val.abs() <= 500_000.0 {
             return Some(val);
         }
     }

@@ -273,13 +273,19 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
     {
         (AssetKind::M8ldMap, "Level Map Logic Layer (.8ld)", "🗺️")
 
-    // Priority 22: UI Sprite Collections & Atlases
-    } else if magic_bytes == b"CRL\0"
+    // Priority 22: UI Sprite Collections & CPTX Texture Maps (.map, .crl)
+    } else if magic_bytes == b"CPTX"
+        || magic_bytes == b"CRL\0"
         || data
             .windows(4)
             .any(|w| w == b"\x60\x00\x41\x00" || w == b"\x78\x00\x41\x00")
     {
-        (AssetKind::UiSprite, "UI Sprite Collection", "🖼️")
+        let label = if magic_bytes == b"CPTX" {
+            "UI Texture Atlas Map (CPTX)"
+        } else {
+            "UI Sprite Collection (CRL)"
+        };
+        (AssetKind::UiSprite, label, "🖼️")
 
     // Priority 23: Miscellaneous Engine Structures
     } else if magic_bytes == b"\x4E\x00\x41\x00" {
@@ -315,7 +321,6 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
     }
 }
 
-/// Fast header metadata scanner inspecting the first 4 KB
 fn extract_internal_strings(data: &[u8]) -> Option<String> {
     let scan_limit = data.len().min(4096);
     let header_slice = &data[..scan_limit];
@@ -342,6 +347,7 @@ fn extract_internal_strings(data: &[u8]) -> Option<String> {
                     || clean.ends_with(".8ld")
                     || clean.ends_with(".fxe")
                     || clean.ends_with(".fxa")
+                    || clean.ends_with(".map")
                 {
                     return Some(clean.to_string());
                 }

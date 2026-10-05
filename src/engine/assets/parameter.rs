@@ -13,9 +13,10 @@ pub fn export_parameter_to_json(data: &[u8], stem: &str) -> Result<String> {
             "count": files.len(),
             "files": files
         })
-    } else if data.len() == 24 && data.starts_with(&[3, 20, 0, 21]) {
+    } else if (23..=25).contains(&data.len()) && data.len() > 11 && data[0] == 3 && data[1] == 20 {
         let slen = u32::from_le_bytes(data[7..11].try_into().unwrap_or_default()) as usize;
         if slen <= 13
+            && 11 + slen <= data.len()
             && let Ok(slot_id) = std::str::from_utf8(&data[11..11 + slen])
         {
             json!({
