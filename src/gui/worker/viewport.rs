@@ -163,15 +163,23 @@ pub fn evaluate_and_render_animated_frame(
         )
     };
 
-    let (skin_matrices, lines, bone_positions) = if let Some(clip_idx) = preview.current_clip_index
-        && let Some(clip) = preview.available_clips.get(clip_idx)
-    {
-        let t = preview.current_time_seconds;
-        if let Some(sm) = preview.submeshes.first() {
-            if !sm.bones.is_empty() {
+    let (skin_matrices, lines, bone_positions) = if let Some(sm) = preview.submeshes.first() {
+        if !sm.bones.is_empty() {
+            if let Some(clip_idx) = preview.current_clip_index
+                && let Some(clip) = preview.available_clips.get(clip_idx)
+            {
+                let t = preview.current_time_seconds;
                 compute_skinning_matrices(&sm.bones, clip, t)
             } else {
-                (Vec::new(), Vec::new(), Vec::new())
+                // Slot 0: [REST POSE / BIND POSE] - compute pure bind pose skinning
+                let empty_clip = crate::engine::assets::animation::AnimationClip {
+                    name: "RestPose".into(),
+                    target_rig: "".into(),
+                    frame_rate: 30.0,
+                    duration_seconds: 0.0,
+                    bone_tracks: Vec::new(),
+                };
+                compute_skinning_matrices(&sm.bones, &empty_clip, 0.0)
             }
         } else {
             (Vec::new(), Vec::new(), Vec::new())
@@ -180,20 +188,25 @@ pub fn evaluate_and_render_animated_frame(
         (Vec::new(), Vec::new(), Vec::new())
     };
 
+    // Align skeleton lines and bone labels directly with mesh shader space: [X, -Z, Y]
+    let align_to_viewport = |raw_x: f32, raw_y: f32, raw_z: f32| -> [f32; 3] {
+        let base = [raw_x, -raw_z, raw_y];
+        match cam.up_axis {
+            1 => [base[0], -base[2], base[1]],
+            2 => [base[0], base[2], -base[1]],
+            3 => [base[0], -base[1], -base[2]],
+            _ => base,
+        }
+    };
+
     let mut debug_lines = Vec::new();
     if show_skeleton {
         for mut line_vert in lines {
-            let p = Vector3 {
-                x: line_vert.position[0],
-                y: line_vert.position[1],
-                z: line_vert.position[2],
-            };
-            let tp = match cam.up_axis {
-                1 => [p.x, -p.z, p.y],
-                2 => [p.x, p.z, -p.y],
-                3 => [p.x, -p.y, -p.z],
-                _ => [p.x, p.y, p.z],
-            };
+            let tp = align_to_viewport(
+                line_vert.position[0],
+                line_vert.position[1],
+                line_vert.position[2],
+            );
             line_vert.position = tp;
             debug_lines.push(line_vert);
         }
@@ -203,15 +216,15 @@ pub fn evaluate_and_render_animated_frame(
     let mut max = Vec3::splat(f32::NEG_INFINITY);
     for sm in &preview.submeshes {
         for &p in &sm.rest_positions {
-            let aligned = Vec3::new(p.x, -p.z, p.y);
+            let aligned = [p.x, -p.z, p.y];
             let tp = match cam.up_axis {
-                1 => Vec3::new(aligned.x, -aligned.z, aligned.y),
-                2 => Vec3::new(aligned.x, aligned.z, -aligned.y),
-                3 => Vec3::new(aligned.x, -aligned.y, -aligned.z),
+                1 => [aligned[0], -aligned[2], aligned[1]],
+                2 => [aligned[0], aligned[2], -aligned[1]],
+                3 => [aligned[0], -aligned[1], -aligned[2]],
                 _ => aligned,
             };
-            min = min.min(tp);
-            max = max.max(tp);
+            min = min.min(Vec3::from(tp));
+            max = max.max(Vec3::from(tp));
         }
     }
     let center = if min.x.is_finite() {
@@ -240,13 +253,8 @@ pub fn evaluate_and_render_animated_frame(
         for (b_idx, bone) in sm.bones.iter().enumerate() {
             if b_idx < bone_positions.len() {
                 let raw_p = bone_positions[b_idx];
-                let tp = match cam.up_axis {
-                    1 => Vec3::new(raw_p.x, -raw_p.z, raw_p.y),
-                    2 => Vec3::new(raw_p.x, raw_p.z, -raw_p.y),
-                    3 => Vec3::new(raw_p.x, -raw_p.y, -raw_p.z),
-                    _ => Vec3::new(raw_p.x, raw_p.y, raw_p.z),
-                };
-                let world_pos = Vec4::new(tp.x, tp.y, tp.z, 1.0);
+                let tp = align_to_viewport(raw_p.x, raw_p.y, raw_p.z);
+                let world_pos = Vec4::new(tp[0], tp[1], tp[2], 1.0);
                 let clip_pos = view_proj * world_pos;
                 if clip_pos.w > 0.05 {
                     let ndc = clip_pos.truncate() / clip_pos.w;

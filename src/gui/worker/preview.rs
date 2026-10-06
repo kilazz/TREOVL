@@ -47,25 +47,105 @@ pub fn load_mesh_with_smart_texture(
     })
 }
 
-pub fn find_master_skeleton(project_dir: Option<&Path>) -> Option<Vec<ObjectBone>> {
+/// Finds the best matching skeleton for the given mesh using dependency_graph.json or the master object chunk.
+pub fn find_master_skeleton_for_mesh(
+    mesh_stem: &str,
+    project_dir: Option<&Path>,
+) -> Option<Vec<ObjectBone>> {
     let base_dir = project_dir?;
     let chunks_dir = base_dir.join("chunks");
+    let assets_dir = base_dir.join("assets");
+
     if !chunks_dir.exists() {
         return None;
     }
 
-    for entry in fs::read_dir(&chunks_dir).ok()?.flatten() {
-        let p = entry.path();
-        if p.is_file()
-            && p.extension().is_some_and(|e| e == "bin")
+    let norm_mesh = s_normalize(mesh_stem);
+
+    // 1. Try resolving via objects directory (find an object JSON referencing this mesh)
+    let objects_dir = assets_dir.join("objects");
+    if objects_dir.exists()
+        && let Ok(entries) = fs::read_dir(&objects_dir)
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "json")
+                && let Ok(content) = fs::read_to_string(&path)
+                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&content)
+            {
+                let mut matches = false;
+                if let Some(bindings) = v["mesh_bindings"].as_array() {
+                    for b in bindings {
+                        let m_path = b["mesh_path"].as_str().unwrap_or_default();
+                        let m_name = b["mesh_part_name"].as_str().unwrap_or_default();
+                        if s_normalize(m_path).contains(&norm_mesh)
+                            || norm_mesh.contains(&s_normalize(m_path))
+                            || s_normalize(m_name).contains(&norm_mesh)
+                        {
+                            matches = true;
+                            break;
+                        }
+                    }
+                }
+
+                if matches
+                    && let Some(bones_val) = v["bones"].as_array()
+                    && !bones_val.is_empty()
+                    && let Ok(obj_bones) = serde_json::from_value::<
+                        Vec<crate::engine::assets::object::FullObjectBoneJson>,
+                    >(v["bones"].clone())
+                {
+                    return Some(obj_bones.into_iter().map(|b| b.to_object_bone()).collect());
+                }
+            }
+        }
+    }
+
+    // 2. Prioritize candidate chunks with full adult skeletons (e.g., chunk_0071)
+    let candidates = [
+        "chunk_0071_id0x2F.bin",
+        "chunk_0072_id0x30.bin",
+        "chunk_0066_id0x2A.bin",
+    ];
+
+    for c in &candidates {
+        let p = chunks_dir.join(c);
+        if p.exists()
             && let Ok(bytes) = fs::read(&p)
             && let Ok(bones) = parse_object_bone_container(&bytes)
-            && !bones.is_empty()
+            && bones.len() >= 40
         {
             return Some(bones);
         }
     }
-    None
+
+    // 3. Fallback: Search any chunk containing a complete bone hierarchy
+    let mut fallback = None;
+    if let Ok(entries) = fs::read_dir(&chunks_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file()
+                && p.extension().is_some_and(|e| e == "bin")
+                && let Ok(bytes) = fs::read(&p)
+                && let Ok(bones) = parse_object_bone_container(&bytes)
+                && !bones.is_empty()
+            {
+                let len = bones.len();
+                if len >= 40 {
+                    return Some(bones);
+                }
+                if fallback.is_none() {
+                    fallback = Some(bones);
+                }
+            }
+        }
+    }
+
+    fallback
+}
+
+pub fn find_master_skeleton(project_dir: Option<&Path>) -> Option<Vec<ObjectBone>> {
+    find_master_skeleton_for_mesh("", project_dir)
 }
 
 pub fn discover_companion_animations(

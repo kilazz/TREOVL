@@ -38,7 +38,7 @@ fn vs_main(model: VertexInput) -> VertexOutput {
     var local_pos = vec4<f32>(model.position, 1.0);
     var local_norm = model.normal;
 
-    // GPU Vertex Skinning: linear blend skinning across 4 bone weights
+    // 1. Apply vertex skinning in pure native model coordinates (Triumph engine space)
     let is_skinned = scene.params.y > 0.5;
     if (is_skinned && (model.weights.x + model.weights.y + model.weights.z + model.weights.w) > 0.001) {
         let bone_m = model.weights.x * bones.matrices[model.joints.x]
@@ -50,24 +50,23 @@ fn vs_main(model: VertexInput) -> VertexOutput {
         local_norm = (bone_m * vec4<f32>(local_norm, 0.0)).xyz;
     }
 
-    // Global Viewport Orientation Converter:
-    // Mode 0 (Default / Ground): [x, y, z] (Already synchronized with skeleton)
-    // Mode 1 (Pitch Up +90°): [x, -z, y]
-    // Mode 2 (Pitch Down -90°): [x, z, -y]
-    // Mode 3 (Invert 180°): [x, -y, -z]
+    // 2. Map coordinates to WGPU Viewport (Y-up: X=Right, Y=-Z (Height Up), Z=Y (Forward))
+    let base_world_pos = vec3<f32>(local_pos.x, -local_pos.z, local_pos.y);
+    let base_world_norm = vec3<f32>(local_norm.x, -local_norm.z, local_norm.y);
+
     let up_axis = u32(scene.params.z);
-    var world_pos = local_pos.xyz;
-    var world_norm = local_norm;
+    var world_pos = base_world_pos;
+    var world_norm = base_world_norm;
 
     if (up_axis == 1u) {
-        world_pos = vec3<f32>(local_pos.x, -local_pos.z, local_pos.y);
-        world_norm = vec3<f32>(local_norm.x, -local_norm.z, local_norm.y);
+        world_pos = vec3<f32>(base_world_pos.x, -base_world_pos.z, base_world_pos.y);
+        world_norm = vec3<f32>(base_world_norm.x, -base_world_norm.z, base_world_norm.y);
     } else if (up_axis == 2u) {
-        world_pos = vec3<f32>(local_pos.x, local_pos.z, -local_pos.y);
-        world_norm = vec3<f32>(local_norm.x, local_norm.z, -local_norm.y);
+        world_pos = vec3<f32>(base_world_pos.x, base_world_pos.z, -base_world_pos.y);
+        world_norm = vec3<f32>(base_world_norm.x, base_world_norm.z, -base_world_norm.y);
     } else if (up_axis == 3u) {
-        world_pos = vec3<f32>(local_pos.x, -local_pos.y, -local_pos.z);
-        world_norm = vec3<f32>(local_norm.x, -local_norm.y, -local_norm.z);
+        world_pos = vec3<f32>(base_world_pos.x, -base_world_pos.y, -base_world_pos.z);
+        world_norm = vec3<f32>(base_world_norm.x, -base_world_norm.y, -base_world_norm.z);
     }
 
     out.clip_position = scene.view_proj * vec4<f32>(world_pos, 1.0);
@@ -86,19 +85,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let tex_color = textureSample(t_diffuse, s_diffuse, in.tex_coords);
     let mode = u32(scene.params.x);
 
-    // Mode 2: Unlit (Pure Albedo / Texture inspect)
+    // Mode 2: Unlit
     if (mode == 2u) {
         return vec4<f32>(tex_color.rgb, 1.0);
     }
 
     let norm = normalize(in.world_normal);
 
-    // 3-Point Double-Sided Studio Lighting Rig
+    // 3-Point Studio Lighting
     let key_dir = normalize(vec3<f32>(0.5, 0.85, 0.65));
     let fill_dir = normalize(vec3<f32>(-0.6, 0.35, -0.5));
     let back_dir = normalize(vec3<f32>(0.0, -0.8, -0.6));
 
-    // abs() ensures two-sided illumination on thin/double-sided geometry
     let key_diff = abs(dot(norm, key_dir)) * 0.75;
     let fill_diff = abs(dot(norm, fill_dir)) * 0.35;
     let back_diff = abs(dot(norm, back_dir)) * 0.15;

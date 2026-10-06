@@ -33,7 +33,7 @@ pub struct RawObjectBone {
     pub rotation: [f32; 4],      // Local rotation quaternion
     pub translation: [f32; 3],   // Local translation vector
     pub bone_id: i32,            // Bone ID / skin index (offset 124)
-    pub parent_index: i32,       // True parent bone index (-1 for Root) (offset 128)
+    pub parent_index: i32,       // True parent index (-1 for Root) (offset 128)
     pub next_sibling_index: i32, // Pointer to next sibling (offset 132)
     pub first_child_index: i32,  // Pointer to first child (offset 136)
     pub aux_id: i32,             // Auxiliary flags (offset 140)
@@ -232,6 +232,7 @@ pub fn export_skeleton_to_glb(bones: &[ObjectBone], rig_name: &str) -> Result<Ve
             bone.name.clone()
         };
 
+        // Z-up to Y-up mapping for GLB Export
         let (tx, ty, tz) = if is_root {
             (
                 sanitize_f32(bone.translation.x, 0.0),
@@ -533,6 +534,7 @@ fn parse_rotation_stream(
 
             let mut q = Quat::from_xyzw(x, y, z, w).normalize();
 
+            // Enforce shortest-path continuity
             if let Some(prev) = previous_q
                 && prev.dot(q) < 0.0
             {
@@ -654,6 +656,7 @@ fn parse_rotation_blob(data: &[u8], total_duration: f32, rotations: &mut Vec<Key
         }
     } else if chunk_len.is_multiple_of(10) {
         let count = chunk_len / 10;
+        let mut previous_q: Option<Quat> = None;
         for i in 0..count {
             let chunk = &data[i * 10..(i + 1) * 10];
             let micros = u32::from_le_bytes(chunk[0..4].try_into().unwrap_or_default());
@@ -665,11 +668,26 @@ fn parse_rotation_blob(data: &[u8], total_duration: f32, rotations: &mut Vec<Key
             let w_sq = 1.0 - (x * x + y * y + z * z);
             let w = if w_sq > 0.0 { w_sq.sqrt() } else { 0.0 };
 
+            let mut q = Quat::from_xyzw(x, y, z, w).normalize();
+
+            // Enforce shortest-path continuity
+            if let Some(prev) = previous_q
+                && prev.dot(q) < 0.0
+            {
+                q = -q;
+            }
+            previous_q = Some(q);
+
             let time_seconds = (micros as f32 / 1_000_000.0).min(total_duration);
             rotations.push(KeyframeRotation {
                 time_seconds,
                 rotation_euler: BoneRotation::default(),
-                rotation_quat: Vector4 { x, y, z, w },
+                rotation_quat: Vector4 {
+                    x: q.x,
+                    y: q.y,
+                    z: q.z,
+                    w: q.w,
+                },
             });
         }
     } else if chunk_len.is_multiple_of(8) {
@@ -732,8 +750,8 @@ pub fn export_animation_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>> {
 
                 if is_root {
                     val_bytes.write_f32::<LittleEndian>(px)?;
-                    val_bytes.write_f32::<LittleEndian>(-pz)?;
-                    val_bytes.write_f32::<LittleEndian>(py)?;
+                    val_bytes.write_f32::<LittleEndian>(pz)?;
+                    val_bytes.write_f32::<LittleEndian>(-py)?;
                 } else {
                     val_bytes.write_f32::<LittleEndian>(px)?;
                     val_bytes.write_f32::<LittleEndian>(py)?;
@@ -865,27 +883,46 @@ pub fn compute_skinning_matrices(
         return (Vec::new(), Vec::new(), Vec::new());
     }
 
+    // Базовый поворот для корневых костей (компенсация 90 градусов между базисом Biped и мешем)
+    let root_quat_fix = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+
     // 1. Compute Bind Global Matrices (Forward Kinematics on Rest Pose)
     let mut bind_global = vec![None; num_bones];
 
-    fn get_bind_local(bone: &ObjectBone) -> Mat4 {
-        let rot = Quat::from_xyzw(
+    let get_bind_local = |bone: &ObjectBone| -> Mat4 {
+        let raw_rot = Quat::from_xyzw(
             bone.rotation.x,
             bone.rotation.y,
             bone.rotation.z,
             bone.rotation.w,
         )
         .normalize();
-        let trans = Vec3::new(bone.translation.x, bone.translation.y, bone.translation.z);
-        Mat4::from_rotation_translation(rot, trans)
-    }
 
-    fn calc_bind_global(
+        let raw_trans = Vec3::new(bone.translation.x, bone.translation.y, bone.translation.z);
+
+        // Для корневой кости (parent_index < 0) поворачиваем базис на 90 градусов
+        let (rot, trans) = if bone.parent_index < 0 {
+            (
+                (root_quat_fix * raw_rot).normalize(),
+                root_quat_fix * raw_trans,
+            )
+        } else {
+            (raw_rot, raw_trans)
+        };
+
+        Mat4::from_rotation_translation(rot, trans)
+    };
+
+    fn calc_bind_global<F>(
         idx: usize,
         bones: &[ObjectBone],
         bind_global: &mut [Option<Mat4>],
         visited: &mut [bool],
-    ) -> Mat4 {
+        get_local: &F,
+    ) -> Mat4
+    where
+        F: Fn(&ObjectBone) -> Mat4,
+    {
         if let Some(m) = bind_global[idx] {
             return m;
         }
@@ -894,11 +931,11 @@ pub fn compute_skinning_matrices(
         }
         visited[idx] = true;
 
-        let local_m = get_bind_local(&bones[idx]);
+        let local_m = get_local(&bones[idx]);
         let p_idx = bones[idx].parent_index;
 
         let global_m = if p_idx >= 0 && (p_idx as usize) < bones.len() && (p_idx as usize) != idx {
-            let parent_m = calc_bind_global(p_idx as usize, bones, bind_global, visited);
+            let parent_m = calc_bind_global(p_idx as usize, bones, bind_global, visited, get_local);
             parent_m * local_m
         } else {
             local_m
@@ -911,7 +948,7 @@ pub fn compute_skinning_matrices(
     let mut bind_inv_matrices = Vec::with_capacity(num_bones);
     for i in 0..num_bones {
         let mut visited = vec![false; num_bones];
-        let bg = calc_bind_global(i, bones, &mut bind_global, &mut visited);
+        let bg = calc_bind_global(i, bones, &mut bind_global, &mut visited, &get_bind_local);
         bind_inv_matrices.push(bg.inverse());
     }
 
@@ -921,7 +958,7 @@ pub fn compute_skinning_matrices(
     for bone in bones {
         let track_opt = clip.bone_tracks.iter().find(|t| t.bone_name == bone.name);
 
-        let translation = if let Some(track) = track_opt
+        let raw_trans = if let Some(track) = track_opt
             && !track.translations.is_empty()
         {
             sample_translation(&track.translations, time_seconds)
@@ -929,7 +966,7 @@ pub fn compute_skinning_matrices(
             Vec3::new(bone.translation.x, bone.translation.y, bone.translation.z)
         };
 
-        let rotation = if let Some(track) = track_opt
+        let raw_rot = if let Some(track) = track_opt
             && !track.rotations.is_empty()
         {
             sample_rotation(&track.rotations, time_seconds)
@@ -940,9 +977,20 @@ pub fn compute_skinning_matrices(
                 bone.rotation.z,
                 bone.rotation.w,
             )
+            .normalize()
         };
 
-        let local_m = Mat4::from_rotation_translation(rotation.normalize(), translation);
+        // Корректируем корневую кость и во время анимации
+        let (rotation, translation) = if bone.parent_index < 0 {
+            (
+                (root_quat_fix * raw_rot).normalize(),
+                root_quat_fix * raw_trans,
+            )
+        } else {
+            (raw_rot, raw_trans)
+        };
+
+        let local_m = Mat4::from_rotation_translation(rotation, translation);
         local_animated.push(local_m);
     }
 
@@ -987,7 +1035,7 @@ pub fn compute_skinning_matrices(
         );
     }
 
-    // 4. Extract 3D Bone Joint Positions for skeleton lines and labels
+    // 4. Extract 3D Bone Joint Positions in native model coordinates
     let bone_positions: Vec<Vec3> = global_animated
         .iter()
         .map(|g_opt| g_opt.unwrap_or(Mat4::IDENTITY).transform_point3(Vec3::ZERO))
@@ -1016,10 +1064,17 @@ pub fn compute_skinning_matrices(
     }
 
     // 6. Compute Final Skinning Matrices: (Global_Anim * Bind_Inv)
-    let mut skin_matrices = Vec::with_capacity(num_bones);
+    let mut skin_matrices = vec![Mat4::IDENTITY; 128];
     for i in 0..num_bones {
+        let b_id = bones[i].bone_id;
         let g = global_animated[i].unwrap_or(Mat4::IDENTITY);
-        skin_matrices.push(g * bind_inv_matrices[i]);
+        let m = g * bind_inv_matrices[i];
+
+        if b_id >= 0 && (b_id as usize) < skin_matrices.len() {
+            skin_matrices[b_id as usize] = m;
+        } else if i < skin_matrices.len() {
+            skin_matrices[i] = m;
+        }
     }
 
     (skin_matrices, debug_lines, bone_positions)
@@ -1087,13 +1142,19 @@ fn sample_rotation(keys: &[KeyframeRotation], time: f32) -> Quat {
                 k0.rotation_quat.w,
             )
             .normalize();
-            let q1 = Quat::from_xyzw(
+            let mut q1 = Quat::from_xyzw(
                 k1.rotation_quat.x,
                 k1.rotation_quat.y,
                 k1.rotation_quat.z,
                 k1.rotation_quat.w,
             )
             .normalize();
+
+            // Ensure shortest path interpolation to avoid 360-degree joint flips
+            if q0.dot(q1) < 0.0 {
+                q1 = -q1;
+            }
+
             return q0.slerp(q1, factor).normalize();
         }
     }

@@ -218,10 +218,9 @@ pub fn extract_mesh_geometry_with_endian(
     let has_indices = attributes
         .iter()
         .any(|a| a.semantic == VertexSemantic::BlendIndices);
-    let is_skinned = has_weights && has_indices;
+    let is_skinned = (has_weights && has_indices) || stride == 53 || stride == 54;
 
-    let num_bones = bones.len();
-    let vertex_count = raw_vertices.len() / stride;
+    let vertex_count = raw_vertices.len().checked_div(stride).unwrap_or(0);
     let mut positions = Vec::with_capacity(vertex_count);
     let mut normals = Vec::with_capacity(vertex_count);
     let mut uvs = Vec::with_capacity(vertex_count);
@@ -230,87 +229,141 @@ pub fn extract_mesh_geometry_with_endian(
 
     for i in 0..vertex_count {
         let base = i * stride;
+        if base + stride > raw_vertices.len() {
+            break;
+        }
         let vdata = &raw_vertices[base..base + stride];
 
         let mut pos = Vector3::default();
         let mut norm = Vector3::default();
         let mut uv = Vector2::default();
-        let mut w_val = Vector4::default();
+        let mut w_val = Vector4 {
+            x: 1.0,
+            y: 0.0,
+            z: 0.0,
+            w: 0.0,
+        };
         let mut j_val = [0u16; 4];
 
-        let mut weight_slot = 0;
-        let mut joint_slot = 0;
-        let mut offset = 0;
+        // 1. Direct Triumph 53/54-byte packed layout parser (Overlord 1 & 2 character/creature meshes)
+        if stride == 53 || stride == 54 {
+            let mut cur = Cursor::new(&vdata[0..12]);
+            pos = Vector3 {
+                x: endian.read_f32(&mut cur).unwrap_or(0.0),
+                y: endian.read_f32(&mut cur).unwrap_or(0.0),
+                z: endian.read_f32(&mut cur).unwrap_or(0.0),
+            };
 
-        for attr in &attributes {
-            match attr.semantic {
-                VertexSemantic::Position => {
-                    let mut cur = Cursor::new(&vdata[offset..offset + 12]);
-                    pos = Vector3 {
-                        x: endian.read_f32(&mut cur).unwrap_or(0.0),
-                        y: endian.read_f32(&mut cur).unwrap_or(0.0),
-                        z: endian.read_f32(&mut cur).unwrap_or(0.0),
-                    };
+            let mut cur_n = Cursor::new(&vdata[12..24]);
+            norm = Vector3 {
+                x: endian.read_f32(&mut cur_n).unwrap_or(0.0),
+                y: endian.read_f32(&mut cur_n).unwrap_or(1.0),
+                z: endian.read_f32(&mut cur_n).unwrap_or(0.0),
+            };
+
+            let mut cur_uv = Cursor::new(&vdata[24..32]);
+            uv = Vector2 {
+                x: endian.read_f32(&mut cur_uv).unwrap_or(0.0),
+                y: endian.read_f32(&mut cur_uv).unwrap_or(0.0),
+            };
+
+            // Offset 32, 33, 34: Exact bone indices
+            j_val[0] = vdata[32] as u16;
+            j_val[1] = vdata[33] as u16;
+            j_val[2] = vdata[34] as u16;
+            j_val[3] = 0;
+
+            // Offset 35, 36: Exact normalized bone weights
+            let w0 = vdata[35] as f32 / 255.0;
+            let w1 = vdata[36] as f32 / 255.0;
+            let w2 = (1.0 - (w0 + w1)).max(0.0);
+
+            w_val = Vector4 {
+                x: w0,
+                y: w1,
+                z: w2,
+                w: 0.0,
+            };
+        } else {
+            // 2. Generic flexible FVF descriptor parser
+            let mut weight_slot = 0;
+            let mut joint_slot = 0;
+            let mut offset = 0;
+
+            for attr in &attributes {
+                if offset + attr.byte_size > vdata.len() {
+                    break;
                 }
-                VertexSemantic::Normal => {
-                    let mut cur = Cursor::new(&vdata[offset..offset + 12]);
-                    norm = Vector3 {
-                        x: endian.read_f32(&mut cur).unwrap_or(0.0),
-                        y: endian.read_f32(&mut cur).unwrap_or(1.0),
-                        z: endian.read_f32(&mut cur).unwrap_or(0.0),
-                    };
-                }
-                VertexSemantic::TexCoord => {
-                    let mut cur = Cursor::new(&vdata[offset..offset + 8]);
-                    uv = Vector2 {
-                        x: endian.read_f32(&mut cur).unwrap_or(0.0),
-                        y: endian.read_f32(&mut cur).unwrap_or(0.0),
-                    };
-                }
-                VertexSemantic::BlendWeights => {
-                    if attr.byte_size == 16 {
-                        let mut cur = Cursor::new(&vdata[offset..offset + 16]);
-                        w_val = Vector4 {
-                            x: endian.read_f32(&mut cur).unwrap_or(1.0),
+                match attr.semantic {
+                    VertexSemantic::Position => {
+                        let mut cur = Cursor::new(&vdata[offset..offset + 12]);
+                        pos = Vector3 {
+                            x: endian.read_f32(&mut cur).unwrap_or(0.0),
                             y: endian.read_f32(&mut cur).unwrap_or(0.0),
                             z: endian.read_f32(&mut cur).unwrap_or(0.0),
-                            w: endian.read_f32(&mut cur).unwrap_or(0.0),
                         };
-                    } else if attr.byte_size == 12 {
+                    }
+                    VertexSemantic::Normal => {
                         let mut cur = Cursor::new(&vdata[offset..offset + 12]);
-                        let x = endian.read_f32(&mut cur).unwrap_or(1.0);
-                        let y = endian.read_f32(&mut cur).unwrap_or(0.0);
-                        let z = endian.read_f32(&mut cur).unwrap_or(0.0);
-                        w_val = Vector4 {
-                            x,
-                            y,
-                            z,
-                            w: (1.0 - (x + y + z)).max(0.0),
+                        norm = Vector3 {
+                            x: endian.read_f32(&mut cur).unwrap_or(0.0),
+                            y: endian.read_f32(&mut cur).unwrap_or(1.0),
+                            z: endian.read_f32(&mut cur).unwrap_or(0.0),
                         };
-                    } else if attr.byte_size == 1 {
-                        let w_norm = vdata[offset] as f32 / 255.0;
-                        match weight_slot {
-                            0 => w_val.x = w_norm,
-                            1 => w_val.y = w_norm,
-                            2 => w_val.z = w_norm,
-                            3 => w_val.w = w_norm,
-                            _ => {}
+                    }
+                    VertexSemantic::TexCoord => {
+                        let mut cur = Cursor::new(&vdata[offset..offset + 8]);
+                        uv = Vector2 {
+                            x: endian.read_f32(&mut cur).unwrap_or(0.0),
+                            y: endian.read_f32(&mut cur).unwrap_or(0.0),
+                        };
+                    }
+                    VertexSemantic::BlendWeights => {
+                        if attr.byte_size == 16 {
+                            let mut cur = Cursor::new(&vdata[offset..offset + 16]);
+                            w_val = Vector4 {
+                                x: endian.read_f32(&mut cur).unwrap_or(1.0),
+                                y: endian.read_f32(&mut cur).unwrap_or(0.0),
+                                z: endian.read_f32(&mut cur).unwrap_or(0.0),
+                                w: endian.read_f32(&mut cur).unwrap_or(0.0),
+                            };
+                        } else if attr.byte_size == 12 {
+                            let mut cur = Cursor::new(&vdata[offset..offset + 12]);
+                            let x = endian.read_f32(&mut cur).unwrap_or(1.0);
+                            let y = endian.read_f32(&mut cur).unwrap_or(0.0);
+                            let z = endian.read_f32(&mut cur).unwrap_or(0.0);
+                            w_val = Vector4 {
+                                x,
+                                y,
+                                z,
+                                w: (1.0 - (x + y + z)).max(0.0),
+                            };
+                        } else if attr.byte_size == 1 {
+                            let w_norm = vdata[offset] as f32 / 255.0;
+                            match weight_slot {
+                                0 => w_val.x = w_norm,
+                                1 => w_val.y = w_norm,
+                                2 => w_val.z = w_norm,
+                                3 => w_val.w = w_norm,
+                                _ => {}
+                            }
+                            weight_slot += 1;
                         }
-                        weight_slot += 1;
                     }
-                }
-                VertexSemantic::BlendIndices => {
-                    if attr.byte_size == 4 {
-                        let val: [u8; 4] = bytemuck::pod_read_unaligned(&vdata[offset..offset + 4]);
-                        j_val = [val[0] as u16, val[1] as u16, val[2] as u16, val[3] as u16];
-                    } else if attr.byte_size == 1 && joint_slot < 4 {
-                        j_val[joint_slot] = vdata[offset] as u16;
-                        joint_slot += 1;
+                    VertexSemantic::BlendIndices => {
+                        if attr.byte_size == 4 {
+                            let val: [u8; 4] =
+                                bytemuck::pod_read_unaligned(&vdata[offset..offset + 4]);
+                            j_val = [val[0] as u16, val[1] as u16, val[2] as u16, val[3] as u16];
+                        } else if attr.byte_size == 1 && joint_slot < 4 {
+                            j_val[joint_slot] = vdata[offset] as u16;
+                            joint_slot += 1;
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
+                offset += attr.byte_size;
             }
-            offset += attr.byte_size;
         }
 
         let weight_sum = w_val.x + w_val.y + w_val.z + w_val.w;
@@ -329,13 +382,11 @@ pub fn extract_mesh_geometry_with_endian(
             };
         }
 
-        if num_bones > 0 {
-            let max_bone_idx = (num_bones - 1) as u16;
-            j_val[0] = j_val[0].min(max_bone_idx);
-            j_val[1] = j_val[1].min(max_bone_idx);
-            j_val[2] = j_val[2].min(max_bone_idx);
-            j_val[3] = j_val[3].min(max_bone_idx);
-        }
+        // Clamp joint indices to safe uniform palette capacity
+        j_val[0] = j_val[0].min(127);
+        j_val[1] = j_val[1].min(127);
+        j_val[2] = j_val[2].min(127);
+        j_val[3] = j_val[3].min(127);
 
         positions.push(pos);
         normals.push(norm);
@@ -362,9 +413,6 @@ pub fn extract_mesh_geometry_with_endian(
     })
 }
 
-/// Exports mesh to glTF 2.0 Binary (.glb).
-/// Automatically applies the Blender Upright Converter (X'=X, Y'=-Z, Z'=Y)
-/// and inverts triangle winding order (0, 2, 1) so front faces are counter-clockwise (CCW).
 pub fn export_mesh_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, MeshStats)> {
     let parsed = extract_mesh_geometry(chunk_data)?;
     let vertex_count = parsed.positions.len();
@@ -396,7 +444,6 @@ pub fn export_mesh_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, MeshStats)> {
     let (ind_view, comp_type) = if max_idx <= 0xFFFF {
         let mut ind_bytes = Vec::with_capacity(parsed.indices.len() * 2);
         for tri in parsed.indices.as_chunks::<3>().0 {
-            // Winding Order: (0, 2, 1) converts LH CW -> RH CCW for glTF 2.0 and Blender
             ind_bytes.write_u16::<LittleEndian>(tri[0] as u16)?;
             ind_bytes.write_u16::<LittleEndian>(tri[2] as u16)?;
             ind_bytes.write_u16::<LittleEndian>(tri[1] as u16)?;
@@ -405,7 +452,6 @@ pub fn export_mesh_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, MeshStats)> {
     } else {
         let mut ind_bytes = Vec::with_capacity(parsed.indices.len() * 4);
         for tri in parsed.indices.as_chunks::<3>().0 {
-            // Winding Order: (0, 2, 1) converts LH CW -> RH CCW for glTF 2.0 and Blender
             ind_bytes.write_u32::<LittleEndian>(tri[0])?;
             ind_bytes.write_u32::<LittleEndian>(tri[2])?;
             ind_bytes.write_u32::<LittleEndian>(tri[1])?;
@@ -696,6 +742,55 @@ fn pack_vertex_buffer_preserving_fvf(
     let mut cur_vbuf = Cursor::new(&mut vertex_buffer);
 
     for i in 0..pos_count {
+        if stride == 53 || stride == 54 {
+            let p = streams.positions.get(i).copied().unwrap_or_default();
+            endian.write_f32(&mut cur_vbuf, p.x)?;
+            endian.write_f32(&mut cur_vbuf, p.y)?;
+            endian.write_f32(&mut cur_vbuf, p.z)?;
+
+            let n = streams.normals.get(i).copied().unwrap_or(Vector3 {
+                x: 0.0,
+                y: 1.0,
+                z: 0.0,
+            });
+            endian.write_f32(&mut cur_vbuf, n.x)?;
+            endian.write_f32(&mut cur_vbuf, n.y)?;
+            endian.write_f32(&mut cur_vbuf, n.z)?;
+
+            let uv = streams.uvs.get(i).copied().unwrap_or_default();
+            endian.write_f32(&mut cur_vbuf, uv.x)?;
+            endian.write_f32(&mut cur_vbuf, uv.y)?;
+
+            let j = streams.joints.get(i).copied().unwrap_or([0, 0, 0, 0]);
+            cur_vbuf.write_all(&[j[0], j[1], j[2]])?;
+
+            let w = streams.weights.get(i).copied().unwrap_or(Vector4 {
+                x: 1.0,
+                y: 0.0,
+                z: 0.0,
+                w: 0.0,
+            });
+            let w0 = (w.x * 255.0).clamp(0.0, 255.0) as u8;
+            let w1 = (w.y * 255.0).clamp(0.0, 255.0) as u8;
+            cur_vbuf.write_all(&[w0, w1])?;
+
+            let t = streams.tangents.get(i).copied().unwrap_or(Vector4 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+                w: 1.0,
+            });
+            endian.write_f32(&mut cur_vbuf, t.x)?;
+            endian.write_f32(&mut cur_vbuf, t.y)?;
+            endian.write_f32(&mut cur_vbuf, t.z)?;
+            endian.write_f32(&mut cur_vbuf, t.w)?;
+
+            if stride == 54 {
+                cur_vbuf.write_all(&[0u8])?;
+            }
+            continue;
+        }
+
         for attr in attributes {
             match attr.semantic {
                 VertexSemantic::Position => {
@@ -769,8 +864,6 @@ fn pack_vertex_buffer_preserving_fvf(
     Ok(vertex_buffer)
 }
 
-/// Imports glTF 2.0 Binary (.glb) into a mesh chunk.
-/// Converts Blender (Y-Up) back to Game (Z-Up) and symmetrically inverts triangle winding order.
 pub fn import_glb_to_mesh(original_chunk: &[u8], glb_bytes: &[u8]) -> Result<Vec<u8>> {
     if glb_bytes.len() < 20 || &glb_bytes[0..4] != b"glTF" {
         bail!("Invalid .glb file format (missing 'glTF' signature)");
@@ -849,7 +942,6 @@ pub fn import_glb_to_mesh(original_chunk: &[u8], glb_bytes: &[u8]) -> Result<Vec
     let pos_slice = read_buffer_view_slice(pos_acc_idx)?;
     let mut pos_cur = Cursor::new(pos_slice);
 
-    // Symmetric Reverse Converter: Blender (Y-Up) -> Triumph Game (Z-Up): X=X', Y=Z', Z=-Y'
     let mut raw_positions = Vec::with_capacity(pos_count);
     for _ in 0..pos_count {
         let bx = pos_cur.read_f32::<LittleEndian>().unwrap_or(0.0);
@@ -932,9 +1024,9 @@ pub fn import_glb_to_mesh(original_chunk: &[u8], glb_bytes: &[u8]) -> Result<Vec
         let mut j_cur = Cursor::new(j_slice);
 
         let max_bone_idx = if num_bones > 0 {
-            (num_bones - 1) as u8
+            (num_bones - 1).min(127) as u8
         } else {
-            255
+            127
         };
 
         for j in raw_joints.iter_mut().take(pos_count) {
@@ -1007,7 +1099,6 @@ pub fn import_glb_to_mesh(original_chunk: &[u8], glb_bytes: &[u8]) -> Result<Vec
         index_buffer.push(idx);
     }
 
-    // Invert winding order back to engine's original order: (tri[0], tri[2], tri[1]) -> (tri[0], tri[1], tri[2])
     for tri in index_buffer.as_chunks_mut::<3>().0 {
         tri.swap(1, 2);
     }
@@ -1033,8 +1124,8 @@ pub fn import_glb_to_mesh(original_chunk: &[u8], glb_bytes: &[u8]) -> Result<Vec
                     VertexAttribute::from_descriptor(0x03090000),
                 ],
                 vec![
-                    0x02010000, 0x02040000, 0x01050000, 0x040B0001,
-                    0x040B0002, 0x070A0100, 0x070A0101, 0x03090000,
+                    0x02010000, 0x02040000, 0x01050000, 0x040B0001, 0x040B0002, 0x070A0100,
+                    0x070A0101, 0x03090000,
                 ],
             )
         } else {
@@ -1080,7 +1171,6 @@ pub fn import_glb_to_mesh(original_chunk: &[u8], glb_bytes: &[u8]) -> Result<Vec
     )
 }
 
-/// Exports mesh to Wavefront OBJ with Blender Y-Up coordinate space and CCW triangle winding.
 pub fn export_mesh_to_obj(chunk_data: &[u8]) -> Result<(String, MeshStats)> {
     let parsed = extract_mesh_geometry(chunk_data)?;
     let vertex_count = parsed.positions.len();
@@ -1104,7 +1194,7 @@ pub fn export_mesh_to_obj(chunk_data: &[u8]) -> Result<(String, MeshStats)> {
     obj.push_str("\ns 1\n");
     for tri in parsed.indices.as_chunks::<3>().0 {
         let i1 = tri[0] as usize + 1;
-        let i2 = tri[2] as usize + 1; // Invert winding (0, 2, 1) for CCW
+        let i2 = tri[2] as usize + 1;
         let i3 = tri[1] as usize + 1;
         obj.push_str(&format!(
             "f {0}/{0}/{0} {1}/{1}/{1} {2}/{2}/{2}\n",
@@ -1122,7 +1212,6 @@ pub fn export_mesh_to_obj(chunk_data: &[u8]) -> Result<(String, MeshStats)> {
     Ok((obj, stats))
 }
 
-/// Imports Wavefront OBJ into mesh chunk, converting Blender Y-Up back to Triumph Z-Up.
 pub fn import_obj_to_mesh(original_chunk: &[u8], obj_content: &str) -> Result<Vec<u8>> {
     let original_parsed = extract_mesh_geometry(original_chunk).ok();
     let target_skinned = original_parsed.as_ref().is_some_and(|p| p.is_skinned);
@@ -1214,7 +1303,6 @@ pub fn import_obj_to_mesh(original_chunk: &[u8], obj_content: &str) -> Result<Ve
     };
 
     for (t0, t1, t2) in faces {
-        // Symmetrically invert winding back to engine convention: [t0, t2, t1]
         for token in [t0, t2, t1] {
             let key = parse_face_token(token);
             if let Some(&existing_idx) = unique_vertices.get(&key) {
@@ -1268,8 +1356,8 @@ pub fn import_obj_to_mesh(original_chunk: &[u8], obj_content: &str) -> Result<Ve
                     VertexAttribute::from_descriptor(0x03090000),
                 ],
                 vec![
-                    0x02010000, 0x02040000, 0x01050000, 0x040B0001,
-                    0x040B0002, 0x070A0100, 0x070A0101, 0x03090000,
+                    0x02010000, 0x02040000, 0x01050000, 0x040B0001, 0x040B0002, 0x070A0100,
+                    0x070A0101, 0x03090000,
                 ],
             )
         } else {

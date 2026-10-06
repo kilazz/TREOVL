@@ -9,10 +9,12 @@ use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc::Receiver};
 
+use glam::{Mat4, Vec3};
 use slint::{Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
 
 use crate::AppWindow;
 use crate::engine::assets::sniffer::AssetKind;
+use crate::engine::math::Vector4;
 use crate::engine::service;
 use crate::gui::commands::WorkerCommand;
 use crate::gui::{ActiveMeshPreview, AppState};
@@ -212,24 +214,41 @@ impl BackgroundWorker {
                 let mut re_render_opt = None;
                 {
                     let mut st = self.state.lock().unwrap();
-                    if let Some(ref mut preview) = st.active_mesh
-                        && clip_index >= 0
-                        && (clip_index as usize) < preview.available_clips.len()
-                    {
-                        preview.current_clip_index = Some(clip_index as usize);
-                        preview.current_time_seconds = 0.0;
-                        let clip = &preview.available_clips[clip_index as usize];
-                        let duration = clip.duration_seconds;
+                    if let Some(ref mut preview) = st.active_mesh {
+                        if clip_index == 0 {
+                            // Slot 0 is [REST POSE / BIND POSE]
+                            preview.current_clip_index = None;
+                            preview.current_time_seconds = 0.0;
 
-                        let ui_h = self.ui_handle.clone();
-                        let _ = slint::invoke_from_event_loop(move || {
-                            if let Some(ui) = ui_h.upgrade() {
-                                ui.set_anim_duration(duration);
-                                ui.set_anim_current_time(0.0);
-                            }
-                        });
+                            let ui_h = self.ui_handle.clone();
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(ui) = ui_h.upgrade() {
+                                    ui.set_anim_duration(0.0);
+                                    ui.set_anim_current_time(0.0);
+                                    ui.set_is_anim_playing(false);
+                                }
+                            });
 
-                        re_render_opt = Some((preview.clone(), st.camera));
+                            re_render_opt = Some((preview.clone(), st.camera));
+                        } else if clip_index > 0
+                            && ((clip_index - 1) as usize) < preview.available_clips.len()
+                        {
+                            let actual_clip_idx = (clip_index - 1) as usize;
+                            preview.current_clip_index = Some(actual_clip_idx);
+                            preview.current_time_seconds = 0.0;
+                            let clip = &preview.available_clips[actual_clip_idx];
+                            let duration = clip.duration_seconds;
+
+                            let ui_h = self.ui_handle.clone();
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(ui) = ui_h.upgrade() {
+                                    ui.set_anim_duration(duration);
+                                    ui.set_anim_current_time(0.0);
+                                }
+                            });
+
+                            re_render_opt = Some((preview.clone(), st.camera));
+                        }
                     }
                 }
 
@@ -1202,9 +1221,10 @@ impl BackgroundWorker {
                     let (_, has_composite) =
                         preview::build_composite_mesh_assembly(&stem, proj_dir.as_deref());
 
+                    // Accurately resolve matching skeleton for the given mesh
                     if submesh.bones.is_empty()
                         && let Some(master_bones) =
-                            preview::find_master_skeleton(proj_dir.as_deref())
+                            preview::find_master_skeleton_for_mesh(&stem, proj_dir.as_deref())
                     {
                         submesh.bones = master_bones;
                     }
@@ -1222,31 +1242,135 @@ impl BackgroundWorker {
                         proj_dir.as_deref(),
                     );
                     let has_clips = !clips.is_empty();
-                    let clip_names: Vec<slint::SharedString> = clips
-                        .iter()
-                        .enumerate()
-                        .map(|(i, c)| {
-                            format!("{}: {} ({:.2}s)", i + 1, c.name, c.duration_seconds).into()
-                        })
-                        .collect();
 
+                    // Prepend slot 0 as [REST POSE / BIND POSE] so users can inspect clean bind pose skinning
+                    let mut clip_names: Vec<slint::SharedString> = Vec::new();
+                    clip_names.push("0: [REST POSE / BIND POSE]".into());
+                    for (i, c) in clips.iter().enumerate() {
+                        clip_names.push(
+                            format!("{}: {} ({:.2}s)", i + 1, c.name, c.duration_seconds).into(),
+                        );
+                    }
+
+                    // Default current_clip_index to None so the model starts in Rest Pose
                     let mut preview = ActiveMeshPreview {
                         submeshes: vec![submesh],
                         is_composite: false,
                         composite_name: stem.to_string(),
                         available_clips: clips,
-                        current_clip_index: if has_clips { Some(0) } else { None },
+                        current_clip_index: None,
                         current_time_seconds: 0.0,
                         is_playing: false,
                         playback_speed: 1.0,
                     };
 
+                    // ==================== SKELETON & ANIMATION DIAGNOSTICS ====================
+                    if let Some(first_submesh) = preview.submeshes.first() {
+                        self.logger.log("==================== SKELETON & ANIMATION DIAGNOSTICS ====================");
+                        self.logger.log(&format!(
+                            "Mesh: {} | Verts: {} | Bones in Skeleton: {}",
+                            first_submesh.name,
+                            first_submesh.positions.len(),
+                            first_submesh.bones.len()
+                        ));
+
+                        if let Some(clip) = preview.available_clips.first() {
+                            self.logger.log(&format!(
+                                "Active Clip: '{}' (Tracks: {})",
+                                clip.name,
+                                clip.bone_tracks.len()
+                            ));
+
+                            // 1. Show bones without animation tracks in this clip
+                            let missing_bones: Vec<&str> = first_submesh
+                                .bones
+                                .iter()
+                                .filter(|b| !clip.bone_tracks.iter().any(|t| t.bone_name == b.name))
+                                .map(|b| b.name.as_str())
+                                .collect();
+                            self.logger.log(&format!(
+                                "  [!] Bones WITHOUT animation tracks ({}): {:?}",
+                                missing_bones.len(),
+                                missing_bones
+                            ));
+
+                            // 2. Check translation key for bone 28 (L_middle_leg)
+                            if let Some(track28) = clip
+                                .bone_tracks
+                                .iter()
+                                .find(|t| t.bone_name.contains("middle_leg"))
+                                && let Some(first_trans) = track28.translations.first()
+                            {
+                                self.logger.log(&format!("  Bone 28 '{}': Trans Key=[{:.4}, {:.4}, {:.4}] (Rest Trans was [0.125, -0.165, 0.068])",
+                                    track28.bone_name, first_trans.position.x, first_trans.position.y, first_trans.position.z));
+                            }
+
+                            // 3. Compute skinning for frame 0 and detect vertices with extreme displacement
+                            let (diag_matrices, _, _) =
+                                crate::engine::assets::animation::compute_skinning_matrices(
+                                    &first_submesh.bones,
+                                    clip,
+                                    0.0,
+                                );
+
+                            let mut worst_dist = 0.0f32;
+                            let mut worst_v = 0;
+                            let mut worst_bone_id = 0;
+
+                            for (v_i, &p_rest) in first_submesh.rest_positions.iter().enumerate() {
+                                let j = first_submesh.joints.get(v_i).copied().unwrap_or([0; 4]);
+                                let w = first_submesh
+                                    .weights
+                                    .get(v_i)
+                                    .copied()
+                                    .unwrap_or(Vector4::default());
+                                if (w.x + w.y + w.z + w.w) > 0.001 {
+                                    let m0 = diag_matrices
+                                        .get((j[0] as usize).min(127))
+                                        .copied()
+                                        .unwrap_or(Mat4::IDENTITY);
+                                    let m1 = diag_matrices
+                                        .get((j[1] as usize).min(127))
+                                        .copied()
+                                        .unwrap_or(Mat4::IDENTITY);
+                                    let m2 = diag_matrices
+                                        .get((j[2] as usize).min(127))
+                                        .copied()
+                                        .unwrap_or(Mat4::IDENTITY);
+                                    let m3 = diag_matrices
+                                        .get((j[3] as usize).min(127))
+                                        .copied()
+                                        .unwrap_or(Mat4::IDENTITY);
+                                    let blended = m0 * w.x + m1 * w.y + m2 * w.z + m3 * w.w;
+                                    let p_anim = blended
+                                        .transform_point3(Vec3::new(p_rest.x, p_rest.y, p_rest.z));
+                                    let dist =
+                                        (p_anim - Vec3::new(p_rest.x, p_rest.y, p_rest.z)).length();
+                                    if dist > worst_dist {
+                                        worst_dist = dist;
+                                        worst_v = v_i;
+                                        worst_bone_id = j[0];
+                                    }
+                                }
+                            }
+
+                            let worst_bone_name = first_submesh
+                                .bones
+                                .iter()
+                                .find(|b| b.bone_id == worst_bone_id as i32)
+                                .map(|b| b.name.as_str())
+                                .unwrap_or("Unknown");
+
+                            self.logger.log(&format!(
+                                "  [Worst Distortion] Vert {} displaced by {:.3}m! Controlled by Bone ID {} ('{}')",
+                                worst_v, worst_dist, worst_bone_id, worst_bone_name
+                            ));
+                        }
+                        self.logger.log("==========================================================================");
+                    }
+                    // ===================================================================================
+
                     let cam = viewport::center_camera_for_preview(&self.state, &preview);
-                    let initial_duration = preview
-                        .available_clips
-                        .first()
-                        .map(|c| c.duration_seconds)
-                        .unwrap_or(1.0);
 
                     {
                         let mut st = self.state.lock().unwrap();
@@ -1275,8 +1399,8 @@ impl BackgroundWorker {
                             ui.set_available_animations(ModelRc::from(std::rc::Rc::new(
                                 VecModel::from(clip_names),
                             )));
-                            ui.set_selected_anim_idx(0);
-                            ui.set_anim_duration(initial_duration);
+                            ui.set_selected_anim_idx(0); // Select 0: [REST POSE / BIND POSE]
+                            ui.set_anim_duration(0.0);
                             ui.set_anim_current_time(0.0);
                             ui.set_mesh_stats_lines(ModelRc::from(std::rc::Rc::new(
                                 VecModel::from(stats_lines),
@@ -1315,13 +1439,13 @@ impl BackgroundWorker {
                     proj_dir.as_deref(),
                 );
                 let has_clips = !clips.is_empty();
-                let clip_names: Vec<slint::SharedString> = clips
-                    .iter()
-                    .enumerate()
-                    .map(|(i, c)| {
-                        format!("{}: {} ({:.2}s)", i + 1, c.name, c.duration_seconds).into()
-                    })
-                    .collect();
+
+                let mut clip_names: Vec<slint::SharedString> = Vec::new();
+                clip_names.push("0: [REST POSE / BIND POSE]".into());
+                for (i, c) in clips.iter().enumerate() {
+                    clip_names
+                        .push(format!("{}: {} ({:.2}s)", i + 1, c.name, c.duration_seconds).into());
+                }
 
                 if has_composite && !composite_submeshes.is_empty() {
                     let mut preview = ActiveMeshPreview {
@@ -1329,17 +1453,12 @@ impl BackgroundWorker {
                         is_composite: true,
                         composite_name: stem.to_string(),
                         available_clips: clips,
-                        current_clip_index: if has_clips { Some(0) } else { None },
+                        current_clip_index: None,
                         current_time_seconds: 0.0,
                         is_playing: false,
                         playback_speed: 1.0,
                     };
                     let cam = viewport::center_camera_for_preview(&self.state, &preview);
-                    let initial_duration = preview
-                        .available_clips
-                        .first()
-                        .map(|c| c.duration_seconds)
-                        .unwrap_or(1.0);
 
                     {
                         let mut st = self.state.lock().unwrap();
@@ -1370,7 +1489,7 @@ impl BackgroundWorker {
                                 VecModel::from(clip_names),
                             )));
                             ui.set_selected_anim_idx(0);
-                            ui.set_anim_duration(initial_duration);
+                            ui.set_anim_duration(0.0);
                             ui.set_anim_current_time(0.0);
                         }
                     });
