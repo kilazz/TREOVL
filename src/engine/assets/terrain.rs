@@ -97,18 +97,33 @@ pub fn parse_terrain_geometry_with_endian(
     let width = endian.read_u32(&mut Cursor::new(width_bytes.as_slice()))? as usize;
     let height = endian.read_u32(&mut Cursor::new(height_bytes.as_slice()))? as usize;
 
-    let mut points = Vec::with_capacity(width * height);
+    if width == 0 || height == 0 || width > 4096 || height > 4096 {
+        bail!("Invalid terrain grid dimensions: {}x{}", width, height);
+    }
+
+    let expected_points = width
+        .checked_mul(height)
+        .context("Terrain grid dimensions overflow arithmetic bounds")?;
+
+    let max_possible_points = raw_points.len() / 4;
+    if max_possible_points < expected_points {
+        bail!(
+            "Point count in binary data ({}) does not match grid dimensions ({}x{} = {})",
+            max_possible_points,
+            width,
+            height,
+            expected_points
+        );
+    }
+
+    let mut points = Vec::with_capacity(expected_points);
     let mut cur = Cursor::new(raw_points.as_slice());
-    while (cur.position() as usize) + 4 <= raw_points.len() {
+    while (cur.position() as usize) + 4 <= raw_points.len() && points.len() < expected_points {
         let raw = endian.read_u32(&mut cur)?;
         points.push(TerrainPoint::from_u32(raw));
     }
 
-    if points.len() < width * height {
-        bail!("Point count does not match grid dimensions");
-    }
-
-    let vertex_count = width * height;
+    let vertex_count = expected_points;
     let spacing = 2.0f32;
 
     let mut min_pos = [f32::INFINITY, f32::INFINITY, f32::INFINITY];

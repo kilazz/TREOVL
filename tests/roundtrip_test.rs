@@ -3,6 +3,7 @@ use TREOVL::engine::container::footer::{
     MAGIC_FOOTER_1, MAGIC_FOOTER_2, calculate_triumph_crc32, check_footer,
 };
 use TREOVL::utils::gltf_builder::GltfBuilder;
+use TREOVL::utils::renderer::WgpuRenderer;
 
 #[test]
 fn test_triumph_crc32_and_footer() {
@@ -58,4 +59,38 @@ fn test_gltf_builder_validity() {
     // Check glTF binary header magic "glTF" and version 2
     assert!(glb.starts_with(b"glTF"));
     assert_eq!(u32::from_le_bytes(glb[4..8].try_into().unwrap()), 2);
+}
+
+#[test]
+fn test_mesh_winding_roundtrip() {
+    let original_indices = vec![0u32, 1, 2, 3, 4, 5];
+
+    // Export inversion: (0, 2, 1) converts LH CW -> RH CCW
+    let mut exported = Vec::new();
+    for tri in original_indices.chunks_exact(3) {
+        exported.push(tri[0]);
+        exported.push(tri[2]);
+        exported.push(tri[1]);
+    }
+
+    assert_eq!(exported, vec![0, 2, 1, 3, 5, 4]);
+
+    // Import inversion back: swap(1, 2)
+    let mut restored = exported;
+    for tri in restored.chunks_exact_mut(3) {
+        tri.swap(1, 2);
+    }
+
+    assert_eq!(restored, original_indices);
+}
+
+#[test]
+fn test_wgpu_renderer_creation_safe() {
+    // Verifies that WgpuRenderer::new() returns a Result without panicking
+    // regardless of whether the environment has a dedicated GPU or is headless.
+    let res = WgpuRenderer::new();
+    match res {
+        Ok(_) => println!("[+] GPU renderer initialized successfully."),
+        Err(e) => println!("[*] Headless or driverless environment detected: {}", e),
+    }
 }

@@ -362,7 +362,9 @@ pub fn extract_mesh_geometry_with_endian(
     })
 }
 
-/// Exports mesh to glTF 2.0 Binary (.glb), automatically applying the Blender Upright Converter (X'=X, Y'=-Z, Z'=Y)
+/// Exports mesh to glTF 2.0 Binary (.glb).
+/// Automatically applies the Blender Upright Converter (X'=X, Y'=-Z, Z'=Y)
+/// and inverts triangle winding order (0, 2, 1) so front faces are counter-clockwise (CCW).
 pub fn export_mesh_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, MeshStats)> {
     let parsed = extract_mesh_geometry(chunk_data)?;
     let vertex_count = parsed.positions.len();
@@ -370,7 +372,6 @@ pub fn export_mesh_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, MeshStats)> {
     let mut min_pos = [f32::INFINITY, f32::INFINITY, f32::INFINITY];
     let mut max_pos = [f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
 
-    // Converter: Triumph (Z-Up) -> Blender / glTF (Y-Up upright): X'=X, Y'=-Z, Z'=Y
     for p in &parsed.positions {
         let px = p.x;
         let py = -p.z;
@@ -394,14 +395,20 @@ pub fn export_mesh_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, MeshStats)> {
     let max_idx = parsed.indices.iter().copied().max().unwrap_or(0);
     let (ind_view, comp_type) = if max_idx <= 0xFFFF {
         let mut ind_bytes = Vec::with_capacity(parsed.indices.len() * 2);
-        for &idx in &parsed.indices {
-            ind_bytes.write_u16::<LittleEndian>(idx as u16)?;
+        for tri in parsed.indices.as_chunks::<3>().0 {
+            // Winding Order: (0, 2, 1) converts LH CW -> RH CCW for glTF 2.0 and Blender
+            ind_bytes.write_u16::<LittleEndian>(tri[0] as u16)?;
+            ind_bytes.write_u16::<LittleEndian>(tri[2] as u16)?;
+            ind_bytes.write_u16::<LittleEndian>(tri[1] as u16)?;
         }
         (builder.add_buffer_view(&ind_bytes, Some(34963)), 5123)
     } else {
         let mut ind_bytes = Vec::with_capacity(parsed.indices.len() * 4);
-        for &idx in &parsed.indices {
-            ind_bytes.write_u32::<LittleEndian>(idx)?;
+        for tri in parsed.indices.as_chunks::<3>().0 {
+            // Winding Order: (0, 2, 1) converts LH CW -> RH CCW for glTF 2.0 and Blender
+            ind_bytes.write_u32::<LittleEndian>(tri[0])?;
+            ind_bytes.write_u32::<LittleEndian>(tri[2])?;
+            ind_bytes.write_u32::<LittleEndian>(tri[1])?;
         }
         (builder.add_buffer_view(&ind_bytes, Some(34963)), 5125)
     };
@@ -518,7 +525,6 @@ pub fn export_mesh_to_glb(chunk_data: &[u8]) -> Result<(Vec<u8>, MeshStats)> {
                 bone.name.clone()
             };
 
-            // Convert bone translation to Blender Y-Up space: tx=tx, ty=-tz, tz=ty
             let tx = bone.translation.x;
             let ty = -bone.translation.z;
             let tz = bone.translation.y;
@@ -763,7 +769,8 @@ fn pack_vertex_buffer_preserving_fvf(
     Ok(vertex_buffer)
 }
 
-/// Imports glTF 2.0 Binary (.glb) into a mesh chunk, automatically converting Blender (Y-Up) back to Game (Z-Up): X=X', Y=Z', Z=-Y'
+/// Imports glTF 2.0 Binary (.glb) into a mesh chunk.
+/// Converts Blender (Y-Up) back to Game (Z-Up) and symmetrically inverts triangle winding order.
 pub fn import_glb_to_mesh(original_chunk: &[u8], glb_bytes: &[u8]) -> Result<Vec<u8>> {
     if glb_bytes.len() < 20 || &glb_bytes[0..4] != b"glTF" {
         bail!("Invalid .glb file format (missing 'glTF' signature)");
@@ -1000,6 +1007,11 @@ pub fn import_glb_to_mesh(original_chunk: &[u8], glb_bytes: &[u8]) -> Result<Vec
         index_buffer.push(idx);
     }
 
+    // Invert winding order back to engine's original order: (tri[0], tri[2], tri[1]) -> (tri[0], tri[1], tri[2])
+    for tri in index_buffer.as_chunks_mut::<3>().0 {
+        tri.swap(1, 2);
+    }
+
     let (target_stride, target_attributes, target_descriptors) =
         if let Some(ref orig) = original_parsed {
             (
@@ -1009,15 +1021,21 @@ pub fn import_glb_to_mesh(original_chunk: &[u8], glb_bytes: &[u8]) -> Result<Vec
             )
         } else if target_skinned {
             (
-                52usize,
+                53usize,
                 vec![
                     VertexAttribute::from_descriptor(0x02010000),
                     VertexAttribute::from_descriptor(0x02040000),
                     VertexAttribute::from_descriptor(0x01050000),
-                    VertexAttribute::from_descriptor(0x030A0000),
-                    VertexAttribute::from_descriptor(0x0F0B0000),
+                    VertexAttribute::from_descriptor(0x040B0001),
+                    VertexAttribute::from_descriptor(0x040B0002),
+                    VertexAttribute::from_descriptor(0x070A0100),
+                    VertexAttribute::from_descriptor(0x070A0101),
+                    VertexAttribute::from_descriptor(0x03090000),
                 ],
-                vec![0x02010000, 0x02040000, 0x01050000, 0x030A0000, 0x0F0B0000],
+                vec![
+                    0x02010000, 0x02040000, 0x01050000, 0x040B0001,
+                    0x040B0002, 0x070A0100, 0x070A0101, 0x03090000,
+                ],
             )
         } else {
             (
@@ -1062,7 +1080,7 @@ pub fn import_glb_to_mesh(original_chunk: &[u8], glb_bytes: &[u8]) -> Result<Vec
     )
 }
 
-/// Exports mesh to Wavefront OBJ with Blender Y-Up coordinate space: X'=X, Y'=-Z, Z'=Y
+/// Exports mesh to Wavefront OBJ with Blender Y-Up coordinate space and CCW triangle winding.
 pub fn export_mesh_to_obj(chunk_data: &[u8]) -> Result<(String, MeshStats)> {
     let parsed = extract_mesh_geometry(chunk_data)?;
     let vertex_count = parsed.positions.len();
@@ -1071,7 +1089,6 @@ pub fn export_mesh_to_obj(chunk_data: &[u8]) -> Result<(String, MeshStats)> {
     obj.push_str("# Exported from Overlord Modding Studio (Blender Ready)\n");
     obj.push_str("o OverlordMesh\n\n");
 
-    // Converter: Triumph (Z-Up) -> Blender OBJ (Y-Up): X'=X, Y'=-Z, Z'=Y
     for p in &parsed.positions {
         obj.push_str(&format!("v {:.6} {:.6} {:.6}\n", p.x, -p.z, p.y));
     }
@@ -1087,8 +1104,8 @@ pub fn export_mesh_to_obj(chunk_data: &[u8]) -> Result<(String, MeshStats)> {
     obj.push_str("\ns 1\n");
     for tri in parsed.indices.as_chunks::<3>().0 {
         let i1 = tri[0] as usize + 1;
-        let i2 = tri[1] as usize + 1;
-        let i3 = tri[2] as usize + 1;
+        let i2 = tri[2] as usize + 1; // Invert winding (0, 2, 1) for CCW
+        let i3 = tri[1] as usize + 1;
         obj.push_str(&format!(
             "f {0}/{0}/{0} {1}/{1}/{1} {2}/{2}/{2}\n",
             i1, i2, i3
@@ -1105,7 +1122,7 @@ pub fn export_mesh_to_obj(chunk_data: &[u8]) -> Result<(String, MeshStats)> {
     Ok((obj, stats))
 }
 
-/// Imports Wavefront OBJ into mesh chunk, converting Blender Y-Up back to Triumph Z-Up: X=X', Y=Z', Z=-Y'
+/// Imports Wavefront OBJ into mesh chunk, converting Blender Y-Up back to Triumph Z-Up.
 pub fn import_obj_to_mesh(original_chunk: &[u8], obj_content: &str) -> Result<Vec<u8>> {
     let original_parsed = extract_mesh_geometry(original_chunk).ok();
     let target_skinned = original_parsed.as_ref().is_some_and(|p| p.is_skinned);
@@ -1133,7 +1150,6 @@ pub fn import_obj_to_mesh(original_chunk: &[u8], obj_content: &str) -> Result<Ve
                 let bx: f32 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
                 let by: f32 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
                 let bz: f32 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
-                // Blender -> Triumph: X = bx, Y = bz, Z = -by
                 raw_positions.push(Vector3 {
                     x: bx,
                     y: bz,
@@ -1198,7 +1214,8 @@ pub fn import_obj_to_mesh(original_chunk: &[u8], obj_content: &str) -> Result<Ve
     };
 
     for (t0, t1, t2) in faces {
-        for token in [t0, t1, t2] {
+        // Symmetrically invert winding back to engine convention: [t0, t2, t1]
+        for token in [t0, t2, t1] {
             let key = parse_face_token(token);
             if let Some(&existing_idx) = unique_vertices.get(&key) {
                 index_buffer.push(existing_idx);
@@ -1239,15 +1256,21 @@ pub fn import_obj_to_mesh(original_chunk: &[u8], obj_content: &str) -> Result<Ve
             )
         } else if target_skinned {
             (
-                52usize,
+                53usize,
                 vec![
                     VertexAttribute::from_descriptor(0x02010000),
                     VertexAttribute::from_descriptor(0x02040000),
                     VertexAttribute::from_descriptor(0x01050000),
-                    VertexAttribute::from_descriptor(0x030A0000),
-                    VertexAttribute::from_descriptor(0x0F0B0000),
+                    VertexAttribute::from_descriptor(0x040B0001),
+                    VertexAttribute::from_descriptor(0x040B0002),
+                    VertexAttribute::from_descriptor(0x070A0100),
+                    VertexAttribute::from_descriptor(0x070A0101),
+                    VertexAttribute::from_descriptor(0x03090000),
                 ],
-                vec![0x02010000, 0x02040000, 0x01050000, 0x030A0000, 0x0F0B0000],
+                vec![
+                    0x02010000, 0x02040000, 0x01050000, 0x040B0001,
+                    0x040B0002, 0x070A0100, 0x070A0101, 0x03090000,
+                ],
             )
         } else {
             (

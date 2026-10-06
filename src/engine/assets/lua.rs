@@ -4,37 +4,13 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::io::Cursor;
+use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use tempfile::Builder;
 
 pub const LUA_MAGIC: &[u8; 4] = b"\x1bLua";
 pub const LUA_VERSION_50: u8 = 0x50;
-
-static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// RAII guard to guarantee temporary file cleanup across all execution paths.
-struct TempFileGuard(PathBuf);
-
-impl Drop for TempFileGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
-}
-
-/// Generates a process-unique, collision-resistant temporary file path.
-fn create_unique_temp_file(prefix: &str, ext: &str) -> (PathBuf, TempFileGuard) {
-    let pid = std::process::id();
-    let seq = TEMP_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let time = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let path = std::env::temp_dir().join(format!("{}_{}_{}_{}.{}", prefix, pid, time, seq, ext));
-    let guard = TempFileGuard(path.clone());
-    (path, guard)
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LuaInfo {
@@ -90,7 +66,6 @@ pub enum LuaConstant {
     String(String),
 }
 
-/// Searches for the Lua 5.0 compiler (luac50.exe or luac.exe)
 pub fn find_luac_executable() -> Option<PathBuf> {
     let candidates = [
         PathBuf::from("bin/luac50.exe"),
@@ -127,7 +102,6 @@ pub fn find_luac_executable() -> Option<PathBuf> {
     None
 }
 
-/// Searches for the Lua 5.0 decompiler (luadec50.exe or luadec.exe based on LuaDec 0.7 for Lua 5.0.2)
 pub fn find_luadec_executable() -> Option<PathBuf> {
     let candidates = [
         PathBuf::from("bin/luadec50.exe"),
@@ -164,13 +138,17 @@ pub fn find_luadec_executable() -> Option<PathBuf> {
     None
 }
 
-/// Compiles a Lua 5.0 source file (.lua) into Lua 5.0.2 bytecode using luac50.exe
 pub fn compile_lua_script(source_path: &Path) -> Result<Vec<u8>> {
     let compiler = find_luac_executable().context(
         "Lua 5.0 compiler (luac50.exe) not found! Please place luac50.exe into the root folder or 'bin/' folder.",
     )?;
 
-    let (temp_out, _guard) = create_unique_temp_file("ovl_lua_compile", "luac");
+    let temp_file = Builder::new()
+        .prefix("ovl_lua_compile_")
+        .suffix(".luac")
+        .tempfile()
+        .context("Failed to allocate secure temporary file for Lua compilation")?;
+    let temp_out = temp_file.path().to_path_buf();
 
     let output = Command::new(&compiler)
         .arg("-o")
@@ -216,10 +194,16 @@ fn read_lua_string(cur: &mut Cursor<&[u8]>) -> Result<Option<String>> {
     if len == 0 {
         return Ok(None);
     }
+    if len > 65_536 {
+        bail!(
+            "Lua string length ({}) exceeds safe memory limit (64 KB)",
+            len
+        );
+    }
     let pos = cur.position() as usize;
     let data = cur.get_ref();
     if pos + len > data.len() {
-        bail!("Unexpected EOF while reading string");
+        bail!("Unexpected EOF while reading Lua string");
     }
     let mut raw = &data[pos..pos + len];
     if raw.ends_with(b"\x00") {
@@ -233,23 +217,24 @@ fn read_lua_string(cur: &mut Cursor<&[u8]>) -> Result<Option<String>> {
 pub fn decompile_lua_bytecode(bytecode: &[u8]) -> Result<String> {
     validate_lua_50_header(bytecode)?;
 
-    // 1. Attempt decompilation through external LuaDec 5.0 if installed
-    if let Some(luadec) = find_luadec_executable() {
-        let (temp_in, _guard) = create_unique_temp_file("ovl_lua_decomp", "luac");
-        if fs::write(&temp_in, bytecode).is_ok() {
-            let output = Command::new(&luadec).arg(&temp_in).output();
-            if let Ok(out) = output
-                && out.status.success()
-            {
-                let code = String::from_utf8_lossy(&out.stdout).to_string();
-                if !code.trim().is_empty() {
-                    return Ok(code);
-                }
+    if let Some(luadec) = find_luadec_executable()
+        && let Ok(mut temp_file) = Builder::new()
+            .prefix("ovl_lua_decomp_")
+            .suffix(".luac")
+            .tempfile()
+        && temp_file.write_all(bytecode).is_ok()
+    {
+        let output = Command::new(&luadec).arg(temp_file.path()).output();
+        if let Ok(out) = output
+            && out.status.success()
+        {
+            let code = String::from_utf8_lossy(&out.stdout).to_string();
+            if !code.trim().is_empty() {
+                return Ok(code);
             }
         }
     }
 
-    // 2. Built-in AST-less pseudocode generator with warning header
     let mut cur = Cursor::new(&bytecode[22..]);
     let mut out = String::new();
     out.push_str("-- [WARNING: Built-in AST-less pseudocode generator]\n");
@@ -272,15 +257,21 @@ fn decompile_scope(cur: &mut Cursor<&[u8]>, out: &mut String, level: usize) -> R
     let _is_vararg = cur.read_u8()?;
     let _max_stack = cur.read_u8()?;
 
-    // 1. Line info table
+    let remaining_before_lines = cur.get_ref().len().saturating_sub(cur.position() as usize);
+
     let num_lines = cur.read_u32::<LittleEndian>()? as usize;
+    if num_lines > remaining_before_lines / 4 {
+        bail!("Corrupted line info table count: {}", num_lines);
+    }
     for _ in 0..num_lines {
         let _ = cur.read_u32::<LittleEndian>()?;
     }
 
-    // 2. Local variables debug table
     let num_locvars = cur.read_u32::<LittleEndian>()? as usize;
-    let mut locvars = Vec::with_capacity(num_locvars);
+    if num_locvars > 65_536 {
+        bail!("Corrupted local variables count: {}", num_locvars);
+    }
+    let mut locvars = Vec::with_capacity(num_locvars.min(1024));
     for _ in 0..num_locvars {
         let varname = read_lua_string(cur)?.unwrap_or_default();
         let startpc = cur.read_u32::<LittleEndian>()?;
@@ -288,15 +279,19 @@ fn decompile_scope(cur: &mut Cursor<&[u8]>, out: &mut String, level: usize) -> R
         locvars.push((varname, startpc, endpc));
     }
 
-    // 3. Upvalues table
     let num_upvalues = cur.read_u32::<LittleEndian>()? as usize;
+    if num_upvalues > 256 {
+        bail!("Corrupted upvalues count: {}", num_upvalues);
+    }
     for _ in 0..num_upvalues {
         let _ = read_lua_string(cur)?;
     }
 
-    // 4. Constants table
     let num_constants = cur.read_u32::<LittleEndian>()? as usize;
-    let mut constants = Vec::with_capacity(num_constants);
+    if num_constants > 65_536 {
+        bail!("Corrupted constants count: {}", num_constants);
+    }
+    let mut constants = Vec::with_capacity(num_constants.min(1024));
     for _ in 0..num_constants {
         let k_type = cur.read_u8()?;
         let c = match k_type {
@@ -309,8 +304,10 @@ fn decompile_scope(cur: &mut Cursor<&[u8]>, out: &mut String, level: usize) -> R
         constants.push(c);
     }
 
-    // 5. Nested Function Prototypes
     let num_nested = cur.read_u32::<LittleEndian>()? as usize;
+    if num_nested > 1024 {
+        bail!("Corrupted nested prototypes count: {}", num_nested);
+    }
     let mut nested_functions = Vec::new();
     for _ in 0..num_nested {
         let mut nested_out = String::new();
@@ -318,8 +315,11 @@ fn decompile_scope(cur: &mut Cursor<&[u8]>, out: &mut String, level: usize) -> R
         nested_functions.push(nested_out);
     }
 
-    // 6. Bytecode instructions
+    let remaining_before_code = cur.get_ref().len().saturating_sub(cur.position() as usize);
     let num_code = cur.read_u32::<LittleEndian>()? as usize;
+    if num_code > remaining_before_code / 4 {
+        bail!("Corrupted bytecode instructions count: {}", num_code);
+    }
     let mut code_instructions = Vec::with_capacity(num_code);
     for _ in 0..num_code {
         code_instructions.push(cur.read_u32::<LittleEndian>()?);
@@ -523,15 +523,20 @@ fn disassemble_function_prototype(
         source, line_defined, nups, num_params, is_vararg, max_stack
     ));
 
-    // 1. Lines
+    let remaining = cur.get_ref().len().saturating_sub(cur.position() as usize);
     let num_lines = cur.read_u32::<LittleEndian>()? as usize;
-    let mut lines = Vec::with_capacity(num_lines);
+    if num_lines > remaining / 4 {
+        bail!("Corrupted lines count: {}", num_lines);
+    }
+    let mut lines = Vec::with_capacity(num_lines.min(1024));
     for _ in 0..num_lines {
         lines.push(cur.read_u32::<LittleEndian>()?);
     }
 
-    // 2. LocVars
     let num_locvars = cur.read_u32::<LittleEndian>()? as usize;
+    if num_locvars > 65_536 {
+        bail!("Corrupted locvars count: {}", num_locvars);
+    }
     out.push_str(&format!("{indent}.locals ({})\n", num_locvars));
     for i in 0..num_locvars {
         let vname = read_lua_string(cur)?.unwrap_or_default();
@@ -543,15 +548,19 @@ fn disassemble_function_prototype(
         ));
     }
 
-    // 3. Upvalues
     let num_upvalues = cur.read_u32::<LittleEndian>()? as usize;
+    if num_upvalues > 256 {
+        bail!("Corrupted upvalues count: {}", num_upvalues);
+    }
     for _ in 0..num_upvalues {
         let _ = read_lua_string(cur)?;
     }
 
-    // 4. Constants
     let num_constants = cur.read_u32::<LittleEndian>()? as usize;
-    let mut constants = Vec::with_capacity(num_constants);
+    if num_constants > 65_536 {
+        bail!("Corrupted constants count: {}", num_constants);
+    }
+    let mut constants = Vec::with_capacity(num_constants.min(1024));
     out.push_str(&format!("{indent}.constants ({})\n", num_constants));
     for i in 0..num_constants {
         let k_type = cur.read_u8()?;
@@ -572,11 +581,16 @@ fn disassemble_function_prototype(
         constants.push(c);
     }
 
-    // 5. Nested Prototypes
     let num_nested = cur.read_u32::<LittleEndian>()? as usize;
+    if num_nested > 1024 {
+        bail!("Corrupted nested prototypes count: {}", num_nested);
+    }
 
-    // 6. Code Instructions
+    let rem_code = cur.get_ref().len().saturating_sub(cur.position() as usize);
     let num_code = cur.read_u32::<LittleEndian>()? as usize;
+    if num_code > rem_code / 4 {
+        bail!("Corrupted code count: {}", num_code);
+    }
     out.push_str(&format!("{indent}.code ({} instructions)\n", num_code));
 
     for pc in 0..num_code {

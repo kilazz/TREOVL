@@ -1,10 +1,32 @@
+export struct BoneLabel {
+    name: string,
+    x: float,
+    y: float,
+}
+
 export component Viewport3DView inherits Rectangle {
     in property <image> preview_image;
     in property <bool> has_mesh: false;
     in property <[string]> stats_lines: [];
+    in property <[BoneLabel]> bone_labels: [];
+
+    // Animations Integration in Left Overlay
+    in property <bool> has_animations: false;
+    in property <[string]> available_animations: [];
+    in property <int> selected_anim_idx: 0;
 
     callback rotate_viewport(float, float);
     callback zoom_viewport(float);
+    callback select_animation(int);
+
+    // Collapsible Panel States
+    property <bool> show_stats_panel: true;
+    property <bool> show_anims_panel: true;
+
+    // Viewport drag coordinates
+    property <length> drag_last_x: 0px;
+    property <length> drag_last_y: 0px;
+    property <bool> is_dragging: false;
 
     background: #111214;
     border-radius: 4px;
@@ -13,11 +35,74 @@ export component Viewport3DView inherits Rectangle {
     clip: true;
     vertical-stretch: 1;
 
-    Image {
-        source: root.preview_image;
+    // 1. 3D RENDERED IMAGE CONTAINER
+    image_container := Rectangle {
+        width: Math.min(root.width, root.height);
+        height: self.width;
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+
+        Image {
+            source: root.preview_image;
+            width: 100%;
+            height: 100%;
+        }
+    }
+
+    // 2. 3D VIEWPORT ORBIT & ZOOM TOUCHAREA (Placed BEHIND HUD panels so HUD controls receive clicks/scrolls!)
+    TouchArea {
         width: 100%;
         height: 100%;
-        image-fit: contain;
+        mouse-cursor: self.pressed ? grabbing : grab;
+
+        scroll-event(event) => {
+            root.zoom_viewport(event.delta-y / 1px);
+            return accept;
+        }
+
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down) {
+                root.is_dragging = true;
+                root.drag_last_x = self.mouse-x;
+                root.drag_last_y = self.mouse-y;
+            } else if (event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) {
+                root.is_dragging = false;
+            }
+        }
+
+        moved => {
+            if (self.pressed && root.is_dragging) {
+                let dx = (self.mouse-x - root.drag_last_x) / 1px;
+                let dy = (self.mouse-y - root.drag_last_y) / 1px;
+                root.drag_last_x = self.mouse-x;
+                root.drag_last_y = self.mouse-y;
+                if (dx != 0 || dy != 0) {
+                    root.rotate_viewport(dx * 0.015, dy * 0.015);
+                }
+            }
+        }
+    }
+
+    // 3. OVERLAY BONE PIN LABELS
+    for label in root.bone_labels: Rectangle {
+        x: image_container.x + (label.x / 1024.0) * image_container.width - 32px;
+        y: image_container.y + (label.y / 1024.0) * image_container.height - 10px;
+        width: 64px;
+        height: 20px;
+        background: #0f1115f0;
+        border-radius: 3px;
+        border-width: 1px;
+        border-color: #3e6a90;
+
+        Text {
+            text: label.name;
+            font-family: "Consolas";
+            font-size: 9.5px;
+            color: #58a6ff;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            overflow: elide;
+        }
     }
 
     if !root.has_mesh: Text {
@@ -28,77 +113,169 @@ export component Viewport3DView inherits Rectangle {
         horizontal-alignment: center;
     }
 
-    // --- TOP-LEFT: GEOMETRY HUD ---
-    if root.has_mesh && root.stats_lines.length > 0: Rectangle {
+    // 4. LEFT HUD OVERLAY (STATS & FULL-HEIGHT SCROLLABLE ANIMATION LIST)
+    if root.has_mesh: Rectangle {
         x: 12px;
         y: 12px;
-        width: 370px;
-        height: hud_layout.preferred-height;
-        background: #0f1115f0;
-        border-radius: 6px;
-        border-width: 1px;
-        border-color: #2c323b;
+        width: 330px;
+        height: root.height - 24px;
+        background: transparent;
 
-        hud_layout := VerticalLayout {
-            padding: 10px;
-            spacing: 5px;
+        VerticalLayout {
+            spacing: 8px;
             alignment: start;
 
-            HorizontalLayout {
-                spacing: 6px;
-                Text {
-                    text: "📊 Geometry & Material Stats";
-                    font-size: 12px;
-                    font-weight: 700;
-                    color: #f0b132;
+            // 1. GEOMETRY STATS ACCORDION
+            if root.stats_lines.length > 0: Rectangle {
+                background: #0f1115f0;
+                border-radius: 6px;
+                border-width: 1px;
+                border-color: #2c323b;
+
+                VerticalLayout {
+                    padding: 8px;
+                    spacing: 6px;
+
+                    Rectangle {
+                        height: 22px;
+                        HorizontalLayout {
+                            alignment: space-between;
+                            Text {
+                                text: "📊 Geometry Stats";
+                                font-size: 12px;
+                                font-weight: 700;
+                                color: #f0b132;
+                                vertical-alignment: center;
+                            }
+
+                            Text {
+                                text: root.show_stats_panel ? "▼" : "▶";
+                                font-size: 10px;
+                                color: #949ba4;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.show_stats_panel = !root.show_stats_panel; }
+                        }
+                    }
+
+                    if root.show_stats_panel: VerticalLayout {
+                        spacing: 4px;
+                        Rectangle {
+                            height: 1px;
+                            background: #2c323b;
+                        }
+
+                        for line in root.stats_lines: Text {
+                            text: line;
+                            font-family: "Consolas";
+                            font-size: 11px;
+                            color: #e2e4e9;
+                            overflow: elide;
+                        }
+                    }
                 }
             }
 
-            Rectangle {
-                height: 1px;
-                background: #2c323b;
-            }
+            // 2. DYNAMIC FULL-HEIGHT ANIMATION CLIPS LIST
+            if root.has_animations: Rectangle {
+                background: #0f1115f0;
+                border-radius: 6px;
+                border-width: 1px;
+                border-color: #2c323b;
+                vertical-stretch: 1;
+                clip: true;
 
-            for line in root.stats_lines: Text {
-                text: line;
-                font-family: "Consolas";
-                font-size: 11.5px;
-                color: #e2e4e9;
-                overflow: elide;
-            }
-        }
-    }
+                VerticalLayout {
+                    padding: 8px;
+                    spacing: 6px;
 
-    property <length> drag_last_x: 0px;
-    property <length> drag_last_y: 0px;
-    property <bool> is_dragging: false;
+                    // Header
+                    Rectangle {
+                        height: 22px;
+                        HorizontalLayout {
+                            alignment: space-between;
+                            Text {
+                                text: "🎬 Animations (" + root.available_animations.length + ")";
+                                font-size: 12px;
+                                font-weight: 700;
+                                color: #58a6ff;
+                                vertical-alignment: center;
+                            }
 
-    TouchArea {
-        mouse-cursor: self.pressed ? grabbing : grab;
+                            Text {
+                                text: root.show_anims_panel ? "▼" : "▶";
+                                font-size: 10px;
+                                color: #949ba4;
+                                vertical-alignment: center;
+                            }
+                        }
 
-        scroll-event(event) => {
-            root.zoom_viewport(event.delta-y / 1px);
-            return accept;
-        }
+                        TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.show_anims_panel = !root.show_anims_panel; }
+                        }
+                    }
 
-        pointer-event(event) => {
-            if (event.kind == PointerEventKind.down) {
-                is_dragging = true;
-                drag_last_x = self.mouse-x;
-                drag_last_y = self.mouse-y;
-            } else if (event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) {
-                is_dragging = false;
-            }
-        }
+                    if root.show_anims_panel: VerticalLayout {
+                        vertical-stretch: 1;
+                        spacing: 4px;
 
-        moved => {
-            if (self.pressed && is_dragging) {
-                let dx = (self.mouse-x - drag_last_x) / 1px;
-                let dy = (self.mouse-y - drag_last_y) / 1px;
-                drag_last_x = self.mouse-x;
-                drag_last_y = self.mouse-y;
-                if (dx != 0 || dy != 0) {
-                    root.rotate_viewport(dx * 0.015, dy * 0.015);
+                        Rectangle {
+                            height: 1px;
+                            background: #2c323b;
+                        }
+
+                        // Scrollable List of Animation Clips
+                        Flickable {
+                            vertical-stretch: 1;
+                            content-height: root.available_animations.length * 30px;
+
+                            VerticalLayout {
+                                spacing: 3px;
+                                alignment: start;
+
+                                for anim[idx] in root.available_animations: Rectangle {
+                                    height: 27px;
+                                    background: root.selected_anim_idx == idx ? #3e6a90 : (anim_ta.has-hover ? #242c38 : #15181f);
+                                    border-radius: 4px;
+                                    border-width: root.selected_anim_idx == idx ? 1px : 0px;
+                                    border-color: #58a6ff;
+
+                                    HorizontalLayout {
+                                        padding-left: 8px;
+                                        padding-right: 8px;
+                                        spacing: 6px;
+
+                                        Text {
+                                            text: root.selected_anim_idx == idx ? "▶" : "•";
+                                            font-size: 11px;
+                                            color: root.selected_anim_idx == idx ? #f0b132 : #606877;
+                                            vertical-alignment: center;
+                                        }
+
+                                        Text {
+                                            text: anim;
+                                            font-family: "Consolas";
+                                            font-size: 11px;
+                                            font-weight: root.selected_anim_idx == idx ? 700 : 500;
+                                            color: root.selected_anim_idx == idx ? #ffffff : #c5cad3;
+                                            vertical-alignment: center;
+                                            overflow: elide;
+                                        }
+                                    }
+
+                                    anim_ta := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.select_animation(idx); }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

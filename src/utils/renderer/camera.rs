@@ -8,7 +8,7 @@ pub struct ViewportCamera {
     pub target: Vector3,
     pub fov_degrees: f32,
     pub lighting_mode: u32, // 0 = Studio Lit, 1 = Bright Fill, 2 = Unlit
-    pub up_axis: u32,       // 0 = Y-Up (Raw), 1 = Z-Up to Y-Up (Triumph Engine / 3ds Max)
+    pub up_axis: u32, // 0 = Ground / Aligned, 1 = Pitch Up (+90°), 2 = Pitch Down (-90°), 3 = Invert (180°)
 }
 
 impl Default for ViewportCamera {
@@ -20,7 +20,7 @@ impl Default for ViewportCamera {
             target: Vector3::default(),
             fov_degrees: 45.0,
             lighting_mode: 0,
-            up_axis: 1, // Default to 1 (Z-Up to Y-Up conversion)
+            up_axis: 0, // Default to 0 (Ground / Perfectly Aligned with Skeleton)
         }
     }
 }

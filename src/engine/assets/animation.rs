@@ -852,20 +852,33 @@ pub fn export_animation_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>> {
 }
 
 // -----------------------------------------------------------------------------
-// FORWARD KINEMATICS & REAL-TIME SKELETAL SKINNING
+// FORWARD KINEMATICS & SKELETON MATRIX EVALUATION
 // -----------------------------------------------------------------------------
 
 pub fn compute_skinning_matrices(
     bones: &[ObjectBone],
     clip: &AnimationClip,
     time_seconds: f32,
-) -> (Vec<Mat4>, Vec<GridVertex>) {
+) -> (Vec<Mat4>, Vec<GridVertex>, Vec<Vec3>) {
     let num_bones = bones.len();
     if num_bones == 0 {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     }
 
+    // 1. Compute Bind Global Matrices (Forward Kinematics on Rest Pose)
     let mut bind_global = vec![None; num_bones];
+
+    fn get_bind_local(bone: &ObjectBone) -> Mat4 {
+        let rot = Quat::from_xyzw(
+            bone.rotation.x,
+            bone.rotation.y,
+            bone.rotation.z,
+            bone.rotation.w,
+        )
+        .normalize();
+        let trans = Vec3::new(bone.translation.x, bone.translation.y, bone.translation.z);
+        Mat4::from_rotation_translation(rot, trans)
+    }
 
     fn calc_bind_global(
         idx: usize,
@@ -881,7 +894,7 @@ pub fn compute_skinning_matrices(
         }
         visited[idx] = true;
 
-        let local_m = Mat4::from_cols_array(&bones[idx].matrix).transpose();
+        let local_m = get_bind_local(&bones[idx]);
         let p_idx = bones[idx].parent_index;
 
         let global_m = if p_idx >= 0 && (p_idx as usize) < bones.len() && (p_idx as usize) != idx {
@@ -896,21 +909,16 @@ pub fn compute_skinning_matrices(
     }
 
     let mut bind_inv_matrices = Vec::with_capacity(num_bones);
-    let mut bind_scales = Vec::with_capacity(num_bones);
-
     for i in 0..num_bones {
         let mut visited = vec![false; num_bones];
         let bg = calc_bind_global(i, bones, &mut bind_global, &mut visited);
         bind_inv_matrices.push(bg.inverse());
-
-        let local_bind = Mat4::from_cols_array(&bones[i].matrix).transpose();
-        let (scale, _, _) = local_bind.to_scale_rotation_translation();
-        bind_scales.push(scale);
     }
 
+    // 2. Compute Animated Local Matrices
     let mut local_animated = Vec::with_capacity(num_bones);
 
-    for (i, bone) in bones.iter().enumerate() {
+    for bone in bones {
         let track_opt = clip.bone_tracks.iter().find(|t| t.bone_name == bone.name);
 
         let translation = if let Some(track) = track_opt
@@ -934,12 +942,11 @@ pub fn compute_skinning_matrices(
             )
         };
 
-        let scale = bind_scales[i];
-        let local_m =
-            Mat4::from_scale_rotation_translation(scale, rotation.normalize(), translation);
+        let local_m = Mat4::from_rotation_translation(rotation.normalize(), translation);
         local_animated.push(local_m);
     }
 
+    // 3. Compute Animated Global Matrices
     let mut global_animated = vec![None; num_bones];
 
     fn calc_anim_global(
@@ -980,39 +987,42 @@ pub fn compute_skinning_matrices(
         );
     }
 
+    // 4. Extract 3D Bone Joint Positions for skeleton lines and labels
+    let bone_positions: Vec<Vec3> = global_animated
+        .iter()
+        .map(|g_opt| g_opt.unwrap_or(Mat4::IDENTITY).transform_point3(Vec3::ZERO))
+        .collect();
+
+    // 5. Build line segments connecting bones
     let mut debug_lines = Vec::new();
     let magenta = [1.0, 0.0, 1.0, 1.0];
     let cyan = [0.0, 1.0, 1.0, 1.0];
 
     for i in 0..num_bones {
-        let g_mat = global_animated[i].unwrap_or(Mat4::IDENTITY);
-        let cp = g_mat.transform_point3(Vec3::ZERO);
-        let child_pos = Vec3::new(cp.x, cp.z, -cp.y);
-
         let p_idx = bones[i].parent_index;
         if p_idx >= 0 && (p_idx as usize) < num_bones {
-            let p_mat = global_animated[p_idx as usize].unwrap_or(Mat4::IDENTITY);
-            let pp = p_mat.transform_point3(Vec3::ZERO);
-            let parent_pos = Vec3::new(pp.x, pp.z, -pp.y);
+            let parent_pos = bone_positions[p_idx as usize];
+            let child_pos = bone_positions[i];
 
             debug_lines.push(GridVertex {
-                position: parent_pos.into(),
+                position: [parent_pos.x, parent_pos.y, parent_pos.z],
                 color: magenta,
             });
             debug_lines.push(GridVertex {
-                position: child_pos.into(),
+                position: [child_pos.x, child_pos.y, child_pos.z],
                 color: cyan,
             });
         }
     }
 
+    // 6. Compute Final Skinning Matrices: (Global_Anim * Bind_Inv)
     let mut skin_matrices = Vec::with_capacity(num_bones);
     for i in 0..num_bones {
         let g = global_animated[i].unwrap_or(Mat4::IDENTITY);
         skin_matrices.push(g * bind_inv_matrices[i]);
     }
 
-    (skin_matrices, debug_lines)
+    (skin_matrices, debug_lines, bone_positions)
 }
 
 fn sample_translation(keys: &[KeyframeTranslation], time: f32) -> Vec3 {
@@ -1090,92 +1100,4 @@ fn sample_rotation(keys: &[KeyframeRotation], time: f32) -> Quat {
 
     let q = &keys[0].rotation_quat;
     Quat::from_xyzw(q.x, q.y, q.z, q.w).normalize()
-}
-
-pub fn apply_skeletal_skinning(
-    rest_positions: &[Vector3],
-    rest_normals: &[Vector3],
-    joints: &[[u16; 4]],
-    weights: &[Vector4],
-    skin_matrices: &[Mat4],
-    out_positions: &mut [Vector3],
-    out_normals: &mut [Vector3],
-) {
-    if skin_matrices.is_empty() || joints.is_empty() || weights.is_empty() {
-        out_positions.copy_from_slice(rest_positions);
-        out_normals.copy_from_slice(rest_normals);
-        return;
-    }
-
-    let num_matrices = skin_matrices.len();
-
-    let mut scale_factor: u16 = 1;
-    for j in joints {
-        if j[0] as usize >= num_matrices
-            || j[1] as usize >= num_matrices
-            || j[2] as usize >= num_matrices
-            || j[3] as usize >= num_matrices
-        {
-            scale_factor = 3;
-            break;
-        }
-    }
-
-    for i in 0..rest_positions.len() {
-        let p = rest_positions[i];
-        let n = rest_normals.get(i).copied().unwrap_or(Vector3 {
-            x: 0.0,
-            y: 1.0,
-            z: 0.0,
-        });
-        let j = joints[i];
-        let w = weights[i];
-
-        let j0 = (j[0] / scale_factor) as usize;
-        let j1 = (j[1] / scale_factor) as usize;
-        let j2 = (j[2] / scale_factor) as usize;
-        let j3 = (j[3] / scale_factor) as usize;
-
-        let m0 = if j0 < num_matrices {
-            skin_matrices[j0]
-        } else {
-            Mat4::IDENTITY
-        };
-        let m1 = if j1 < num_matrices {
-            skin_matrices[j1]
-        } else {
-            Mat4::IDENTITY
-        };
-        let m2 = if j2 < num_matrices {
-            skin_matrices[j2]
-        } else {
-            Mat4::IDENTITY
-        };
-        let m3 = if j3 < num_matrices {
-            skin_matrices[j3]
-        } else {
-            Mat4::IDENTITY
-        };
-
-        let v_pos = glam::Vec4::new(p.x, p.y, p.z, 1.0);
-        let v_norm = glam::Vec4::new(n.x, n.y, n.z, 0.0);
-
-        let skinned_p =
-            (m0 * v_pos) * w.x + (m1 * v_pos) * w.y + (m2 * v_pos) * w.z + (m3 * v_pos) * w.w;
-
-        let skinned_n =
-            (m0 * v_norm) * w.x + (m1 * v_norm) * w.y + (m2 * v_norm) * w.z + (m3 * v_norm) * w.w;
-
-        out_positions[i] = Vector3 {
-            x: skinned_p.x,
-            y: skinned_p.y,
-            z: skinned_p.z,
-        };
-
-        out_normals[i] = Vector3 {
-            x: skinned_n.x,
-            y: skinned_n.y,
-            z: skinned_n.z,
-        };
-    }
 }

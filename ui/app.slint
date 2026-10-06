@@ -7,23 +7,18 @@ import {
 } from "std-widgets.slint";
 import { TabButton, CustomButton } from "./components/buttons.slint";
 import { SectionTitle, SplitterBar } from "./components/common.slint";
-import { Viewport3DView } from "./views/viewport_3d.slint";
+import { Viewport3DView, BoneLabel } from "./views/viewport_3d.slint";
 import { JsonEditorView } from "./views/editor_view.slint";
 
+export { BoneLabel }
 export struct AssetItem {
     display_name: string,
     kind_name: string,
     icon: string,
     file_path: string,
     size_str: string,
-    kind_id: int, // 0: Texture, 1: Audio, 2: Material, 3: Mesh, 4: Lua, 5: Generic, 6: UI, 7: Object, 8: Animation, 9: TerrainPalette, 10: Collision, 11: Environment, 12: M8LD Map Logic, 13: UI Sprite Collection, 14: Lighting Set (.dta), 15: Voice Package (.debug-vpk)
+    kind_id: int,
     is_modified: bool,
-}
-
-export struct BoneLabel {
-    name: string,
-    x: length,
-    y: length,
 }
 
 export component AppWindow inherits Window {
@@ -38,7 +33,7 @@ export component AppWindow inherits Window {
     in-out property <int> active_tab: 0;
     in-out property <length> sidebar_width: 440px;
 
-    // Toolbox Subcategory Tab: 0 = Localization, 1 = Lighting & Env, 2 = 3D & Maps, 3 = Collisions & Fonts, 4 = Textures & Audio
+    // Toolbox Subcategory Tab
     in-out property <int> active_toolbox_tab: 0;
 
     // Workspace Data
@@ -55,7 +50,7 @@ export component AppWindow inherits Window {
     // 3D Viewport Controls & Composite State
     in-out property <float> viewport_fov: 45.0;
     in-out property <int> viewport_lighting: 0;
-    in-out property <int> viewport_up_axis: 1;
+    in-out property <int> viewport_up_axis: 0;
     in-out property <bool> has_composite_available: false;
     in-out property <bool> is_composite_active: false;
     in-out property <bool> is_skinning_enabled: true;
@@ -70,10 +65,13 @@ export component AppWindow inherits Window {
     // Real-Time Viewport Animation Playback States
     in-out property <bool> has_animations: false;
     in-out property <bool> is_anim_playing: false;
+    in-out property <bool> is_anim_looping: true;
+    in-out property <float> playback_speed: 1.0;
     in-out property <[string]> available_animations: [];
     in-out property <int> selected_anim_idx: 0;
     in-out property <float> anim_current_time: 0.0;
     in-out property <float> anim_duration: 1.0;
+    in-out property <float> anim_fps: 30.0;
 
     // Active Asset Inspector States
     in-out property <image> tex_preview;
@@ -128,11 +126,11 @@ export component AppWindow inherits Window {
         interval: 33ms;
         running: root.is_anim_playing && root.has_animations;
         triggered => {
-            root.tick_animation_frame(0.033);
+            root.tick_animation_frame(0.033 * root.playback_speed);
         }
     }
 
-    // Contextual Asset Operations Callbacks (for loaded project chunks)
+    // Contextual Asset Operations Callbacks
     callback export_dds(string, string);
     callback import_dds(string, string);
     callback export_wav(string, string);
@@ -156,7 +154,7 @@ export component AppWindow inherits Window {
     callback export_anim_glb(string, string);
     callback export_anim_json(string, string);
 
-    // Standalone Direct File Operations (Global Toolbox)
+    // Standalone Direct File Operations
     callback decompile_8ld(string, string);
     callback compile_8ld(string, string);
     callback decompile_8ld_batch(string, string);
@@ -235,7 +233,7 @@ export component AppWindow inherits Window {
         if root.active_tab == 0: VerticalLayout {
             spacing: 10px;
 
-            // QUICK ACTIONS TOOLBAR (ORGANIZED IN 3 ROWS)
+            // QUICK ACTIONS TOOLBAR
             Rectangle {
                 height: 114px;
                 background: #2b2d31;
@@ -371,7 +369,6 @@ export component AppWindow inherits Window {
                             width: 65px;
                         }
 
-                        // Tab 0: Localization
                         Rectangle {
                             background: root.active_toolbox_tab == 0 ? #3e6a90 : (c0_ta.has-hover ? #2e3035 : #202124);
                             border-radius: 3px;
@@ -395,7 +392,6 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        // Tab 1: Lighting & Env
                         Rectangle {
                             background: root.active_toolbox_tab == 1 ? #d28e1b : (c1_ta.has-hover ? #2e3035 : #202124);
                             border-radius: 3px;
@@ -419,7 +415,6 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        // Tab 2: 3D Models & Maps
                         Rectangle {
                             background: root.active_toolbox_tab == 2 ? #23a55a : (c2_ta.has-hover ? #2e3035 : #202124);
                             border-radius: 3px;
@@ -443,7 +438,6 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        // Tab 3: Collisions & Fonts
                         Rectangle {
                             background: root.active_toolbox_tab == 3 ? #5865f2 : (c3_ta.has-hover ? #2e3035 : #202124);
                             border-radius: 3px;
@@ -467,7 +461,6 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        // Tab 4: Textures & Audio
                         Rectangle {
                             background: root.active_toolbox_tab == 4 ? #b57a16 : (c4_ta.has-hover ? #2e3035 : #202124);
                             border-radius: 3px;
@@ -492,12 +485,11 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    // ROW 3: CONTEXTUAL ACTIONS FOR SELECTED TOOLBOX CATEGORY
+                    // ROW 3: CONTEXTUAL ACTIONS
                     HorizontalLayout {
                         spacing: 6px;
                         alignment: start;
 
-                        // --- CATEGORY 0: LOCALIZATION ---
                         if root.active_toolbox_tab == 0: HorizontalLayout {
                             spacing: 6px;
                             CustomButton {
@@ -570,7 +562,6 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        // --- CATEGORY 1: LIGHTING & ENVIRONMENT ---
                         if root.active_toolbox_tab == 1: HorizontalLayout {
                             spacing: 6px;
                             CustomButton {
@@ -624,7 +615,6 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        // --- CATEGORY 2: 3D MODELS & LEVEL MAPS ---
                         if root.active_toolbox_tab == 2: HorizontalLayout {
                             spacing: 6px;
                             CustomButton {
@@ -678,7 +668,6 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        // --- CATEGORY 3: COLLISIONS & FONTS ---
                         if root.active_toolbox_tab == 3: HorizontalLayout {
                             spacing: 6px;
                             CustomButton {
@@ -729,7 +718,6 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        // --- CATEGORY 4: TEXTURES & AUDIO ---
                         if root.active_toolbox_tab == 4: HorizontalLayout {
                             spacing: 6px;
                             CustomButton {
@@ -1141,7 +1129,7 @@ export component AppWindow inherits Window {
                                     spacing: 12px;
                                     alignment: space-between;
 
-                                    // Left: Camera Controls (Fit, Zoom +, -, Axis Mode)
+                                    // Left: Camera Controls (Fit, Zoom +, -, Axis Mode Switcher)
                                     HorizontalLayout {
                                         spacing: 6px;
                                         alignment: center;
@@ -1216,17 +1204,17 @@ export component AppWindow inherits Window {
                                             }
                                         }
 
-                                        // 3-way axis cycler: Mode 1 (+90° Upright) -> Mode 0 (Raw) -> Mode 2 (-90° Invert)
+                                        // 4-Mode Viewport Axis Switcher
                                         Rectangle {
-                                            width: 130px;
+                                            width: 160px;
                                             height: 26px;
                                             y: (parent.height - self.height) / 2;
-                                            background: root.viewport_up_axis == 1 ? #23a55a : (root.viewport_up_axis == 2 ? #d28e1b : #2b303c);
+                                            background: root.viewport_up_axis == 0 ? #23a55a : (root.viewport_up_axis == 1 ? #d28e1b : (root.viewport_up_axis == 2 ? #5865f2 : #2b303c));
                                             border-radius: 4px;
                                             border-width: 1px;
-                                            border-color: root.viewport_up_axis == 1 ? #57f287 : (root.viewport_up_axis == 2 ? #f0b132 : #3e4450);
+                                            border-color: root.viewport_up_axis == 0 ? #57f287 : (root.viewport_up_axis == 1 ? #f0b132 : (root.viewport_up_axis == 2 ? #7983f5 : #3e4450));
                                             Text {
-                                                text: root.viewport_up_axis == 1 ? "📐 Game (+90°)" : (root.viewport_up_axis == 2 ? "📐 Invert (-90°)" : "📐 Raw (As-is)");
+                                                text: root.viewport_up_axis == 0 ? "📐 Ground (Default)" : (root.viewport_up_axis == 1 ? "📐 Pitch Up (+90°)" : (root.viewport_up_axis == 2 ? "📐 Pitch Down (-90°)" : "📐 Inverted (180°)"));
                                                 font-size: 11px;
                                                 font-weight: 700;
                                                 color: #ffffff;
@@ -1237,12 +1225,14 @@ export component AppWindow inherits Window {
                                             up_ta := TouchArea {
                                                 mouse-cursor: pointer;
                                                 clicked => {
-                                                    if (root.viewport_up_axis == 1) {
-                                                        root.viewport_up_axis = 0;
-                                                    } else if (root.viewport_up_axis == 0) {
-                                                        root.viewport_up_axis = 2;
-                                                    } else {
+                                                    if (root.viewport_up_axis == 0) {
                                                         root.viewport_up_axis = 1;
+                                                    } else if (root.viewport_up_axis == 1) {
+                                                        root.viewport_up_axis = 2;
+                                                    } else if (root.viewport_up_axis == 2) {
+                                                        root.viewport_up_axis = 3;
+                                                    } else {
+                                                        root.viewport_up_axis = 0;
                                                     }
                                                     root.set_viewport_up_axis(root.viewport_up_axis);
                                                 }
@@ -1368,7 +1358,7 @@ export component AppWindow inherits Window {
                                 }
                             }
 
-                            // --- VIEWPORT WITH BONE LABELS OVERLAY ---
+                            // --- VIEWPORT WITH 3D IMAGE, PINNED BONES & LEFT PANELS ---
                             Rectangle {
                                 background: #111214;
                                 border-radius: 4px;
@@ -1381,122 +1371,326 @@ export component AppWindow inherits Window {
                                     preview_image: root.mesh_preview;
                                     has_mesh: root.has_mesh;
                                     stats_lines: root.mesh_stats_lines;
+                                    bone_labels: root.bone_labels;
+                                    has_animations: root.has_animations;
+                                    available_animations: root.available_animations;
+                                    selected_anim_idx: root.selected_anim_idx;
                                     rotate_viewport(dyaw, dpitch) => { root.rotate_mesh_viewport(dyaw, dpitch); }
                                     zoom_viewport(delta) => { root.zoom_mesh_viewport(delta); }
-                                }
-
-                                // Overlay Bone Names
-                                for label in root.bone_labels: Rectangle {
-                                    x: label.x - 32px;
-                                    y: label.y - 10px;
-                                    width: 64px;
-                                    height: 20px;
-                                    background: #0f1115f0;
-                                    border-radius: 3px;
-                                    border-width: 1px;
-                                    border-color: #3e6a90;
-
-                                    Text {
-                                        text: label.name;
-                                        font-family: "Consolas";
-                                        font-size: 9.5px;
-                                        color: #58a6ff;
-                                        horizontal-alignment: center;
-                                        vertical-alignment: center;
-                                        overflow: elide;
+                                    select_animation(idx) => {
+                                        root.selected_anim_idx = idx;
+                                        root.select_active_animation(idx);
                                     }
                                 }
                             }
 
-                            // --- ANIMATION PLAYER HUD ---
-                            Rectangle {
-                                height: 44px;
-                                background: #20242c;
+                            // --- BLENDER-STYLE ANIMATION TIMELINE & TRANSPORT BAR ---
+                            if root.has_animations: Rectangle {
+                                height: 56px;
+                                background: #1b1e24;
                                 border-radius: 6px;
                                 border-width: 1px;
-                                border-color: #353535;
+                                border-color: #2c323b;
 
-                                HorizontalLayout {
-                                    padding-left: 12px;
-                                    padding-right: 12px;
-                                    spacing: 12px;
-                                    alignment: space-between;
+                                VerticalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    padding-top: 5px;
+                                    padding-bottom: 5px;
+                                    spacing: 4px;
 
-                                    // Play / Pause Button
-                                    Rectangle {
-                                        width: 80px;
-                                        height: 28px;
-                                        y: (parent.height - self.height) / 2;
-                                        background: !root.has_animations ? #2b303c : (root.is_anim_playing ? #d28e1b : #23a55a);
-                                        border-radius: 4px;
-                                        Text {
-                                            text: !root.has_animations ? "⛔ No Anim" : (root.is_anim_playing ? "⏸ Pause" : "▶ Play");
-                                            font-size: 11px;
-                                            font-weight: 700;
-                                            color: !root.has_animations ? #808080 : #ffffff;
-                                            vertical-alignment: center;
-                                            horizontal-alignment: center;
-                                        }
+                                    // Top Row: Transport Buttons, Frame Badges & Speed Selector
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        alignment: space-between;
 
-                                        TouchArea {
-                                            enabled: root.has_animations;
-                                            mouse-cursor: root.has_animations ? pointer : default;
-                                            clicked => { root.is_anim_playing = !root.is_anim_playing; }
-                                        }
-                                    }
-
-                                    // Animation Clips Selector Dropdown / Cycle Chip
-                                    Rectangle {
-                                        width: 220px;
-                                        height: 28px;
-                                        y: (parent.height - self.height) / 2;
-                                        background: #2b303c;
-                                        border-radius: 4px;
-                                        border-width: 1px;
-                                        border-color: #3e4450;
+                                        // Left: Transport Player Controls
                                         HorizontalLayout {
-                                            padding-left: 8px;
-                                            padding-right: 8px;
-                                            Text {
-                                                text: "🎬 " + (root.available_animations.length > 0 ? root.available_animations[root.selected_anim_idx] : "No Clips in Package");
-                                                font-size: 11px;
-                                                font-weight: 700;
-                                                color: root.available_animations.length > 0 ? #58a6ff : #808080;
-                                                vertical-alignment: center;
-                                                overflow: elide;
+                                            spacing: 4px;
+                                            alignment: start;
+
+                                            // Go to Start (Frame 0)
+                                            Rectangle {
+                                                width: 28px;
+                                                height: 22px;
+                                                background: f0_ta.has-hover ? #3e4450 : #242932;
+                                                border-radius: 3px;
+                                                border-width: 1px;
+                                                border-color: #343a46;
+                                                Text {
+                                                    text: "⏮";
+                                                    font-size: 11px;
+                                                    color: #ffffff;
+                                                    horizontal-alignment: center;
+                                                    vertical-alignment: center;
+                                                }
+
+                                                f0_ta := TouchArea {
+                                                    mouse-cursor: pointer;
+                                                    clicked => { root.scrub_animation_timeline(0.0); }
+                                                }
+                                            }
+
+                                            // Step -1 Frame
+                                            Rectangle {
+                                                width: 28px;
+                                                height: 22px;
+                                                background: pb_ta.has-hover ? #3e4450 : #242932;
+                                                border-radius: 3px;
+                                                border-width: 1px;
+                                                border-color: #343a46;
+                                                Text {
+                                                    text: "◀";
+                                                    font-size: 10px;
+                                                    color: #ffffff;
+                                                    horizontal-alignment: center;
+                                                    vertical-alignment: center;
+                                                }
+
+                                                pb_ta := TouchArea {
+                                                    mouse-cursor: pointer;
+                                                    clicked => {
+                                                        let new_t = Math.max(0.0, root.anim_current_time - (1.0 / root.anim_fps));
+                                                        root.scrub_animation_timeline(new_t);
+                                                    }
+                                                }
+                                            }
+
+                                            // Play / Pause
+                                            Rectangle {
+                                                width: 65px;
+                                                height: 22px;
+                                                background: root.is_anim_playing ? #d28e1b : #23a55a;
+                                                border-radius: 3px;
+                                                HorizontalLayout {
+                                                    alignment: center;
+                                                    spacing: 4px;
+                                                    Text {
+                                                        text: root.is_anim_playing ? "⏸ Pause" : "▶ Play";
+                                                        font-size: 10.5px;
+                                                        font-weight: 700;
+                                                        color: #ffffff;
+                                                        vertical-alignment: center;
+                                                    }
+                                                }
+
+                                                TouchArea {
+                                                    mouse-cursor: pointer;
+                                                    clicked => { root.is_anim_playing = !root.is_anim_playing; }
+                                                }
+                                            }
+
+                                            // Step +1 Frame
+                                            Rectangle {
+                                                width: 28px;
+                                                height: 22px;
+                                                background: pf_ta.has-hover ? #3e4450 : #242932;
+                                                border-radius: 3px;
+                                                border-width: 1px;
+                                                border-color: #343a46;
+                                                Text {
+                                                    text: "▶";
+                                                    font-size: 10px;
+                                                    color: #ffffff;
+                                                    horizontal-alignment: center;
+                                                    vertical-alignment: center;
+                                                }
+
+                                                pf_ta := TouchArea {
+                                                    mouse-cursor: pointer;
+                                                    clicked => {
+                                                        let new_t = Math.min(root.anim_duration, root.anim_current_time + (1.0 / root.anim_fps));
+                                                        root.scrub_animation_timeline(new_t);
+                                                    }
+                                                }
+                                            }
+
+                                            // Go to End
+                                            Rectangle {
+                                                width: 28px;
+                                                height: 22px;
+                                                background: fe_ta.has-hover ? #3e4450 : #242932;
+                                                border-radius: 3px;
+                                                border-width: 1px;
+                                                border-color: #343a46;
+                                                Text {
+                                                    text: "⏭";
+                                                    font-size: 11px;
+                                                    color: #ffffff;
+                                                    horizontal-alignment: center;
+                                                    vertical-alignment: center;
+                                                }
+
+                                                fe_ta := TouchArea {
+                                                    mouse-cursor: pointer;
+                                                    clicked => { root.scrub_animation_timeline(root.anim_duration); }
+                                                }
+                                            }
+
+                                            // Loop Toggle
+                                            Rectangle {
+                                                width: 32px;
+                                                height: 22px;
+                                                background: root.is_anim_looping ? #3e6a90 : #242932;
+                                                border-radius: 3px;
+                                                border-width: 1px;
+                                                border-color: root.is_anim_looping ? #58a6ff : #343a46;
+                                                Text {
+                                                    text: "🔁";
+                                                    font-size: 11px;
+                                                    horizontal-alignment: center;
+                                                    vertical-alignment: center;
+                                                }
+
+                                                TouchArea {
+                                                    mouse-cursor: pointer;
+                                                    clicked => { root.is_anim_looping = !root.is_anim_looping; }
+                                                }
                                             }
                                         }
 
-                                        TouchArea {
-                                            enabled: root.available_animations.length > 0;
-                                            mouse-cursor: root.available_animations.length > 0 ? pointer : default;
-                                            clicked => {
-                                                if (root.available_animations.length > 0) {
-                                                    root.selected_anim_idx = Math.mod(root.selected_anim_idx + 1, root.available_animations.length);
-                                                    root.select_active_animation(root.selected_anim_idx);
+                                        // Center: Frame Index / Timecode
+                                        HorizontalLayout {
+                                            spacing: 6px;
+                                            alignment: center;
+
+                                            Rectangle {
+                                                background: #111317;
+                                                border-radius: 3px;
+                                                border-width: 1px;
+                                                border-color: #2c323b;
+                                                HorizontalLayout {
+                                                    padding-left: 8px;
+                                                    padding-right: 8px;
+                                                    spacing: 6px;
+
+                                                    Text {
+                                                        text: "Frame " + Math.round(root.anim_current_time * root.anim_fps) + " / " + Math.round(root.anim_duration * root.anim_fps);
+                                                        font-family: "Consolas";
+                                                        font-size: 11px;
+                                                        font-weight: 700;
+                                                        color: #58a6ff;
+                                                        vertical-alignment: center;
+                                                    }
+
+                                                    Text {
+                                                        text: "•";
+                                                        font-size: 10px;
+                                                        color: #4a505b;
+                                                        vertical-alignment: center;
+                                                    }
+
+                                                    Text {
+                                                        text: Math.round(root.anim_current_time * 100.0) / 100.0 + "s / " + Math.round(root.anim_duration * 100.0) / 100.0 + "s";
+                                                        font-family: "Consolas";
+                                                        font-size: 11px;
+                                                        color: #f0b132;
+                                                        vertical-alignment: center;
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        // Right: Playback Speed Selector (0.5x, 1x, 2x)
+                                        HorizontalLayout {
+                                            spacing: 4px;
+                                            alignment: end;
+
+                                            Text {
+                                                text: "Speed:";
+                                                font-size: 10px;
+                                                color: #8b929e;
+                                                vertical-alignment: center;
+                                            }
+
+                                            Rectangle {
+                                                width: 38px;
+                                                height: 20px;
+                                                background: root.playback_speed == 0.5 ? #3e6a90 : #242932;
+                                                border-radius: 3px;
+                                                border-width: 1px;
+                                                border-color: root.playback_speed == 0.5 ? #58a6ff : #343a46;
+                                                Text {
+                                                    text: "0.5x";
+                                                    font-size: 10px;
+                                                    font-weight: 700;
+                                                    color: #ffffff;
+                                                    horizontal-alignment: center;
+                                                    vertical-alignment: center;
+                                                }
+
+                                                TouchArea {
+                                                    mouse-cursor: pointer;
+                                                    clicked => { root.playback_speed = 0.5; }
+                                                }
+                                            }
+
+                                            Rectangle {
+                                                width: 34px;
+                                                height: 20px;
+                                                background: root.playback_speed == 1.0 ? #3e6a90 : #242932;
+                                                border-radius: 3px;
+                                                border-width: 1px;
+                                                border-color: root.playback_speed == 1.0 ? #58a6ff : #343a46;
+                                                Text {
+                                                    text: "1.0x";
+                                                    font-size: 10px;
+                                                    font-weight: 700;
+                                                    color: #ffffff;
+                                                    horizontal-alignment: center;
+                                                    vertical-alignment: center;
+                                                }
+
+                                                TouchArea {
+                                                    mouse-cursor: pointer;
+                                                    clicked => { root.playback_speed = 1.0; }
+                                                }
+                                            }
+
+                                            Rectangle {
+                                                width: 38px;
+                                                height: 20px;
+                                                background: root.playback_speed == 2.0 ? #3e6a90 : #242932;
+                                                border-radius: 3px;
+                                                border-width: 1px;
+                                                border-color: root.playback_speed == 2.0 ? #58a6ff : #343a46;
+                                                Text {
+                                                    text: "2.0x";
+                                                    font-size: 10px;
+                                                    font-weight: 700;
+                                                    color: #ffffff;
+                                                    horizontal-alignment: center;
+                                                    vertical-alignment: center;
+                                                }
+
+                                                TouchArea {
+                                                    mouse-cursor: pointer;
+                                                    clicked => { root.playback_speed = 2.0; }
                                                 }
                                             }
                                         }
                                     }
 
-                                    // Timeline Scrubber Slider
-                                    HorizontalLayout {
-                                        spacing: 8px;
-                                        horizontal-stretch: 1;
-                                        alignment: center;
+                                    // Bottom Row: Interactive Timeline Scrubber
+                                    Rectangle {
+                                        height: 18px;
+                                        background: #111317;
+                                        border-radius: 3px;
+                                        border-width: 1px;
+                                        border-color: #242932;
+                                        clip: true;
 
-                                        Text {
-                                            text: Math.round(root.anim_current_time * 100.0) / 100.0 + "s / " + Math.round(root.anim_duration * 100.0) / 100.0 + "s";
-                                            font-family: "Consolas";
-                                            font-size: 11px;
-                                            font-weight: 700;
-                                            color: #f0b132;
-                                            vertical-alignment: center;
-                                            width: 95px;
+                                        Rectangle {
+                                            x: 0px;
+                                            y: 0px;
+                                            width: (parent.width * (root.anim_current_time / Math.max(0.001, root.anim_duration)));
+                                            height: parent.height;
+                                            background: #3e6a9040;
                                         }
 
                                         Slider {
-                                            enabled: root.has_animations;
+                                            width: parent.width;
+                                            height: parent.height;
                                             minimum: 0.0;
                                             maximum: root.anim_duration;
                                             value <=> root.anim_current_time;

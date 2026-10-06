@@ -100,7 +100,13 @@ pub fn decompress_dta_payload(data: &[u8]) -> Result<(Vec<u8>, DtaHeader, DtaEng
 
     let payload_end = data.len().saturating_sub(FOOTER_SIZE);
     let mut pos = DTA_HEADER_SIZE;
-    let mut decompressed_all = Vec::with_capacity(header.uncompressed_size as usize);
+
+    // Prevent Out-Of-Memory exhaustion via truncated/malicious headers
+    let safe_capacity = (header.uncompressed_size as usize)
+        .min(data.len().saturating_mul(20).max(64 * 1024))
+        .min(64 * 1024 * 1024);
+
+    let mut decompressed_all = Vec::with_capacity(safe_capacity);
     let mut block_count = 0;
 
     while pos + 4 <= payload_end {

@@ -30,6 +30,7 @@ bytemuck = { version = "1.25.2", features = ["derive"] }
 wgpu = "30.0.1"
 pollster = "1.0.1"
 glam = "0.34.0"
+tempfile = "3.27.0"
 
 [build-dependencies]
 slint-build = "1.18.1"
