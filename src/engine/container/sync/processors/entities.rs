@@ -5,6 +5,7 @@ use super::super::cache::{AssetSyncEntry, build_asset_filename, calculate_crc32}
 use super::{AssetProcessor, ProjectWorkspace};
 use crate::engine::assets::character::export_character;
 use crate::engine::assets::object::export_object;
+use crate::engine::assets::projectile::export_projectile_to_json;
 use crate::engine::assets::sniffer::{AssetKind, SniffedAsset};
 
 pub struct CharacterProcessor;
@@ -30,7 +31,7 @@ impl AssetProcessor for CharacterProcessor {
             fs::create_dir_all(&scripts_dir)?;
             let file_base = format!("{}_logic", stem);
             let lua_path = scripts_dir.join(format!("{}.lua", file_base));
-            fs::write(&lua_path, lua_source.as_bytes())?;
+            let _ = fs::write(&lua_path, lua_source.as_bytes());
 
             if !extracted.embedded_lua_bytecode.is_empty() {
                 let luac_path = scripts_dir.join(format!("{}.luac", file_base));
@@ -44,7 +45,7 @@ impl AssetProcessor for CharacterProcessor {
             fs::create_dir_all(&face_dir)?;
             let fxe_name = format!("{}_face.fxe", stem);
             let fxe_path = face_dir.join(&fxe_name);
-            fs::write(fxe_path, fxe_bytes)?;
+            let _ = fs::write(fxe_path, fxe_bytes);
             extracted.character.embedded_facefx_file = Some(format!("assets/facefx/{}", fxe_name));
         }
 
@@ -112,8 +113,7 @@ impl AssetProcessor for ProjectileProcessor {
         let proj_dir = workspace.assets_dir.join("projectiles");
         fs::create_dir_all(&proj_dir)?;
 
-        let extracted = export_character(data, stem)?;
-        let json_str = serde_json::to_string_pretty(&extracted.character)?;
+        let json_str = export_projectile_to_json(data, stem)?;
         let out_name = build_asset_filename(&sniffed.display_name, stem, "json");
         fs::write(proj_dir.join(&out_name), json_str.as_bytes())?;
 

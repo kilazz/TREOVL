@@ -202,10 +202,10 @@ pub fn compute_skinning_matrices(
     }
 
     // 6. Compute Final Skinning Matrices: (Global_Anim * Bind_Inv)
+    // Pure calculation in native engine space without coordinate interference
     let mut skin_matrices = vec![Mat4::IDENTITY; 128];
     let mut slot_assigned = [false; 128];
 
-    // Check if bone_ids are non-negative, valid, and unique within 0..128
     let has_unique_bone_ids = {
         let mut ids = std::collections::HashSet::new();
         let mut valid = true;

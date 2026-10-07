@@ -169,6 +169,8 @@ pub fn parse_texture_chunk(data: &[u8]) -> Result<OverlordTexture> {
                         let block_size = if format == TextureFormat::DXT1 { 8 } else { 16 };
                         let mip_size = if format == TextureFormat::UncompressedRGBA {
                             (width * height * 4) as usize
+                        } else if format == TextureFormat::UncompressedRGB {
+                            (width * height * 3) as usize
                         } else {
                             (width.div_ceil(4) * height.div_ceil(4) * block_size) as usize
                         };
@@ -218,11 +220,19 @@ pub fn parse_texture_chunk(data: &[u8]) -> Result<OverlordTexture> {
         let width = u32::from_le_bytes(data[16..20].try_into()?);
         let mip_count = u32::from_le_bytes(data[28..32].try_into()?).max(1);
         let fourcc = &data[84..88];
+        let rgb_bit_count = u32::from_le_bytes(data[88..92].try_into().unwrap_or_default());
+
         let format = match fourcc {
             b"DXT1" => TextureFormat::DXT1,
             b"DXT3" => TextureFormat::DXT3,
             b"DXT5" => TextureFormat::DXT5,
-            _ => TextureFormat::UncompressedRGBA,
+            _ => {
+                if rgb_bit_count == 24 {
+                    TextureFormat::UncompressedRGB
+                } else {
+                    TextureFormat::UncompressedRGBA
+                }
+            }
         };
 
         let caps2 = u32::from_le_bytes(data[112..116].try_into()?);
@@ -370,11 +380,20 @@ pub fn replace_texture_in_chunk(chunk_data: &[u8], input_image: &[u8]) -> Result
         let mut fourcc = [0u8; 4];
         c.read_exact(&mut fourcc)?;
 
+        c.set_position(88);
+        let bpp = c.read_u32::<LittleEndian>().unwrap_or(32);
+
         let (new_format, block_size) = match &fourcc {
             b"DXT1" => (7u32, 8usize),
             b"DXT3" => (9u32, 16usize),
             b"DXT5" => (11u32, 16usize),
-            _ => (5u32, 4usize),
+            _ => {
+                if bpp == 24 {
+                    (3u32, 3usize)
+                } else {
+                    (5u32, 4usize)
+                }
+            }
         };
 
         let (root_type_id, mut root_elements) = parse_typed_container(chunk_data)?;
@@ -392,6 +411,8 @@ pub fn replace_texture_in_chunk(chunk_data: &[u8], input_image: &[u8]) -> Result
             for _mip_idx in 0..mip_count {
                 let mip_size = if new_format == 5 {
                     (w * h * 4) as usize
+                } else if new_format == 3 {
+                    (w * h * 3) as usize
                 } else {
                     (w.div_ceil(4) * h.div_ceil(4) * block_size as u32) as usize
                 };

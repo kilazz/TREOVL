@@ -45,6 +45,8 @@ pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> 
     let mut embedded_lua_bytecode = Vec::new();
     let mut animation_states = Vec::new();
     let mut ai_behaviors = Vec::new();
+    let mut ai_actions = Vec::new();
+    let mut socket_offsets = Vec::new();
     let mut transformations = Vec::new();
     let mut effect_receptors = Vec::new();
     let mut minion_grapple_bones = Vec::new();
@@ -55,6 +57,8 @@ pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> 
     let mut knockback = None;
     let mut state_and_rewards = CharacterStateAndRewardsJson::default();
     let mut morph_params = CharacterMorphParamsJson::default();
+    let mut ragdoll_config = None;
+    let mut collision_filter = None;
     let mut equipment = None;
     let mut unmapped_raw_blocks = Vec::new();
 
@@ -98,19 +102,19 @@ pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> 
             23 if !chunk.is_empty() => {
                 attributes.is_enabled = Some(chunk[0] != 0);
             }
+            26 if chunk.len() >= 4 => {
+                attributes.archetype_id = Some(u32::from_le_bytes(
+                    chunk[0..4].try_into().unwrap_or_default(),
+                ));
+            }
             28 if !chunk.is_empty() => {
                 state_and_rewards.stance_id = Some(chunk[0]);
             }
-            29 => {
+            29 | 63 => {
                 if is_breakable {
                     brk_can_be_carried = chunk.len() >= 4 && chunk[0] != 0;
                 } else if equipment.is_none() {
-                    equipment = parse_equipment_definition(&elements);
-                }
-            }
-            63 => {
-                if !is_breakable && equipment.is_none() {
-                    equipment = parse_equipment_definition(&elements);
+                    equipment = parse_equipment_definition(&elements, &character_name);
                 }
             }
             31 | 37 | 67 => {
@@ -125,6 +129,86 @@ pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> 
             }
             70 if is_breakable && !chunk.is_empty() => {
                 brk_debris_count = chunk[0] as usize;
+            }
+            79 if chunk.len() >= 4 => {
+                if let Some(rad) = parse_f32_safe(chunk) {
+                    attributes.vision_cone_degrees = Some(rad.to_degrees());
+                }
+            }
+            84 if !chunk.is_empty() => {
+                attributes.max_attackers_count = Some(chunk[0] as u32);
+            }
+            85 if chunk.len() >= 4 => {
+                attributes.aggro_decay_rate = parse_f32_safe(chunk);
+            }
+            88 => {
+                ai_actions = parse_ai_actions(chunk);
+            }
+            89 if chunk.len() >= 4 => {
+                attributes.max_chase_distance = parse_f32_safe(chunk);
+            }
+            91 if chunk.len() >= 4 => {
+                attributes.jump_force = parse_f32_safe(chunk);
+            }
+            95 if !chunk.is_empty() => {
+                attributes.behavior_state_flags = Some(hex::encode_upper(chunk));
+            }
+            100 if chunk.len() >= 4 => {
+                attributes.threat_level = Some(u32::from_le_bytes(
+                    chunk[0..4].try_into().unwrap_or_default(),
+                ));
+            }
+            101 if !chunk.is_empty() => {
+                attributes.is_elite_or_boss = Some(chunk[0] != 0);
+            }
+            112 => {
+                ai_behaviors = parse_ai_behaviors(chunk);
+            }
+            114 => {
+                attributes.alert_distance = parse_alert_distance(chunk);
+            }
+            125 if chunk.len() >= 4 => {
+                attributes.melee_attack_range = parse_f32_safe(chunk);
+            }
+            126 if !chunk.is_empty() => {
+                attributes.can_swim = Some(chunk[0] != 0);
+            }
+            128 => {
+                socket_offsets = parse_actor_attachments(chunk);
+            }
+            129 => {
+                ragdoll_config = parse_ragdoll_config(chunk);
+            }
+            134 if !chunk.is_empty() => {
+                attributes.can_be_interrupted = Some(chunk[0] != 0);
+            }
+            135 if chunk.len() >= 4 => {
+                attributes.ranged_attack_range = parse_f32_safe(chunk);
+            }
+            136 if chunk.len() >= 4 => {
+                attributes.ranged_cooldown_sec = parse_f32_safe(chunk);
+            }
+            144 if chunk.len() >= 4 => {
+                timings.hit_recovery_cooldown_sec = parse_f32_safe(chunk);
+            }
+            154 if chunk.len() >= 12 => {
+                let mut cur = Cursor::new(chunk);
+                if let (Ok(x), Ok(y), Ok(z)) = (
+                    cur.read_f32::<LittleEndian>(),
+                    cur.read_f32::<LittleEndian>(),
+                    cur.read_f32::<LittleEndian>(),
+                ) && x.is_finite()
+                    && y.is_finite()
+                    && z.is_finite()
+                {
+                    attributes.forward_aim_vector = Some([x, y, z]);
+                }
+            }
+            159 => {
+                collision_filter = parse_collision_filter(chunk);
+            }
+            164 if !chunk.is_empty() => {
+                attributes.enable_foot_ik = Some(chunk[0] != 0);
             }
             201 if is_breakable && chunk.len() >= 10 => {
                 brk_sound_cue = chunk[6] as u32;
@@ -175,12 +259,6 @@ pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> 
             }
             83 if chunk.len() >= 4 => {
                 attributes.base_health = parse_f32_safe(chunk);
-            }
-            91 if chunk.len() >= 4 => {
-                attributes.jump_force = parse_f32_safe(chunk);
-            }
-            112 => {
-                ai_behaviors = parse_ai_behaviors(chunk);
             }
             115 | 200 => {
                 if let Some((lua_source, bytecode)) = extract_embedded_lua_and_bytecode(chunk) {
@@ -290,8 +368,10 @@ pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> 
                     embedded_facefx_bytes = Some(fxe_bytes);
                 }
             }
-            88 | 92 | 96 | 97 | 98 | 102 | 111 | 114 | 128 | 129 | 134 | 144 | 147 | 148 | 152
-            | 153 | 159 | 161 | 167 | 19 | 1 | 41 | 42 | 45 | 71 | 301 => {}
+            19 | 1 | 41 | 42 | 45 | 71 | 301 | 92 | 96 | 97 | 98 | 102 | 111 | 147 | 148 | 152
+            | 153 | 161 | 167 => {
+                // Engine internal control, framing, and automatic state blocks (rebuilt on import)
+            }
             _ => {
                 unmapped_raw_blocks.push(RawCharacterBlock {
                     id: *id,
@@ -303,6 +383,7 @@ pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> 
 
     let engine_class = match type_id {
         0x00463018 => "TREBreakable".to_string(),
+        0x0046305B => "TRECaptiveObject".to_string(),
         _ => "TREActorController".to_string(),
     };
 
@@ -350,6 +431,8 @@ pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> 
         knockback_parameters: knockback,
         state_and_rewards: Some(state_and_rewards),
         morph_parameters: Some(morph_params),
+        ragdoll_config,
+        collision_filter,
         equipment,
         facefx_actor,
         embedded_facefx_file: None,
@@ -358,6 +441,8 @@ pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> 
         embedded_lua_script,
         animation_states,
         ai_behaviors,
+        ai_actions,
+        socket_offsets,
         transformations,
         effect_receptors,
         minion_grapple_bones,
@@ -371,7 +456,6 @@ pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> 
     })
 }
 
-/// Pure in-memory export to formatted JSON string without writing companion files
 pub fn export_character_to_json(data: &[u8], stem: &str) -> Result<String> {
     let extracted = export_character(data, stem)?;
     serde_json::to_string_pretty(&extracted.character).map_err(|e| anyhow::anyhow!(e))
@@ -442,20 +526,15 @@ pub fn import_character_from_json_with_externals(
         .or_else(|| parsed.embedded_lua_script.clone());
 
     for block in &parsed._engine_metadata.unmapped_raw_blocks {
-        let mut chunk_bytes = hex::decode(&block.hex).with_context(|| {
-            format!(
-                "Invalid hex payload in block ID {}: '{}'",
-                block.id, block.hex
-            )
-        })?;
-
-        if block.id == 117
-            && let Some(ref color) = parsed.lifeforce_color
-        {
-            chunk_bytes = update_lifeforce_color(&chunk_bytes, color);
+        if let Ok(chunk_bytes) = hex::decode(&block.hex) {
+            let mut final_bytes = chunk_bytes;
+            if block.id == 117
+                && let Some(ref color) = parsed.lifeforce_color
+            {
+                final_bytes = update_lifeforce_color(&final_bytes, color);
+            }
+            elements.push((block.id, final_bytes));
         }
-
-        elements.push((block.id, chunk_bytes));
     }
 
     if let Some(ref tag) = parsed.resource_tag {
@@ -555,6 +634,9 @@ pub fn import_character_from_json_with_externals(
         }
 
         if let Some(ref attrs) = parsed.combat_attributes {
+            if let Some(arch) = attrs.archetype_id {
+                elements.push((26, endian.u32_to_bytes(arch).to_vec()));
+            }
             if let Some(v) = attrs.move_speed_scale {
                 elements.push((61, endian.f32_to_bytes(v).to_vec()));
             }
@@ -576,17 +658,58 @@ pub fn import_character_from_json_with_externals(
             if let Some(active) = attrs.is_active_on_spawn {
                 elements.push((77, vec![if active { 1 } else { 0 }]));
             }
+            if let Some(v) = attrs.vision_cone_degrees {
+                elements.push((79, endian.f32_to_bytes(v.to_radians()).to_vec()));
+            }
             if let Some(v) = attrs.mass {
                 elements.push((80, endian.f32_to_bytes(v).to_vec()));
             }
             if let Some(v) = attrs.base_health {
                 elements.push((83, endian.f32_to_bytes(v).to_vec()));
             }
+            if let Some(v) = attrs.max_attackers_count {
+                elements.push((84, vec![v as u8]));
+            }
+            if let Some(v) = attrs.aggro_decay_rate {
+                elements.push((85, endian.f32_to_bytes(v).to_vec()));
+            }
+            if let Some(v) = attrs.max_chase_distance {
+                elements.push((89, endian.f32_to_bytes(v).to_vec()));
+            }
             if let Some(v) = attrs.jump_force {
                 elements.push((91, endian.f32_to_bytes(v).to_vec()));
             }
+            if let Some(ref h) = attrs.behavior_state_flags
+                && let Ok(b) = hex::decode(h)
+            {
+                elements.push((95, b));
+            }
+            if let Some(tl) = attrs.threat_level {
+                elements.push((100, endian.u32_to_bytes(tl).to_vec()));
+            }
+            if let Some(elite) = attrs.is_elite_or_boss {
+                elements.push((101, endian.u32_to_bytes(if elite { 1 } else { 0 }).to_vec()));
+            }
+            if let Some(dist) = attrs.alert_distance {
+                elements.push((114, build_alert_distance(dist, endian)));
+            }
             if let Some(v) = attrs.hit_reaction_force {
                 elements.push((121, endian.f32_to_bytes(v).to_vec()));
+            }
+            if let Some(v) = attrs.melee_attack_range {
+                elements.push((125, endian.f32_to_bytes(v).to_vec()));
+            }
+            if let Some(swim) = attrs.can_swim {
+                elements.push((126, vec![if swim { 1 } else { 0 }]));
+            }
+            if let Some(interrupted) = attrs.can_be_interrupted {
+                elements.push((134, vec![if interrupted { 1 } else { 0 }]));
+            }
+            if let Some(v) = attrs.ranged_attack_range {
+                elements.push((135, endian.f32_to_bytes(v).to_vec()));
+            }
+            if let Some(v) = attrs.ranged_cooldown_sec {
+                elements.push((136, endian.f32_to_bytes(v).to_vec()));
             }
             if let Some(v) = attrs.explosion_damage {
                 elements.push((137, endian.f32_to_bytes(v).to_vec()));
@@ -594,8 +717,18 @@ pub fn import_character_from_json_with_externals(
             if let Some(v) = attrs.aggro_range {
                 elements.push((140, endian.f32_to_bytes(v).to_vec()));
             }
+            if let Some(aim) = attrs.forward_aim_vector {
+                let mut buf = Vec::with_capacity(12);
+                let _ = endian.write_f32(&mut buf, aim[0]);
+                let _ = endian.write_f32(&mut buf, aim[1]);
+                let _ = endian.write_f32(&mut buf, aim[2]);
+                elements.push((154, buf));
+            }
             if let Some(v) = attrs.damage_multiplier {
                 elements.push((155, endian.f32_to_bytes(v).to_vec()));
+            }
+            if let Some(ik) = attrs.enable_foot_ik {
+                elements.push((164, endian.u32_to_bytes(if ik { 1 } else { 0 }).to_vec()));
             }
         }
 
@@ -622,8 +755,22 @@ pub fn import_character_from_json_with_externals(
             if let Some(v) = timings.invulnerability_time_sec {
                 elements.push((133, endian.f32_to_bytes(v).to_vec()));
             }
+            if let Some(v) = timings.hit_recovery_cooldown_sec {
+                elements.push((144, endian.f32_to_bytes(v).to_vec()));
+            }
         }
 
+        if let Some(ref cfg) = parsed.ragdoll_config {
+            elements.push((129, build_ragdoll_config(cfg, endian)));
+        }
+
+        if let Some(ref f) = parsed.collision_filter {
+            elements.push((159, build_collision_filter(f, endian)));
+        }
+
+        if !parsed.socket_offsets.is_empty() {
+            elements.push((128, build_actor_attachments(&parsed.socket_offsets, endian)));
+        }
         elements.push((88, vec![1, 1, 0, 0]));
         elements.push((92, vec![0, 0, 0, 0]));
         elements.push((96, vec![0]));
@@ -631,9 +778,20 @@ pub fn import_character_from_json_with_externals(
         elements.push((98, vec![0]));
         elements.push((102, vec![0, 0, 0, 0]));
         elements.push((111, vec![0xFF, 0xFF, 0xFF, 0xFF]));
-        elements.push((114, vec![1, 0x22, 0, 0, 0, 0, 0x40]));
-        elements.push((134, vec![1]));
-        elements.push((144, vec![0, 0, 0x80, 0x3F]));
+        if !elements.iter().any(|(id, _)| *id == 114) {
+            elements.push((114, vec![1, 0x22, 0, 0, 0, 0, 0x40]));
+        }
+        if !elements.iter().any(|(id, _)| *id == 134) {
+            elements.push((134, vec![1]));
+        }
+        if !elements.iter().any(|(id, _)| *id == 144) {
+            elements.push((144, vec![0, 0, 0x80, 0x3F]));
+        }
+        elements.push((147, vec![1, 0x1F, 0, 2, 0x28, 0, 0x29, 1, 0, 1, 0x29, 0, 0]));
+        elements.push((148, vec![1, 0x16, 0, 0]));
+        elements.push((152, vec![0]));
+        elements.push((153, vec![1, 1, 0, 0]));
+        elements.push((161, vec![1, 1, 0, 0]));
         elements.push((167, vec![0]));
 
         if let Some(ref lua_code) = updated_lua
@@ -662,7 +820,7 @@ pub fn import_character_from_json_with_externals(
         elements.push((166, rebuild_embedded_facefx(&[], new_fxe, endian)));
     }
 
-    elements.sort_by_key(|(id, _)| *id);
+    elements.sort_by_key(|&(id, _)| id);
     Ok(build_typed_container_with_endian(
         type_id, &elements, endian,
     ))

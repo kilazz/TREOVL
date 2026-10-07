@@ -8,13 +8,23 @@ use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::engine::assets::codec::reencode_asset_to_chunk;
 use crate::engine::assets::sniffer::sniff_asset;
 use crate::engine::common::Endian;
 use processors::{RawProcessor, get_standard_processors};
 
+pub type ProgressCallback<'a> = &'a (dyn Fn(f32, &str) + Send + Sync);
+
 pub fn export_smart_assets(project_dir: &Path) -> Result<usize> {
+    export_smart_assets_with_progress(project_dir, None)
+}
+
+pub fn export_smart_assets_with_progress(
+    project_dir: &Path,
+    progress: Option<ProgressCallback>,
+) -> Result<usize> {
     let workspace = ProjectWorkspace::new(project_dir);
 
     let source_chunks_dir = if workspace.vanilla_chunks_dir.exists() {
@@ -40,6 +50,9 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize> {
         .filter(|p| p.is_file() && p.extension().is_some_and(|ext| ext == "bin"))
         .collect();
 
+    let total_entries = entries.len();
+    let processed_counter = AtomicUsize::new(0);
+
     let sync_records: Vec<(String, AssetSyncEntry)> = entries
         .par_iter()
         .filter_map(|chunk_path| {
@@ -47,21 +60,39 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize> {
             let stem = chunk_path.file_stem()?.to_string_lossy();
             let sniffed = sniff_asset(&data, &stem);
 
-            for processor in &processors {
-                match processor.process(&data, &stem, &sniffed, &workspace) {
-                    Ok(Some(entry)) => return Some(entry),
-                    Ok(None) => continue,
-                    Err(e) => {
-                        eprintln!("[!] Processor failed for {}: {}", stem, e);
-                        continue;
+            let res = (|| {
+                for processor in &processors {
+                    match processor.process(&data, &stem, &sniffed, &workspace) {
+                        Ok(Some(entry)) => return Some(entry),
+                        Ok(None) => continue,
+                        Err(e) => {
+                            eprintln!(
+                                "[!] Processor error on {} ({}): {:#}",
+                                stem, sniffed.kind_name, e
+                            );
+                            continue;
+                        }
                     }
                 }
+                match raw_processor.process(&data, &stem, &sniffed, &workspace) {
+                    Ok(Some(entry)) => Some(entry),
+                    _ => None,
+                }
+            })();
+
+            let current_count = processed_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            if let Some(cb) = progress
+                && total_entries > 0
+                && current_count.is_multiple_of(10)
+            {
+                let frac = 0.60 + 0.35 * (current_count as f32 / total_entries as f32);
+                cb(
+                    frac,
+                    &format!("Exporting asset {} of {}...", current_count, total_entries),
+                );
             }
 
-            match raw_processor.process(&data, &stem, &sniffed, &workspace) {
-                Ok(Some(entry)) => Some(entry),
-                _ => None,
-            }
+            res
         })
         .collect();
 
@@ -80,6 +111,13 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize> {
 }
 
 pub fn sync_assets_to_chunks(project_dir: &Path) -> Result<usize> {
+    sync_assets_to_chunks_with_progress(project_dir, None)
+}
+
+pub fn sync_assets_to_chunks_with_progress(
+    project_dir: &Path,
+    progress: Option<ProgressCallback>,
+) -> Result<usize> {
     let cache_file = project_dir.join(".asset_cache.json");
     if !cache_file.exists() {
         return Ok(0);
@@ -92,7 +130,6 @@ pub fn sync_assets_to_chunks(project_dir: &Path) -> Result<usize> {
     let vanilla_dir = project_dir.join("chunks_vanilla");
     let working_dir = project_dir.join("chunks");
 
-    // Read platform endianness from project manifest if available
     let manifest_endian = project_dir
         .join("project.json")
         .exists()
@@ -108,7 +145,22 @@ pub fn sync_assets_to_chunks(project_dir: &Path) -> Result<usize> {
         .flatten()
         .unwrap_or(Endian::Little);
 
+    let total = cache.entries.len();
+    let mut current: usize = 0;
+
     for (rel_asset_path, entry) in cache.entries.iter_mut() {
+        current += 1;
+        if let Some(cb) = progress
+            && total > 0
+            && current.is_multiple_of(15)
+        {
+            let frac = 0.10 + 0.35 * (current as f32 / total as f32);
+            cb(
+                frac,
+                &format!("Checking modifications {}/{}...", current, total),
+            );
+        }
+
         let chunk_file_name = Path::new(&entry.chunk_rel_path)
             .file_name()
             .context("Invalid chunk relative path")?;
@@ -144,7 +196,6 @@ pub fn sync_assets_to_chunks(project_dir: &Path) -> Result<usize> {
                 fs::read(&working_chunk_path)?
             };
 
-            // DRY: Dispatch to unified codec with target platform endianness
             let updated_chunk = reencode_asset_to_chunk(
                 entry.asset_kind,
                 &baseline_chunk,
@@ -195,19 +246,27 @@ pub fn revert_single_asset(project_dir: &Path, chunk_path_str: &str) -> Result<(
     processors.push(Box::new(RawProcessor));
 
     for processor in &processors {
-        if let Ok(Some((rel_path, mut sync_entry))) =
-            processor.process(&data, &stem, &sniffed, &workspace)
-        {
-            sync_entry.is_modified = false;
-            let cache_file = project_dir.join(".asset_cache.json");
-            if cache_file.exists()
-                && let Ok(content) = fs::read_to_string(&cache_file)
-                && let Ok(mut cache) = serde_json::from_str::<AssetSyncCache>(&content)
-            {
-                cache.entries.insert(rel_path, sync_entry);
-                let _ = fs::write(cache_file, serde_json::to_string_pretty(&cache)?);
+        match processor.process(&data, &stem, &sniffed, &workspace) {
+            Ok(Some((rel_path, mut sync_entry))) => {
+                sync_entry.is_modified = false;
+                let cache_file = project_dir.join(".asset_cache.json");
+                if cache_file.exists()
+                    && let Ok(content) = fs::read_to_string(&cache_file)
+                    && let Ok(mut cache) = serde_json::from_str::<AssetSyncCache>(&content)
+                {
+                    cache.entries.insert(rel_path, sync_entry);
+                    let _ = fs::write(cache_file, serde_json::to_string_pretty(&cache)?);
+                }
+                break;
             }
-            break;
+            Ok(None) => continue,
+            Err(e) => {
+                eprintln!(
+                    "[!] Revert processor error on {} ({}): {:#}",
+                    stem, sniffed.kind_name, e
+                );
+                continue;
+            }
         }
     }
 
@@ -215,6 +274,13 @@ pub fn revert_single_asset(project_dir: &Path, chunk_path_str: &str) -> Result<(
 }
 
 pub fn clean_rebuild_project(project_dir: &Path) -> Result<usize> {
+    clean_rebuild_project_with_progress(project_dir, None)
+}
+
+pub fn clean_rebuild_project_with_progress(
+    project_dir: &Path,
+    progress: Option<ProgressCallback>,
+) -> Result<usize> {
     let vanilla_dir = project_dir.join("chunks_vanilla");
     let working_dir = project_dir.join("chunks");
 
@@ -222,10 +288,14 @@ pub fn clean_rebuild_project(project_dir: &Path) -> Result<usize> {
         bail!("No chunks_vanilla/ baseline folder found in project!");
     }
 
+    if let Some(cb) = progress {
+        cb(0.1, "Restoring chunks from vanilla baseline...");
+    }
+
     for entry in fs::read_dir(&vanilla_dir)?.flatten() {
         let dest = working_dir.join(entry.file_name());
         fs::copy(entry.path(), dest)?;
     }
 
-    sync_assets_to_chunks(project_dir)
+    sync_assets_to_chunks_with_progress(project_dir, progress)
 }

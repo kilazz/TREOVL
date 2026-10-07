@@ -16,6 +16,7 @@ pub struct ResolvedTexture {
     pub rgba: Vec<u8>,
 }
 
+#[inline]
 pub fn s_normalize(s: &str) -> String {
     s.to_lowercase()
         .chars()
@@ -29,7 +30,7 @@ pub fn load_mesh_with_smart_texture(
     project_dir: Option<&Path>,
 ) -> Option<RenderSubmesh> {
     let parsed = crate::engine::assets::mesh::extract_mesh_geometry(bytes).ok()?;
-    let resolved_tex = resolve_smart_texture_for_mesh(project_dir, mesh_stem);
+    let resolved_tex = resolve_smart_texture_for_mesh(project_dir, mesh_stem, Some(bytes));
     let tex_arc = resolved_tex.map(|t| Arc::new((t.width, t.height, t.rgba)));
 
     Some(RenderSubmesh {
@@ -101,7 +102,7 @@ pub fn find_master_skeleton_for_mesh(
         }
     }
 
-    // 2. Prioritize candidate chunks with full adult skeletons (e.g., chunk_0071)
+    // 2. Prioritize candidate chunks with full adult skeletons (e.g. chunk_0071)
     let candidates = [
         "chunk_0071_id0x2F.bin",
         "chunk_0072_id0x30.bin",
@@ -192,7 +193,9 @@ pub fn discover_companion_animations(
                     || norm_disp.contains("beetle")
                         && (norm_rig.contains("beetle") || norm_clip.contains("beetle"))
                     || norm_disp.contains("minion")
-                        && (norm_rig.contains("minion") || norm_clip.contains("minion"));
+                        && (norm_rig.contains("minion") || norm_clip.contains("minion"))
+                    || norm_disp.contains("scarecrow")
+                        && (norm_rig.contains("scarecrow") || norm_clip.contains("scarecrow"));
 
                 if is_match {
                     clips.push(clip);
@@ -224,9 +227,12 @@ pub fn discover_companion_animations(
     clips
 }
 
+/// Resolves the diffuse texture for a given mesh by querying `.asset_cache.json`,
+/// embedded tags, model bindings in `objects/`, and material descriptors in `materials/`.
 pub fn resolve_smart_texture_for_mesh(
     project_dir: Option<&Path>,
     mesh_stem: &str,
+    mesh_bytes: Option<&[u8]>,
 ) -> Option<ResolvedTexture> {
     let base_dir = project_dir?;
     let assets_dir = base_dir.join("assets");
@@ -234,8 +240,30 @@ pub fn resolve_smart_texture_for_mesh(
     let objects_dir = assets_dir.join("objects");
     let materials_dir = assets_dir.join("materials");
 
-    let norm_mesh = s_normalize(mesh_stem);
+    // 1. Gather all potential identifiers for this mesh
+    let mut candidate_tags: Vec<String> = Vec::new();
+    candidate_tags.push(s_normalize(mesh_stem));
 
+    // Extract embedded internal resource string (e.g. "[SCARECROW]MESH\19")
+    if let Some(bytes) = mesh_bytes {
+        let sniffed = crate::engine::assets::sniffer::sniff_asset(bytes, mesh_stem);
+        candidate_tags.push(s_normalize(&sniffed.display_name));
+    }
+
+    // Look up .asset_cache.json to map chunk_rel_path back to the exported resource name
+    if let Ok(cache_content) = fs::read_to_string(base_dir.join(".asset_cache.json"))
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&cache_content)
+        && let Some(entries) = v["entries"].as_object()
+    {
+        for (glb_path, entry_val) in entries {
+            let rel = entry_val["chunk_rel_path"].as_str().unwrap_or_default();
+            if rel.contains(mesh_stem) || mesh_stem.contains(rel) {
+                candidate_tags.push(s_normalize(glb_path));
+            }
+        }
+    }
+
+    // 2. Locate model binding in objects/ (TREModelResource / mesh_bindings)
     let mut bound_material_name: Option<String> = None;
     if objects_dir.exists()
         && let Ok(entries) = fs::read_dir(&objects_dir)
@@ -252,24 +280,33 @@ pub fn resolve_smart_texture_for_mesh(
                     let norm_path = s_normalize(m_path);
                     let norm_name = s_normalize(m_name);
 
-                    if (norm_mesh.contains(&norm_path)
-                        || norm_mesh.contains(&norm_name)
-                        || norm_path.contains(&norm_mesh))
-                        && let Some(mat_path) = b["material_path"].as_str()
-                    {
+                    let is_match = candidate_tags.iter().any(|tag| {
+                        tag.contains(&norm_path)
+                            || norm_path.contains(tag)
+                            || (!norm_name.is_empty()
+                                && (tag.contains(&norm_name) || norm_name.contains(tag)))
+                    });
+
+                    if is_match && let Some(mat_path) = b["material_path"].as_str() {
                         bound_material_name = Some(mat_path.to_string());
                         break;
                     }
                 }
             }
+            if bound_material_name.is_some() {
+                break;
+            }
         }
     }
 
+    // 3. Resolve material (e.g. "[SCARECROW]MAT\1") to texture file name ("hat.dds", etc.)
     let mut matched_texture_filename: Option<String> = None;
     if let Some(ref mat_target) = bound_material_name
         && materials_dir.exists()
         && let Ok(entries) = fs::read_dir(&materials_dir)
     {
+        let target_norm = s_normalize(mat_target);
+
         for e in entries.flatten() {
             if e.path().extension().is_some_and(|ext| ext == "json")
                 && let Ok(content) = fs::read_to_string(e.path())
@@ -285,7 +322,7 @@ pub fn resolve_smart_texture_for_mesh(
                     })
                     .unwrap_or_default();
 
-                if s_normalize(mat_val) == s_normalize(mat_target)
+                if s_normalize(mat_val) == target_norm
                     && let Some(blocks) = v["blocks"].as_array()
                 {
                     for b in blocks {
@@ -299,42 +336,53 @@ pub fn resolve_smart_texture_for_mesh(
                             break;
                         }
                     }
+
+                    // Fallback to texture name embedded in material file stem
+                    if matched_texture_filename.is_none() {
+                        let stem = e
+                            .path()
+                            .file_stem()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string();
+                        if let Some(pos) = stem.find(".dds") {
+                            matched_texture_filename = Some(stem[..pos + 4].to_string());
+                        }
+                    }
                 }
+            }
+            if matched_texture_filename.is_some() {
+                break;
             }
         }
     }
 
+    // 4. Match texture file name to concrete .dds file in assets/textures/
     if textures_dir.exists()
         && let Ok(entries) = fs::read_dir(&textures_dir)
     {
-        let mut fallback_dds: Option<PathBuf> = None;
-        let mut diff_dds: Option<PathBuf> = None;
         let clean_target = matched_texture_filename.as_deref().map(s_normalize);
+        let mut chosen_texture: Option<PathBuf> = None;
 
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.is_file() && p.extension().is_some_and(|ext| ext == "dds") {
-                let fname = p.file_name().unwrap_or_default().to_string_lossy();
-                let norm_fname = s_normalize(&fname);
+        if let Some(ref target) = clean_target {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_file() && p.extension().is_some_and(|ext| ext == "dds") {
+                    let fname = p.file_name().unwrap_or_default().to_string_lossy();
+                    let norm_fname = s_normalize(&fname);
 
-                if fallback_dds.is_none() {
-                    fallback_dds = Some(p.clone());
-                }
-                if norm_fname.contains("diff") || norm_fname.contains("base") {
-                    diff_dds = Some(p.clone());
-                }
-
-                if let Some(ref target) = clean_target
-                    && (norm_fname.contains(target) || target.contains(&norm_fname))
-                {
-                    diff_dds = Some(p);
-                    break;
+                    if norm_fname.contains(target) || target.contains(&norm_fname) {
+                        chosen_texture = Some(p);
+                        break;
+                    }
                 }
             }
         }
 
-        let chosen_texture = diff_dds.or(fallback_dds)?;
-        if let Ok(dds_bytes) = fs::read(&chosen_texture)
+        // Only return when an authentic material-bound match is found;
+        // do not fall back to an arbitrary first texture in the directory.
+        if let Some(tex_path) = chosen_texture
+            && let Ok(dds_bytes) = fs::read(&tex_path)
             && let Ok(parsed_tex) = crate::engine::assets::texture::parse_texture_chunk(&dds_bytes)
         {
             let rgba = dds_decoder::decode_to_rgba(
@@ -344,7 +392,7 @@ pub fn resolve_smart_texture_for_mesh(
                 &parsed_tex.pixel_data,
             );
             return Some(ResolvedTexture {
-                filename: chosen_texture
+                filename: tex_path
                     .file_name()
                     .unwrap_or_default()
                     .to_string_lossy()

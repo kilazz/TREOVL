@@ -106,6 +106,11 @@ pub fn register(
         let _ = tx_s_vis.send(WorkerCommand::ToggleSkeletonVis);
     });
 
+    let tx_xray = tx.clone();
+    ui.on_toggle_xray(move || {
+        let _ = tx_xray.send(WorkerCommand::ToggleXRay);
+    });
+
     let tx_b_names = tx.clone();
     ui.on_toggle_bone_names(move || {
         let _ = tx_b_names.send(WorkerCommand::ToggleBoneNames);

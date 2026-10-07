@@ -304,21 +304,13 @@ fn parse_translation_blob(
         return;
     }
 
-    if chunk_len >= 16 && chunk_len.is_multiple_of(16) {
-        let count = chunk_len / 16;
-        for i in 0..count {
-            let chunk = &data[i * 16..(i + 1) * 16];
-            let raw: RawTranslationKey = bytemuck::pod_read_unaligned(chunk);
-            let time_seconds = (raw.micros as f32 / 1_000_000.0).min(total_duration);
-            translations.push(KeyframeTranslation {
-                time_seconds,
-                position: Vector3 {
-                    x: sanitize_f32(raw.px, 0.0),
-                    y: sanitize_f32(raw.py, 0.0),
-                    z: sanitize_f32(raw.pz, 0.0),
-                },
-            });
-        }
+    // Support blocks with a 4-byte keyframe count prefix before the 16-byte key records
+    let (slice, count) = if chunk_len >= 20 && (chunk_len - 4).is_multiple_of(16) {
+        let declared_count = u32::from_le_bytes(data[0..4].try_into().unwrap_or_default()) as usize;
+        let actual_count = (chunk_len - 4) / 16;
+        (&data[4..], declared_count.min(actual_count))
+    } else if chunk_len >= 16 && chunk_len.is_multiple_of(16) {
+        (data, chunk_len / 16)
     } else if chunk_len >= 12 {
         let raw: [f32; 3] = bytemuck::pod_read_unaligned(&data[0..12]);
         translations.push(KeyframeTranslation {
@@ -327,6 +319,23 @@ fn parse_translation_blob(
                 x: sanitize_f32(raw[0], 0.0),
                 y: sanitize_f32(raw[1], 0.0),
                 z: sanitize_f32(raw[2], 0.0),
+            },
+        });
+        return;
+    } else {
+        return;
+    };
+
+    for i in 0..count {
+        let chunk = &slice[i * 16..(i + 1) * 16];
+        let raw: RawTranslationKey = bytemuck::pod_read_unaligned(chunk);
+        let time_seconds = (raw.micros as f32 / 1_000_000.0).min(total_duration);
+        translations.push(KeyframeTranslation {
+            time_seconds,
+            position: Vector3 {
+                x: sanitize_f32(raw.px, 0.0),
+                y: sanitize_f32(raw.py, 0.0),
+                z: sanitize_f32(raw.pz, 0.0),
             },
         });
     }

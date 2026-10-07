@@ -19,7 +19,8 @@ pub fn generate_dds_header(
         flags |= 0x20000;
     }
 
-    let is_compressed = format != TextureFormat::UncompressedRGBA;
+    let is_compressed =
+        format != TextureFormat::UncompressedRGBA && format != TextureFormat::UncompressedRGB;
     if is_compressed {
         flags |= 0x80000;
     } else {
@@ -29,11 +30,17 @@ pub fn generate_dds_header(
     header[12..16].copy_from_slice(&height.to_le_bytes());
     header[16..20].copy_from_slice(&width.to_le_bytes());
 
+    let bpp = match format {
+        TextureFormat::UncompressedRGB => 3u32,
+        TextureFormat::UncompressedRGBA => 4u32,
+        _ => 4u32,
+    };
+
     let block_size: u32 = if format == TextureFormat::DXT1 { 8 } else { 16 };
     let pitch_or_linear = if is_compressed {
         std::cmp::max(1, width.div_ceil(4)) * std::cmp::max(1, height.div_ceil(4)) * block_size
     } else {
-        width * 4
+        width * bpp
     };
     header[20..24].copy_from_slice(&pitch_or_linear.to_le_bytes());
     header[28..32].copy_from_slice(&mipmap_count.to_le_bytes());
@@ -49,8 +56,15 @@ pub fn generate_dds_header(
             _ => b"DXT5",
         };
         header[84..88].copy_from_slice(fourcc);
+    } else if format == TextureFormat::UncompressedRGB {
+        header[80..84].copy_from_slice(&0x40u32.to_le_bytes()); // DDPF_RGB (no alpha)
+        header[88..92].copy_from_slice(&24u32.to_le_bytes()); // 24 bits per pixel
+        header[92..96].copy_from_slice(&0x00FF0000u32.to_le_bytes()); // R mask
+        header[96..100].copy_from_slice(&0x0000FF00u32.to_le_bytes()); // G mask
+        header[100..104].copy_from_slice(&0x000000FFu32.to_le_bytes()); // B mask
+        header[104..108].copy_from_slice(&0x00000000u32.to_le_bytes()); // No alpha mask
     } else {
-        header[80..84].copy_from_slice(&0x41u32.to_le_bytes());
+        header[80..84].copy_from_slice(&0x41u32.to_le_bytes()); // DDPF_RGBA
         header[88..92].copy_from_slice(&32u32.to_le_bytes());
         header[92..96].copy_from_slice(&0x00FF0000u32.to_le_bytes());
         header[96..100].copy_from_slice(&0x0000FF00u32.to_le_bytes());

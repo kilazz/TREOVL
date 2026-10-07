@@ -14,7 +14,7 @@ var<uniform> scene: SceneUniform;
 var<uniform> bones: BonesUniform;
 
 // =========================================================================
-// 1. 3D MESH SHADER PIPELINE (WITH GPU SKELETAL SKINNING)
+// 1. 3D MESH SHADER PIPELINE (WITH GPU SKELETAL SKINNING & BOUNDS CHECKING)
 // =========================================================================
 
 struct VertexInput {
@@ -40,18 +40,25 @@ fn vs_main(model: VertexInput) -> VertexOutput {
 
     // 1. Apply vertex skinning in pure native model coordinates (Triumph engine space)
     let is_skinned = scene.params.y > 0.5;
-    if (is_skinned && (model.weights.x + model.weights.y + model.weights.z + model.weights.w) > 0.001) {
-        let bone_m = model.weights.x * bones.matrices[model.joints.x]
-                   + model.weights.y * bones.matrices[model.joints.y]
-                   + model.weights.z * bones.matrices[model.joints.z]
-                   + model.weights.w * bones.matrices[model.joints.w];
+    let weight_sum = model.weights.x + model.weights.y + model.weights.z + model.weights.w;
+
+    if (is_skinned && weight_sum > 0.001) {
+        // App-level GPU hardware bounds clamping against 128-bone uniform palette limit
+        let j_x = min(model.joints.x, 127u);
+        let j_y = min(model.joints.y, 127u);
+        let j_z = min(model.joints.z, 127u);
+        let j_w = min(model.joints.w, 127u);
+
+        let bone_m = model.weights.x * bones.matrices[j_x]
+                   + model.weights.y * bones.matrices[j_y]
+                   + model.weights.z * bones.matrices[j_z]
+                   + model.weights.w * bones.matrices[j_w];
 
         local_pos = bone_m * local_pos;
         local_norm = (bone_m * vec4<f32>(local_norm, 0.0)).xyz;
     }
 
     // 2. Map coordinates to WGPU Viewport: 180° flipped base (X, -Z, Y)
-    // Synchronized with viewport.rs map_mesh_coords
     let base_world_pos = vec3<f32>(local_pos.x, -local_pos.z, local_pos.y);
     let base_world_norm = vec3<f32>(local_norm.x, -local_norm.z, local_norm.y);
 

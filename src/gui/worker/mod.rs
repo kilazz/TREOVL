@@ -494,6 +494,30 @@ impl BackgroundWorker {
                 }
             }
 
+            WorkerCommand::ToggleXRay => {
+                let (preview_opt, val) = {
+                    let mut st = self.state.lock();
+                    st.show_xray = !st.show_xray;
+                    (st.active_mesh.clone(), st.show_xray)
+                };
+                let ui_h = self.ui_handle.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_h.upgrade() {
+                        ui.set_show_xray(val);
+                    }
+                });
+                if let Some(mut p) = preview_opt {
+                    let cam = self.state.lock().camera;
+                    viewport::evaluate_and_render_animated_frame(
+                        &self.ui_handle,
+                        &self.state,
+                        &mut self.gpu_renderer,
+                        &mut p,
+                        &cam,
+                    );
+                }
+            }
+
             WorkerCommand::ToggleBoneNames => {
                 let (preview_opt, val) = {
                     let mut st = self.state.lock();

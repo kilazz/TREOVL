@@ -24,6 +24,7 @@ pub mod material;
 pub mod mesh;
 pub mod object;
 pub mod parameter;
+pub mod projectile;
 pub mod shader;
 pub mod sniffer;
 pub mod terrain;

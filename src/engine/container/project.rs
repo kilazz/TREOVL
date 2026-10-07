@@ -9,8 +9,10 @@ use super::footer::{
 };
 use super::header::{HEADER_SIZE, PrpHeader};
 use super::node::{PrpNode, parse_node};
-use super::sync::{export_smart_assets, sync_assets_to_chunks};
+use super::sync::{export_smart_assets_with_progress, sync_assets_to_chunks_with_progress};
 use crate::engine::common::Endian;
+
+pub type ProgressCallback<'a> = &'a (dyn Fn(f32, &str) + Send + Sync);
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ProjectManifest {
@@ -23,9 +25,24 @@ pub struct ProjectManifest {
 }
 
 pub fn unpack_archive(archive_path: &Path, output_dir: &Path) -> Result<(usize, String)> {
-    // Standard I/O read: closes the file handle immediately, avoiding Windows ERROR_SHARING_VIOLATION
+    unpack_archive_with_progress(archive_path, output_dir, None)
+}
+
+pub fn unpack_archive_with_progress(
+    archive_path: &Path,
+    output_dir: &Path,
+    progress: Option<ProgressCallback>,
+) -> Result<(usize, String)> {
+    if let Some(cb) = progress {
+        cb(0.05, "Reading package into memory...");
+    }
+
     let data = fs::read(archive_path)
         .with_context(|| format!("Failed to read archive into memory: {:?}", archive_path))?;
+
+    if let Some(cb) = progress {
+        cb(0.15, "Parsing PRP/RPK headers and footers...");
+    }
 
     let header = PrpHeader::read(&data)?;
     let footer_opt = check_footer(&data);
@@ -60,6 +77,10 @@ pub fn unpack_archive(archive_path: &Path, output_dir: &Path) -> Result<(usize, 
     };
     let payload = &data[HEADER_SIZE..payload_end];
 
+    if let Some(cb) = progress {
+        cb(0.30, "Extracting binary chunks hierarchy...");
+    }
+
     let mut chunk_counter = 0;
     let root_node = parse_node(payload, 0, true, true, &mut chunk_counter, output_dir);
 
@@ -75,7 +96,14 @@ pub fn unpack_archive(archive_path: &Path, output_dir: &Path) -> Result<(usize, 
     let manifest_file = fs::File::create(&manifest_path)?;
     serde_json::to_writer_pretty(manifest_file, &manifest)?;
 
-    match export_smart_assets(output_dir) {
+    if let Some(cb) = progress {
+        cb(
+            0.60,
+            "Exporting smart editable assets (JSON/3D/Textures)...",
+        );
+    }
+
+    match export_smart_assets_with_progress(output_dir, progress) {
         Ok(count) => {
             log.push_str(&format!(
                 "[+] Smart workspace created: {} editable assets exported to 'assets/'.\n",
@@ -90,6 +118,10 @@ pub fn unpack_archive(archive_path: &Path, output_dir: &Path) -> Result<(usize, 
         }
     }
 
+    if let Some(cb) = progress {
+        cb(1.0, "Extraction complete!");
+    }
+
     Ok((chunk_counter as usize, log))
 }
 
@@ -97,6 +129,15 @@ pub fn pack_archive(
     project_dir: &Path,
     output_archive: &Path,
     compression_level: u32,
+) -> Result<usize> {
+    pack_archive_with_progress(project_dir, output_archive, compression_level, None)
+}
+
+pub fn pack_archive_with_progress(
+    project_dir: &Path,
+    output_archive: &Path,
+    compression_level: u32,
+    progress: Option<ProgressCallback>,
 ) -> Result<usize> {
     let manifest_path = project_dir.join("project.json");
     if !manifest_path.exists() {
@@ -106,13 +147,21 @@ pub fn pack_archive(
         );
     }
 
-    if let Ok(synced) = sync_assets_to_chunks(project_dir)
+    if let Some(cb) = progress {
+        cb(0.10, "Syncing modified assets into binary chunks...");
+    }
+
+    if let Ok(synced) = sync_assets_to_chunks_with_progress(project_dir, progress)
         && synced > 0
     {
         println!(
             "[*] Synced {} modified assets from 'assets/' into 'chunks/' using vanilla baseline.",
             synced
         );
+    }
+
+    if let Some(cb) = progress {
+        cb(0.50, "Serializing container node tree...");
     }
 
     let manifest_str = fs::read_to_string(&manifest_path)?;
@@ -124,6 +173,11 @@ pub fn pack_archive(
         compression_level,
         manifest.endian,
     )?;
+
+    if let Some(cb) = progress {
+        cb(0.85, "Writing archive headers and checksums...");
+    }
+
     let mut final_binary = manifest.header.write(payload.len() as u32)?;
     final_binary.extend(payload);
 
@@ -140,5 +194,10 @@ pub fn pack_archive(
     }
 
     fs::write(output_archive, &final_binary)?;
+
+    if let Some(cb) = progress {
+        cb(1.0, "Package successfully built!");
+    }
+
     Ok(final_binary.len())
 }

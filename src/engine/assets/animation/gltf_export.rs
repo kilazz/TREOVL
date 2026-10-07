@@ -14,6 +14,16 @@ pub fn gltf_basis_quat() -> Quat {
     Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)
 }
 
+#[inline]
+fn safe_normalize_quat(q: Quat) -> Quat {
+    let len_sq = q.length_squared();
+    if len_sq.is_finite() && len_sq > 1e-8 {
+        q.normalize()
+    } else {
+        Quat::IDENTITY
+    }
+}
+
 pub fn export_skeleton_to_glb(bones: &[ObjectBone], rig_name: &str) -> Result<Vec<u8>> {
     if bones.is_empty() {
         anyhow::bail!("No valid bones found to export skeleton");
@@ -64,16 +74,15 @@ pub fn export_skeleton_to_glb(bones: &[ObjectBone], rig_name: &str) -> Result<Ve
             )
         };
 
-        let raw_q = Quat::from_xyzw(
+        let raw_q = safe_normalize_quat(Quat::from_xyzw(
             sanitize_f32(bone.rotation.x, 0.0),
             sanitize_f32(bone.rotation.y, 0.0),
             sanitize_f32(bone.rotation.z, 0.0),
             sanitize_f32(bone.rotation.w, 1.0),
-        )
-        .normalize();
+        ));
 
         let conv_q = if is_root {
-            (q_basis * raw_q * q_basis_inv).normalize()
+            safe_normalize_quat(q_basis * raw_q * q_basis_inv)
         } else {
             raw_q
         };
@@ -134,9 +143,9 @@ pub fn export_animation_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>> {
         bone_indices.push(bone_node_id);
 
         let is_root = track.bone_name.eq_ignore_ascii_case("root")
-            || track.bone_name.eq_ignore_ascii_case("bip01")
-            || i == 0;
+            || track.bone_name.eq_ignore_ascii_case("bip01");
 
+        // 1. Translations channel
         if !track.translations.is_empty() {
             let mut time_bytes = Vec::with_capacity(track.translations.len() * 4);
             let mut min_time = f32::INFINITY;
@@ -148,14 +157,21 @@ pub fn export_animation_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>> {
                 min_time = min_time.min(ts);
                 max_time = max_time.max(ts);
             }
+
+            let (min_val, max_val) = if min_time.is_finite() && max_time.is_finite() {
+                (Some(vec![min_time]), Some(vec![max_time]))
+            } else {
+                (Some(vec![0.0]), Some(vec![0.0]))
+            };
+
             let time_view = builder.add_buffer_view(&time_bytes, None);
             let time_acc = builder.add_accessor(
                 time_view,
                 track.translations.len(),
                 5126,
                 "SCALAR",
-                Some(vec![min_time]),
-                Some(vec![max_time]),
+                min_val,
+                max_val,
             );
 
             let mut val_bytes = Vec::with_capacity(track.translations.len() * 12);
@@ -194,6 +210,7 @@ pub fn export_animation_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>> {
             }));
         }
 
+        // 2. Rotations channel
         if !track.rotations.is_empty() {
             let mut time_bytes = Vec::with_capacity(track.rotations.len() * 4);
             let mut min_time = f32::INFINITY;
@@ -205,19 +222,26 @@ pub fn export_animation_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>> {
                 min_time = min_time.min(ts);
                 max_time = max_time.max(ts);
             }
+
+            let (min_val, max_val) = if min_time.is_finite() && max_time.is_finite() {
+                (Some(vec![min_time]), Some(vec![max_time]))
+            } else {
+                (Some(vec![0.0]), Some(vec![0.0]))
+            };
+
             let time_view = builder.add_buffer_view(&time_bytes, None);
             let time_acc = builder.add_accessor(
                 time_view,
                 track.rotations.len(),
                 5126,
                 "SCALAR",
-                Some(vec![min_time]),
-                Some(vec![max_time]),
+                min_val,
+                max_val,
             );
 
             let mut val_bytes = Vec::with_capacity(track.rotations.len() * 16);
             for r in &track.rotations {
-                let raw_q = Quat::from_xyzw(
+                let raw_q = safe_normalize_quat(Quat::from_xyzw(
                     sanitize_f32(r.rotation_quat.x, 0.0),
                     sanitize_f32(r.rotation_quat.y, 0.0),
                     sanitize_f32(r.rotation_quat.z, 0.0),
@@ -226,11 +250,10 @@ pub fn export_animation_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>> {
                     } else {
                         1.0
                     },
-                )
-                .normalize();
+                ));
 
                 let conv_q = if is_root {
-                    (q_basis * raw_q * q_basis_inv).normalize()
+                    safe_normalize_quat(q_basis * raw_q * q_basis_inv)
                 } else {
                     raw_q
                 };
@@ -261,13 +284,22 @@ pub fn export_animation_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>> {
         }
     }
 
-    builder.add_node(json!({
-        "name": format!("{}_Armature", clip.name),
-        "children": bone_indices
-    }));
+    if bone_indices.is_empty() {
+        bone_indices.push(1);
+        builder.add_node(json!({
+            "name": format!("{}_Armature", clip.name),
+            "children": [1]
+        }));
+        builder.add_node(json!({ "name": "Root" }));
+    } else {
+        builder.add_node(json!({
+            "name": format!("{}_Armature", clip.name),
+            "children": bone_indices
+        }));
 
-    for track in &clip.bone_tracks {
-        builder.add_node(json!({ "name": track.bone_name }));
+        for track in &clip.bone_tracks {
+            builder.add_node(json!({ "name": track.bone_name }));
+        }
     }
 
     builder.add_skin(json!({
@@ -275,11 +307,13 @@ pub fn export_animation_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>> {
         "joints": bone_indices
     }));
 
-    builder.add_animation(json!({
-        "name": clip.name,
-        "channels": channels,
-        "samplers": samplers
-    }));
+    if !channels.is_empty() {
+        builder.add_animation(json!({
+            "name": clip.name,
+            "channels": channels,
+            "samplers": samplers
+        }));
+    }
 
     builder.add_scene(vec![0]);
     builder.build("Overlord Modding Studio Skeletal Animation Exporter")

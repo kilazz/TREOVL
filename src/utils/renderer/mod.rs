@@ -7,7 +7,7 @@ pub mod texture;
 
 pub use camera::{ViewportCamera, look_at_rh, perspective_rh_zo};
 pub use gizmo::build_gpu_gizmo_vertices;
-pub use grid::{GridVertex, build_gpu_grid_vertices};
+pub use grid::build_gpu_grid_vertices;
 pub use texture::TextureData;
 
 use anyhow::{Context, Result};
@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::iter;
 use std::time::{Duration, Instant};
 
-use crate::engine::math::{Vector2, Vector3, Vector4};
+use crate::engine::math::{GridVertex, Vector2, Vector3, Vector4};
 use pipelines::{BonesUniform, Pipelines, SceneUniform, Vertex, create_pipelines};
 use targets::{RenderTargetManager, STAGING_BUFFER_COUNT};
 
@@ -26,6 +26,7 @@ pub struct RenderOptions {
     pub is_skinning_enabled: bool,
     pub show_grid: bool,
     pub show_wire: bool,
+    pub show_xray: bool,
     pub size: (u32, u32),
     pub bounds_min: [f32; 3],
     pub bounds_max: [f32; 3],
@@ -69,6 +70,7 @@ struct RenderStateKey {
     up_axis: u32,
     show_grid: bool,
     show_wire: bool,
+    show_xray: bool,
     is_skinning_enabled: bool,
     debug_lines_len: usize,
     submesh_count: usize,
@@ -186,6 +188,7 @@ impl WgpuRenderer {
             up_axis: cam.up_axis,
             show_grid,
             show_wire,
+            show_xray: options.show_xray,
             is_skinning_enabled,
             debug_lines_len: debug_lines.len(),
             submesh_count: submeshes.len(),
@@ -278,20 +281,26 @@ impl WgpuRenderer {
             2.0
         };
 
-        let mut all_lines = Vec::new();
+        let mut grid_vertices = Vec::new();
         if show_grid {
-            all_lines = build_gpu_grid_vertices(center, floor_y, model_radius);
+            grid_vertices = build_gpu_grid_vertices(center, floor_y, model_radius);
         }
+
+        let grid_count = grid_vertices.len() as u32;
+        let skeleton_count = debug_lines.len() as u32;
+        let total_line_count = grid_count + skeleton_count;
+
+        let mut all_lines = Vec::with_capacity(total_line_count as usize);
+        all_lines.extend_from_slice(&grid_vertices);
         all_lines.extend_from_slice(debug_lines);
 
-        let line_count = all_lines.len();
-        if line_count > 0 {
+        if total_line_count > 0 {
             let need_new = match &self.grid_buffer {
-                Some((_, cap)) => *cap < line_count,
+                Some((_, cap)) => *cap < all_lines.len(),
                 None => true,
             };
             if need_new {
-                let new_cap = line_count.next_power_of_two().max(512);
+                let new_cap = all_lines.len().next_power_of_two().max(512);
                 let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("Persistent Grid & Lines Buffer"),
                     size: (new_cap * std::mem::size_of::<GridVertex>()) as u64,
@@ -640,15 +649,7 @@ impl WgpuRenderer {
                 multiview_mask: None,
             });
 
-            if line_count > 0
-                && let Some((ref g_buf, _)) = self.grid_buffer
-            {
-                render_pass.set_pipeline(&self.pipelines.grid_pipeline);
-                render_pass.set_bind_group(0, &self.pipelines.scene_bind_group, &[]);
-                render_pass.set_vertex_buffer(0, g_buf.slice(..));
-                render_pass.draw(0..line_count as u32, 0..1);
-            }
-
+            // 1. Draw Mesh (if visible)
             if !show_wire {
                 render_pass.set_pipeline(&self.pipelines.mesh_pipeline);
                 render_pass.set_bind_group(0, &self.pipelines.scene_bind_group, &[]);
@@ -662,6 +663,7 @@ impl WgpuRenderer {
                     render_pass.draw_indexed(0..dc.index_count, 0, 0..1);
                 }
             } else {
+                // If showing wireframe, render the mesh wireframe using grid pipeline
                 render_pass.set_pipeline(&self.pipelines.grid_pipeline);
                 render_pass.set_bind_group(0, &self.pipelines.scene_bind_group, &[]);
 
@@ -674,6 +676,31 @@ impl WgpuRenderer {
                 }
             }
 
+            // 2. Draw Floor Grid & Skeleton Lines
+            if total_line_count > 0
+                && let Some((ref g_buf, _)) = self.grid_buffer
+            {
+                render_pass.set_bind_group(0, &self.pipelines.scene_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, g_buf.slice(..));
+
+                // Draw Grid (Depth Tested)
+                if grid_count > 0 {
+                    render_pass.set_pipeline(&self.pipelines.grid_pipeline);
+                    render_pass.draw(0..grid_count, 0..1);
+                }
+
+                // Draw Skeleton
+                if skeleton_count > 0 {
+                    if options.show_xray {
+                        render_pass.set_pipeline(&self.pipelines.skeleton_xray_pipeline);
+                    } else {
+                        render_pass.set_pipeline(&self.pipelines.skeleton_depth_pipeline);
+                    }
+                    render_pass.draw(grid_count..(grid_count + skeleton_count), 0..1);
+                }
+            }
+
+            // 3. Draw UI Axis Gizmo on top
             if !gizmo_vertices.is_empty()
                 && let Some((ref gz_buf, _)) = self.gizmo_buffer
             {

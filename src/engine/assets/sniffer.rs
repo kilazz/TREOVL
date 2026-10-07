@@ -62,6 +62,33 @@ pub struct SniffedAsset {
     pub display_name: String,
 }
 
+fn is_string_list_data(data: &[u8]) -> bool {
+    if data.len() < 8 {
+        return false;
+    }
+    let count = u32::from_le_bytes(data[0..4].try_into().unwrap_or_default()) as usize;
+    if count == 0 || count > 100 {
+        return false;
+    }
+    let mut pos = 4;
+    for _ in 0..count {
+        if pos + 4 > data.len() {
+            return false;
+        }
+        let len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap_or_default()) as usize;
+        pos += 4;
+        if len == 0 || pos + len > data.len() {
+            return false;
+        }
+        let slice = &data[pos..pos + len];
+        if !slice.iter().all(|&b| (0x20..=0x7E).contains(&b)) {
+            return false;
+        }
+        pos += len;
+    }
+    pos == data.len()
+}
+
 pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
     if data.len() < 4 {
         return SniffedAsset {
@@ -81,42 +108,44 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
     {
         (AssetKind::Object, "TREModelResource (Entity/Prop)", "🧊")
 
-    // Priority 2: Character / Actor / Breakable Controllers (0x00464003 & 0x00463018)
+    // Priority 2: Character / Actor / Breakable / Captive Controllers (0x00464003, 0x00463018, 0x0046305B)
     } else if data.len() >= 4
         && ((data[0] == 0x03 && data[1] == 0x40 && data[2] == 0x46)
-            || (data[0] == 0x18 && data[1] == 0x30 && data[2] == 0x46))
+            || (data[0] == 0x18 && data[1] == 0x30 && data[2] == 0x46)
+            || (data[0] == 0x5B && data[1] == 0x30 && data[2] == 0x46))
     {
         let mut is_valid = false;
         if let Ok((_, elements)) = parse_typed_container(data) {
-            is_valid = elements
-                .iter()
-                .any(|(id, _)| *id == 115 || *id == 112 || *id == 50 || *id == 37 || *id == 33);
+            is_valid = elements.iter().any(|(id, _)| {
+                *id == 115
+                    || *id == 112
+                    || *id == 50
+                    || *id == 37
+                    || *id == 31
+                    || *id == 33
+                    || *id == 29
+            });
         }
         if is_valid {
-            let (label, icon) = if data[0] == 0x18 {
-                ("Breakable Prop / Destructible Object", "💥")
-            } else {
-                ("Character / NPC Controller (TREActor)", "🧙‍♂️")
+            let (label, icon) = match data[0] {
+                0x18 => ("Breakable Prop / Destructible Object", "💥"),
+                0x5B => ("Tower Captive / Interactive Maiden", "👸"),
+                _ => ("Character / NPC Controller (TREActor)", "🧙‍♂️"),
             };
             (AssetKind::Character, label, icon)
         } else {
             (AssetKind::Generic, "Triumph Binary Container", "📦")
         }
 
-    // Priority 3: Weapons, Items, Attachments (0x0046200D & 0x00462015)
-    } else if data
-        .windows(4)
-        .any(|w| w == b"\x0D\x20\x46\x00" || w == b"\x15\x20\x46\x00")
-        || (data.len() >= 4
-            && (u32::from_le_bytes(data[0..4].try_into().unwrap_or_default()) == 0x0046200D
-                || u32::from_le_bytes(data[0..4].try_into().unwrap_or_default()) == 0x00462015))
-    {
-        let is_weapon = data.starts_with(b"\x15\x20\x46\x00")
-            || data.windows(4).any(|w| w == b"\x15\x20\x46\x00");
-        let (label, icon) = if is_weapon {
-            ("Weapon Resource (TREWeaponResource)", "🗡️")
-        } else {
-            ("Attached Item / Prop (TREItemResource)", "🍽️")
+    // Priority 3: All Weapons, Items, Attachments, Armor & Pickups (Family 0x004620xx)
+    } else if data.len() >= 4 && data[2] == 0x46 && data[1] == 0x20 {
+        let t_id = data[0];
+        let (label, icon) = match t_id {
+            0x11 | 0x15 | 0x17 | 0x21 => ("Weapon Resource (TREWeaponResource)", "🗡️"),
+            0x0B => ("Armor / Equipment (TREEquipmentResource)", "🛡️"),
+            0x1B => ("Consumable / Held Prop (TREConsumableResource)", "🍺"),
+            0x3F => ("Breakable Pickup / Carryable Item (TREBreakableItem)", "🥚"),
+            _ => ("Attached Item / Prop (TREItemResource)", "🍽️"),
         };
         (AssetKind::Attachment, label, icon)
 
@@ -139,7 +168,17 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
     } else if magic_bytes == magic::TEX_INTERFACE {
         (AssetKind::Texture, "TREInterfaceImage (TGA)", "🖼️")
 
-    // Priority 6: Audio Containers
+    // Priority 6: 3D Meshes & Geometry
+    } else if magic_bytes == magic::MESH {
+        (AssetKind::Mesh, "TREMeshResource", "🗿")
+    } else if magic_bytes == b"\x41\x00\x41\x00" {
+        (AssetKind::Mesh, "TREMeshGeometry", "📐")
+
+    // Priority 7: Skeletal Animation Clips
+    } else if magic_bytes == magic::ANIM_CLIP {
+        (AssetKind::Animation, "Skeletal Animation Clip", "🎬")
+
+    // Priority 8: Audio Containers
     } else if magic_bytes == magic::AUDIO_WAV
         || magic_bytes == b"\x00\x00\xA1\x00"
         || data[..data.len().min(512)]
@@ -147,16 +186,6 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
             .any(|w| w == magic::AUDIO_WAV || w == b"RIFF")
     {
         (AssetKind::Audio, "Sound / Voice (WAV)", "🎵")
-
-    // Priority 7: 3D Meshes & Geometry
-    } else if magic_bytes == magic::MESH {
-        (AssetKind::Mesh, "TREMeshResource", "🗿")
-    } else if magic_bytes == b"\x41\x00\x41\x00" {
-        (AssetKind::Mesh, "TREMeshGeometry", "📐")
-
-    // Priority 8: Skeletal Animation Clips
-    } else if magic_bytes == magic::ANIM_CLIP {
-        (AssetKind::Animation, "Skeletal Animation Clip", "🎬")
 
     // Priority 9: FaceFX Facial Animation Actors
     } else if magic_bytes == b"FACE"
@@ -296,7 +325,7 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
         .any(|w| w == b"<?xml")
     {
         (AssetKind::Xml, "XML Document", "📋")
-    } else if data.len() <= 64 {
+    } else if is_string_list_data(data) || data.len() <= 128 {
         (AssetKind::Parameter, "Engine Parameter", "⚙️")
     } else {
         (AssetKind::Generic, "Triumph Binary Container", "📦")

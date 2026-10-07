@@ -71,6 +71,7 @@ pub struct AppState {
     pub is_root_motion_enabled: bool,
     pub show_mesh: bool,
     pub show_skeleton: bool,
+    pub show_xray: bool,
     pub show_bone_names: bool,
     pub show_wireframe: bool,
     pub show_grid: bool,
@@ -83,6 +84,7 @@ impl AppState {
             is_root_motion_enabled: false,
             show_mesh: true,
             show_skeleton: true,
+            show_xray: true,
             show_bone_names: false,
             show_wireframe: false,
             show_grid: true,
@@ -92,7 +94,6 @@ impl AppState {
     }
 }
 
-/// Resolves a directory path whether a directory or an individual file was passed.
 pub fn resolve_project_dir(path: &Path) -> PathBuf {
     if path.is_file() {
         path.parent()

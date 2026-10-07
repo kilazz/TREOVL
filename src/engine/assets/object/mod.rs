@@ -51,6 +51,9 @@ pub fn export_object(data: &[u8]) -> Result<ExtractedObject> {
     let mut pl_is_enabled = true;
     let mut pl_casts_shadows = true;
     let mut pl_can_be_carried = true;
+    let mut pl_stance_id = None;
+    let mut pl_interaction_flags = None;
+    let mut pl_secondary_flags = None;
     let mut pl_flags_hex = None;
 
     for (id, chunk) in &elements {
@@ -85,6 +88,9 @@ pub fn export_object(data: &[u8]) -> Result<ExtractedObject> {
             23 if is_placement_object && !chunk.is_empty() => {
                 pl_is_enabled = chunk[0] != 0;
             }
+            28 if is_placement_object && !chunk.is_empty() => {
+                pl_stance_id = Some(chunk[0]);
+            }
             29 if is_placement_object => {
                 pl_can_be_carried = chunk.len() >= 4 && chunk[0] != 0;
             }
@@ -116,8 +122,14 @@ pub fn export_object(data: &[u8]) -> Result<ExtractedObject> {
                     }
                 }
             }
+            41 if is_placement_object => {
+                pl_interaction_flags = Some(hex::encode_upper(chunk));
+            }
             42 if is_placement_object => {
                 placed_object = parse_placed_object(chunk);
+            }
+            45 if is_placement_object => {
+                pl_secondary_flags = Some(hex::encode_upper(chunk));
             }
             46 if is_placement_object && chunk.len() >= 4 => {
                 pl_material_id = u32::from_le_bytes(chunk[0..4].try_into().unwrap_or_default());
@@ -125,15 +137,12 @@ pub fn export_object(data: &[u8]) -> Result<ExtractedObject> {
             300 if is_placement_object && chunk.len() >= 15 => {
                 placement_offset = parse_placement_offset(chunk);
             }
+            301 => {
+                // Terminator / alignment marker for placement objects
+            }
             19 => {
                 has_sentinel_terminator = true;
             }
-            _ => {}
-        }
-    }
-
-    for (id, chunk) in &elements {
-        match *id {
             30 => {
                 let bindings = parse_mesh_material_bindings(chunk);
                 if !bindings.is_empty() || is_empty_container(chunk) {
@@ -200,13 +209,10 @@ pub fn export_object(data: &[u8]) -> Result<ExtractedObject> {
             1 => {
                 attachments = parse_attachment_slots(chunk);
             }
-            20 | 21 | 32 | 33 | 19 => {}
-            22 | 23 | 28 | 29 | 31 | 38 | 41 | 42 | 44 | 45 | 46 | 300 | 301
-                if is_placement_object => {}
             _ => {
                 raw_fallbacks.push(RawFallbackComponentJson {
                     id: *id,
-                    reason: "Unmapped / unknown engine component".into(),
+                    reason: "Unmapped component".into(),
                     hex: hex::encode_upper(chunk),
                 });
             }
@@ -225,6 +231,9 @@ pub fn export_object(data: &[u8]) -> Result<ExtractedObject> {
             is_enabled: pl_is_enabled,
             casts_shadows: pl_casts_shadows,
             can_be_carried: pl_can_be_carried,
+            stance_id: pl_stance_id,
+            interaction_flags: pl_interaction_flags,
+            secondary_flags: pl_secondary_flags,
             raw_flags_hex: pl_flags_hex,
         })
     } else {
@@ -315,7 +324,9 @@ pub fn import_object_from_json_with_endian(json_str: &str, endian: Endian) -> Re
         elements.push((22, endian.u32_to_bytes(mask).to_vec()));
 
         elements.push((23, vec![if enabled { 1 } else { 0 }]));
-        elements.push((28, vec![0u8]));
+
+        let stance = pl.and_then(|p| p.stance_id).unwrap_or(0);
+        elements.push((28, vec![stance]));
 
         if carry {
             elements.push((29, vec![1, 40, 0, 3, 40, 0, 43, 4, 44, 5, 1, 1, 0, 0, 0, 1]));
@@ -333,7 +344,12 @@ pub fn import_object_from_json_with_endian(json_str: &str, endian: Endian) -> Re
         }
 
         elements.push((38, vec![1u8]));
-        elements.push((41, vec![1, 1, 0, 0]));
+
+        let flag_41 = pl
+            .and_then(|p| p.interaction_flags.as_ref())
+            .and_then(|h| hex::decode(h).ok())
+            .unwrap_or_else(|| vec![1, 1, 0, 0]);
+        elements.push((41, flag_41));
 
         if let Some(ref placed) = parsed.placed_object {
             elements.push((42, build_placed_object(placed, endian)));
@@ -342,7 +358,13 @@ pub fn import_object_from_json_with_endian(json_str: &str, endian: Endian) -> Re
         }
 
         elements.push((44, vec![0u8]));
-        elements.push((45, vec![1, 1, 0, 0]));
+
+        let flag_45 = pl
+            .and_then(|p| p.secondary_flags.as_ref())
+            .and_then(|h| hex::decode(h).ok())
+            .unwrap_or_else(|| vec![1, 1, 0, 0]);
+        elements.push((45, flag_45));
+
         elements.push((46, endian.u32_to_bytes(mat_id).to_vec()));
 
         if let Some(offset) = parsed.placement_offset {
@@ -417,13 +439,7 @@ pub fn import_object_from_json_with_endian(json_str: &str, endian: Endian) -> Re
     }
 
     for fb in &parsed._engine_metadata.raw_fallbacks {
-        if ![
-            20, 21, 30, 32, 33, 34, 35, 36, 37, 19, 1, 22, 23, 28, 29, 31, 38, 41, 42, 44, 45, 46,
-            300, 301,
-        ]
-        .contains(&fb.id)
-            && let Ok(raw) = hex::decode(&fb.hex)
-        {
+        if let Ok(raw) = hex::decode(&fb.hex) {
             elements.push((fb.id, raw));
         }
     }

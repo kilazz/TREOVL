@@ -46,34 +46,27 @@ pub fn build_gpu_gizmo_vertices(cam: &ViewportCamera) -> Vec<GridVertex> {
     let s = f.cross(up_ref).normalize_or(Vec3::X);
     let u = s.cross(f).normalize();
 
-    // Map object coordinate unit vectors through up_axis setting matching the shader (X, -Z, Y)
-    let map_obj_to_world = |local: Vec3| -> Vec3 {
-        let base = Vec3::new(local.x, -local.z, local.y);
-        match cam.up_axis {
-            1 => Vec3::new(base.x, -base.z, base.y),
-            2 => Vec3::new(base.x, base.z, -base.y),
-            3 => Vec3::new(base.x, -base.y, -base.z),
-            _ => base,
-        }
-    };
-
     struct AxisDesc {
         world_dir: Vec3,
         color: [f32; 4],
     }
 
+    // Standard 3D Viewport World Axes:
+    // Red (X) = Right [1, 0, 0]
+    // Green (Y) = Up [0, 1, 0] (Points UP towards sky)
+    // Blue (Z) = Forward/Depth [0, 0, 1] (Lies on grid floor)
     let mut axes = [
         AxisDesc {
-            world_dir: map_obj_to_world(Vec3::X).normalize(),
-            color: [0.92, 0.28, 0.28, 1.0],
+            world_dir: Vec3::X,
+            color: [0.92, 0.28, 0.28, 1.0], // Red: X (Right)
         },
         AxisDesc {
-            world_dir: map_obj_to_world(Vec3::Y).normalize(),
-            color: [0.28, 0.85, 0.35, 1.0],
+            world_dir: Vec3::Y,
+            color: [0.28, 0.85, 0.35, 1.0], // Green: Y (Up)
         },
         AxisDesc {
-            world_dir: map_obj_to_world(Vec3::Z).normalize(),
-            color: [0.32, 0.55, 0.95, 1.0],
+            world_dir: Vec3::Z,
+            color: [0.32, 0.55, 0.95, 1.0], // Blue: Z (Depth/Grid)
         },
     ];
 
@@ -92,8 +85,9 @@ pub fn build_gpu_gizmo_vertices(cam: &ViewportCamera) -> Vec<GridVertex> {
     for axis in axes {
         let depth = axis.world_dir.dot(-f);
         let mut color = axis.color;
+        // Dim arrow if pointing away from camera
         if depth < 0.0 {
-            color[3] = 0.65;
+            color[3] = 0.45;
         }
 
         let sx = axis.world_dir.dot(s);
@@ -142,6 +136,7 @@ pub fn build_gpu_gizmo_vertices(cam: &ViewportCamera) -> Vec<GridVertex> {
                 color,
             });
 
+            // Arrowhead tip (1 triangle)
             let a0 = s_end - ap;
             let a1 = s_end + ap;
             let a2 = tip;

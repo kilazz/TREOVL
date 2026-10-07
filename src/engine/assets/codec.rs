@@ -5,8 +5,6 @@ use std::path::Path;
 use crate::engine::assets::sniffer::AssetKind;
 use crate::engine::common::Endian;
 
-/// Unified dispatcher converting asset files/JSON back into binary chunk data.
-/// Eliminates code duplication between sync and service modules.
 pub fn reencode_asset_to_chunk(
     kind: AssetKind,
     baseline_chunk: &[u8],
@@ -16,7 +14,12 @@ pub fn reencode_asset_to_chunk(
     rel_asset_path: Option<&str>,
 ) -> Result<Vec<u8>> {
     match kind {
-        AssetKind::Character | AssetKind::Projectile => {
+        AssetKind::Projectile => {
+            let json_str =
+                std::str::from_utf8(asset_bytes).context("Projectile JSON is not valid UTF-8")?;
+            crate::engine::assets::projectile::import_projectile_from_json(json_str, endian)
+        }
+        AssetKind::Character => {
             let json_str =
                 std::str::from_utf8(asset_bytes).context("Character JSON is not valid UTF-8")?;
             crate::engine::assets::character::import_character_from_json_files(

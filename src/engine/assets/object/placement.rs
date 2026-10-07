@@ -18,6 +18,12 @@ pub struct PlacementConfigJson {
     pub casts_shadows: bool,
     pub can_be_carried: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub stance_id: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interaction_flags: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secondary_flags: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_flags_hex: Option<String>,
 }
 

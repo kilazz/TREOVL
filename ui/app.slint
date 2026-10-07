@@ -38,6 +38,11 @@ export component AppWindow inherits Window {
     // Toolbox Subcategory Tab
     in-out property <int> active_toolbox_tab: 0;
 
+    // Async Progress Bar State
+    in-out property <bool> is_busy: false;
+    in-out property <float> progress_value: 0.0;
+    in-out property <string> progress_label: "Processing...";
+
     // Workspace Data
     in-out property <string> active_project_dir: "";
     in-out property <[AssetItem]> asset_list: [];
@@ -59,6 +64,7 @@ export component AppWindow inherits Window {
     in-out property <bool> is_root_motion_enabled: false;
     in-out property <bool> show_mesh: true;
     in-out property <bool> show_skeleton: true;
+    in-out property <bool> show_xray: true;
     in-out property <bool> show_bone_names: false;
     in-out property <bool> show_wireframe: false;
     in-out property <bool> show_grid: true;
@@ -115,6 +121,7 @@ export component AppWindow inherits Window {
     callback toggle_root_motion();
     callback toggle_mesh_vis();
     callback toggle_skeleton_vis();
+    callback toggle_xray();
     callback toggle_bone_names();
     callback toggle_wireframe();
     callback toggle_grid();
@@ -259,6 +266,7 @@ export component AppWindow inherits Window {
                             text: "Unpack PRP...";
                             primary-color: #3e6a90;
                             min-w: 125px;
+                            enabled: !root.is_busy;
                             clicked => {
                                 let src = root.browse_file();
                                 if (src != "") {
@@ -273,6 +281,7 @@ export component AppWindow inherits Window {
                             text: "Open Project...";
                             primary-color: #4e5058;
                             min-w: 130px;
+                            enabled: !root.is_busy;
                             clicked => {
                                 let path = root.browse_folder();
                                 if (path != "") { root.load_project(path); }
@@ -296,6 +305,7 @@ export component AppWindow inherits Window {
                             text: "Clean Rebuild";
                             primary-color: #636773;
                             min-w: 125px;
+                            enabled: !root.is_busy;
                             clicked => {
                                 if (root.active_project_dir != "") { root.clean_rebuild(root.active_project_dir); }
                                 else { let proj = root.browse_folder(); if (proj != "") { root.clean_rebuild(proj); } }
@@ -307,6 +317,7 @@ export component AppWindow inherits Window {
                             text: "Pack to PRP";
                             primary-color: #23a55a;
                             min-w: 120px;
+                            enabled: !root.is_busy;
                             clicked => {
                                 if (root.active_project_dir != "") { root.pack_prp(root.active_project_dir); }
                                 else { let proj = root.browse_folder(); if (proj != "") { root.pack_prp(proj); } }
@@ -327,6 +338,7 @@ export component AppWindow inherits Window {
                             text: "Create Patch...";
                             primary-color: #4e5058;
                             min-w: 125px;
+                            enabled: !root.is_busy;
                             clicked => {
                                 let base = root.browse_folder();
                                 if (base != "") {
@@ -344,6 +356,7 @@ export component AppWindow inherits Window {
                             text: "Apply Patch...";
                             primary-color: #3e6a90;
                             min-w: 120px;
+                            enabled: !root.is_busy;
                             clicked => {
                                 let patch = root.browse_file();
                                 if (patch != "") {
@@ -498,6 +511,7 @@ export component AppWindow inherits Window {
                                 text: "8LD -> XML (1 file)";
                                 primary-color: #d28e1b;
                                 min-w: 150px;
+                                enabled: !root.is_busy;
                                 clicked => {
                                     let src = root.browse_file();
                                     if (src != "") { let dst = root.browse_folder(); if (dst != "") { root.decompile_8ld(src, dst); } }
@@ -509,6 +523,7 @@ export component AppWindow inherits Window {
                                 text: "8LD -> XML (Batch)";
                                 primary-color: #b57a16;
                                 min-w: 155px;
+                                enabled: !root.is_busy;
                                 clicked => {
                                     let src = root.browse_folder();
                                     if (src != "") { let dst = root.browse_folder(); if (dst != "") { root.decompile_8ld_batch(src, dst); } }
@@ -520,6 +535,7 @@ export component AppWindow inherits Window {
                                 text: "XML -> 8LD (1 file)";
                                 primary-color: #23a55a;
                                 min-w: 150px;
+                                enabled: !root.is_busy;
                                 clicked => {
                                     let src = root.browse_file();
                                     if (src != "") { let dst = root.browse_folder(); if (dst != "") { root.compile_8ld(src, dst); } }
@@ -531,6 +547,7 @@ export component AppWindow inherits Window {
                                 text: "XML -> 8LD (Batch)";
                                 primary-color: #1c8849;
                                 min-w: 155px;
+                                enabled: !root.is_busy;
                                 clicked => {
                                     let src = root.browse_folder();
                                     if (src != "") { let dst = root.browse_folder(); if (dst != "") { root.compile_8ld_batch(src, dst); } }
@@ -542,6 +559,7 @@ export component AppWindow inherits Window {
                                 text: "VPK -> JSON";
                                 primary-color: #3e6a90;
                                 min-w: 135px;
+                                enabled: !root.is_busy;
                                 clicked => {
                                     let src = root.browse_file();
                                     if (src != "") { let dst = root.save_file(); if (dst != "") { root.direct_vpk_to_json(src, dst); } }
@@ -553,6 +571,7 @@ export component AppWindow inherits Window {
                                 text: "JSON -> VPK";
                                 primary-color: #1c8849;
                                 min-w: 135px;
+                                enabled: !root.is_busy;
                                 clicked => {
                                     let json_src = root.browse_file();
                                     if (json_src != "") {
@@ -570,6 +589,7 @@ export component AppWindow inherits Window {
                                 text: "DTA -> JSON";
                                 primary-color: #d28e1b;
                                 min-w: 135px;
+                                enabled: !root.is_busy;
                                 clicked => {
                                     let src = root.browse_file();
                                     if (src != "") { let dst = root.save_file(); if (dst != "") { root.direct_dta_to_json(src, dst); } }
@@ -581,6 +601,7 @@ export component AppWindow inherits Window {
                                 text: "JSON -> DTA";
                                 primary-color: #23a55a;
                                 min-w: 135px;
+                                enabled: !root.is_busy;
                                 clicked => {
                                     let json_src = root.browse_file();
                                     if (json_src != "") {
@@ -595,6 +616,7 @@ export component AppWindow inherits Window {
                                 text: "ENV -> JSON";
                                 primary-color: #3e6a90;
                                 min-w: 135px;
+                                enabled: !root.is_busy;
                                 clicked => {
                                     let src = root.browse_file();
                                     if (src != "") { let dst = root.save_file(); if (dst != "") { root.direct_env_to_json(src, dst); } }
@@ -606,6 +628,7 @@ export component AppWindow inherits Window {
                                 text: "JSON -> ENV";
                                 primary-color: #1c8849;
                                 min-w: 135px;
+                                enabled: !root.is_busy;
                                 clicked => {
                                     let json_src = root.browse_file();
                                     if (json_src != "") {
@@ -623,6 +646,7 @@ export component AppWindow inherits Window {
                                 text: "Mesh -> GLB/OBJ";
                                 primary-color: #3e6a90;
                                 min-w: 145px;
+                                enabled: !root.is_busy;
                                 clicked => {
                                     let src = root.browse_file();
                                     if (src != "") { let dst = root.save_file(); if (dst != "") { root.direct_mesh_export(src, dst); } }
@@ -634,6 +658,7 @@ export component AppWindow inherits Window {
                                 text: "Inject 3D into Mesh";
                                 primary-color: #23a55a;
                                 min-w: 155px;
+                                enabled: !root.is_busy;
                                 clicked => {
                                     let target_chunk = root.browse_file();
                                     if (target_chunk != "") {
@@ -648,6 +673,7 @@ export component AppWindow inherits Window {
                                 text: "Assemble Level (OMP -> GLB)";
                                 primary-color: #d28e1b;
                                 min-w: 200px;
+                                enabled: !root.is_busy;
                                 clicked => {
                                     let omp = root.browse_file();
                                     if (omp != "") {
@@ -662,6 +688,7 @@ export component AppWindow inherits Window {
                                 text: "Terrain 3D";
                                 primary-color: #4e5058;
                                 min-w: 135px;
+                                enabled: !root.is_busy;
                                 clicked => {
                                     let src = root.browse_file();
                                     if (src != "") { let dst = root.save_file(); if (dst != "") { root.direct_terrain_export(src, dst); } }
@@ -676,6 +703,7 @@ export component AppWindow inherits Window {
                                 text: "Collision -> 3D GLB";
                                 primary-color: #3e6a90;
                                 min-w: 160px;
+                                enabled: !root.is_busy;
                                 clicked => {
                                     let src = root.browse_file();
                                     if (src != "") { let dst = root.save_file(); if (dst != "") { root.direct_collision_export(src, dst); } }
@@ -687,6 +715,7 @@ export component AppWindow inherits Window {
                                 text: "Inject GLB into Collision";
                                 primary-color: #23a55a;
                                 min-w: 175px;
+                                enabled: !root.is_busy;
                                 clicked => {
                                     let target_chunk = root.browse_file();
                                     if (target_chunk != "") {
@@ -701,6 +730,7 @@ export component AppWindow inherits Window {
                                 text: "Font CLB -> JSON";
                                 primary-color: #5865f2;
                                 min-w: 150px;
+                                enabled: !root.is_busy;
                                 clicked => {
                                     let src = root.browse_file();
                                     if (src != "") { let dst = root.save_file(); if (dst != "") { root.direct_font_to_json(src, dst); } }
@@ -712,6 +742,7 @@ export component AppWindow inherits Window {
                                 text: "JSON -> Font CLB";
                                 primary-color: #1c8849;
                                 min-w: 150px;
+                                enabled: !root.is_busy;
                                 clicked => {
                                     let src = root.browse_file();
                                     if (src != "") { let dst = root.save_file(); if (dst != "") { root.direct_json_to_font(src, dst); } }
@@ -726,6 +757,7 @@ export component AppWindow inherits Window {
                                 text: "Texture -> DDS/TGA";
                                 primary-color: #3e6a90;
                                 min-w: 160px;
+                                enabled: !root.is_busy;
                                 clicked => {
                                     let src = root.browse_file();
                                     if (src != "") { let dst = root.save_file(); if (dst != "") { root.direct_texture_export(src, dst); } }
@@ -737,6 +769,7 @@ export component AppWindow inherits Window {
                                 text: "Inject DDS into Texture";
                                 primary-color: #23a55a;
                                 min-w: 175px;
+                                enabled: !root.is_busy;
                                 clicked => {
                                     let target_chunk = root.browse_file();
                                     if (target_chunk != "") {
@@ -751,6 +784,7 @@ export component AppWindow inherits Window {
                                 text: "Audio -> WAV";
                                 primary-color: #d28e1b;
                                 min-w: 135px;
+                                enabled: !root.is_busy;
                                 clicked => {
                                     let src = root.browse_file();
                                     if (src != "") { let dst = root.save_file(); if (dst != "") { root.direct_audio_export(src, dst); } }
@@ -762,6 +796,7 @@ export component AppWindow inherits Window {
                                 text: "Inject WAV into Audio";
                                 primary-color: #1c8849;
                                 min-w: 165px;
+                                enabled: !root.is_busy;
                                 clicked => {
                                     let target_chunk = root.browse_file();
                                     if (target_chunk != "") {
@@ -905,6 +940,7 @@ export component AppWindow inherits Window {
                                 text: "Reset to Vanilla";
                                 primary-color: #8b3a3a;
                                 min-w: 135px;
+                                enabled: !root.is_busy;
                                 clicked => { root.revert_asset(root.active_file_path); }
                             }
                         }
@@ -938,7 +974,7 @@ export component AppWindow inherits Window {
                         }
 
                         // Context 3: 3D Mesh / Composite Viewport
-                        if root.active_kind_id == 3: VerticalLayout {
+                        if root.active_kind_id == 3 || root.active_kind_id == 7 || root.active_kind_id == 8: VerticalLayout {
                             spacing: 8px;
                             vertical-stretch: 1;
 
@@ -1022,6 +1058,14 @@ export component AppWindow inherits Window {
                                     primary-color: root.show_skeleton ? #3e6a90 : #4e5058;
                                     min-w: 125px;
                                     clicked => { root.toggle_skeleton_vis(); }
+                                }
+
+                                CustomButton {
+                                    icon: "👁️";
+                                    text: root.show_xray ? "X-Ray: ON" : "X-Ray: OFF";
+                                    primary-color: root.show_xray ? #d28e1b : #4e5058;
+                                    min-w: 110px;
+                                    clicked => { root.toggle_xray(); }
                                 }
 
                                 CustomButton {
@@ -1779,22 +1823,77 @@ export component AppWindow inherits Window {
             }
         }
 
-        // BOTTOM STATUS BAR
+        // BOTTOM STATUS BAR & DYNAMIC PROGRESS BAR
         Rectangle {
-            height: 30px;
+            height: 32px;
             background: #2b2d31;
             border-radius: 4px;
+            clip: true;
+
+            // Background Smooth Animated Progress Fill
+            if root.is_busy: Rectangle {
+                x: 0px;
+                y: 0px;
+                width: parent.width * Math.min(1.0, Math.max(0.02, root.progress_value));
+                height: parent.height;
+                background: #3e6a9040;
+            }
 
             HorizontalLayout {
-                padding-left: 10px;
-                padding-right: 10px;
+                padding-left: 12px;
+                padding-right: 12px;
+                spacing: 10px;
 
-                Text {
+                if root.is_busy: HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+
+                    Text {
+                        text: "⏳ " + root.progress_label;
+                        color: #58a6ff;
+                        font-size: 11.5px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+
+                    Text {
+                        text: "(" + Math.round(root.progress_value * 100.0) + "%)";
+                        color: #f0b132;
+                        font-family: "Consolas";
+                        font-size: 11px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+                }
+
+                if !root.is_busy: Text {
                     text: root.status_msg;
                     color: root.status_is_error ? #ff5555 : #4CAF50;
                     font-size: 12px;
                     font-weight: 700;
                     vertical-alignment: center;
+                }
+
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
+
+                if root.is_busy: Rectangle {
+                    width: 140px;
+                    height: 8px;
+                    background: #1e2024;
+                    border-radius: 4px;
+                    y: (parent.height - self.height) / 2;
+                    clip: true;
+
+                    Rectangle {
+                        x: 0px;
+                        y: 0px;
+                        width: parent.width * Math.min(1.0, Math.max(0.02, root.progress_value));
+                        height: parent.height;
+                        background: #58a6ff;
+                        border-radius: 4px;
+                    }
                 }
             }
         }

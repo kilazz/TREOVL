@@ -30,6 +30,8 @@ pub struct BonesUniform {
 pub struct Pipelines {
     pub mesh_pipeline: wgpu::RenderPipeline,
     pub grid_pipeline: wgpu::RenderPipeline,
+    pub skeleton_xray_pipeline: wgpu::RenderPipeline,
+    pub skeleton_depth_pipeline: wgpu::RenderPipeline,
     pub gizmo_pipeline: wgpu::RenderPipeline,
     pub scene_buffer: wgpu::Buffer,
     pub bones_buffer: wgpu::Buffer,
@@ -283,6 +285,86 @@ pub fn create_pipelines(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Pi
         cache: None,
     });
 
+    let skeleton_xray_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("TREOVL X-Ray Skeleton Pipeline"),
+        layout: Some(&grid_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_grid"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[Some(wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<GridVertex>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4],
+            })],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_grid"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::LineList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Always), // X-RAY: draw over mesh
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    let skeleton_depth_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("TREOVL Depth Skeleton Pipeline"),
+        layout: Some(&grid_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_grid"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[Some(wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<GridVertex>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4],
+            })],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_grid"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::LineList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::LessEqual), // DEPTH TESTED (hides inside mesh)
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
     let gizmo_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("Gizmo Pipeline Layout"),
         bind_group_layouts: &[],
@@ -332,6 +414,8 @@ pub fn create_pipelines(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Pi
     Ok(Pipelines {
         mesh_pipeline,
         grid_pipeline,
+        skeleton_xray_pipeline,
+        skeleton_depth_pipeline,
         gizmo_pipeline,
         scene_buffer,
         bones_buffer,

@@ -8,10 +8,23 @@ use crate::AppWindow;
 use crate::gui::{AppState, resolve_project_dir, scan_project_folder};
 use crate::utils::logger::UiLogger;
 
+pub fn set_ui_busy(ui_handle: &slint::Weak<AppWindow>, busy: bool, progress: f32, label: &str) {
+    let ui_h = ui_handle.clone();
+    let lbl = label.to_string();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = ui_h.upgrade() {
+            ui.set_is_busy(busy);
+            ui.set_progress_value(progress);
+            ui.set_progress_label(lbl.into());
+        }
+    });
+}
+
 pub fn set_ui_status(ui_handle: &slint::Weak<AppWindow>, status_msg: &'static str, is_error: bool) {
     let ui_h = ui_handle.clone();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(ui) = ui_h.upgrade() {
+            ui.set_is_busy(false);
             ui.set_status_is_error(is_error);
             ui.set_status_msg(status_msg.into());
         }
@@ -22,6 +35,7 @@ pub fn set_ui_error(ui_handle: &slint::Weak<AppWindow>, err_msg: String) {
     let ui_h = ui_handle.clone();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(ui) = ui_h.upgrade() {
+            ui.set_is_busy(false);
             ui.set_status_is_error(true);
             ui.set_status_msg(err_msg.into());
         }
@@ -45,6 +59,7 @@ pub fn refresh_project_state(
     let ui_h = ui_handle.clone();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(ui) = ui_h.upgrade() {
+            ui.set_is_busy(false);
             ui.set_asset_list(ModelRc::from(std::rc::Rc::new(VecModel::from(items))));
             ui.set_status_is_error(false);
             ui.set_status_msg(status_msg.into());
@@ -60,7 +75,18 @@ pub fn handle_unpack_archive(
     dst: PathBuf,
 ) {
     logger.log(&format!("[*] Unpacking archive: {:?}", src));
-    match crate::engine::container::project::unpack_archive(&src, &dst) {
+    set_ui_busy(ui_handle, true, 0.05, "Opening archive...");
+
+    let ui_prog = ui_handle.clone();
+    let progress_cb = move |val: f32, msg: &str| {
+        set_ui_busy(&ui_prog, true, val, msg);
+    };
+
+    match crate::engine::container::project::unpack_archive_with_progress(
+        &src,
+        &dst,
+        Some(&progress_cb),
+    ) {
         Ok((count, info)) => {
             logger.log(&info);
             logger.log(&format!("[+] Unpack complete: {} chunks extracted.", count));
@@ -78,6 +104,7 @@ pub fn handle_unpack_archive(
             let dst_str = dst.to_string_lossy().to_string();
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(ui) = ui_h.upgrade() {
+                    ui.set_is_busy(false);
                     ui.set_active_project_dir(dst_str.into());
                     ui.set_asset_list(ModelRc::from(std::rc::Rc::new(VecModel::from(items))));
                     ui.set_status_is_error(false);
@@ -100,6 +127,7 @@ pub fn handle_load_project(
 ) {
     let actual_dir = resolve_project_dir(&proj_dir);
     logger.log(&format!("[*] Loading project from: {:?}", actual_dir));
+    set_ui_busy(ui_handle, true, 0.2, "Scanning project resources...");
 
     if !actual_dir.exists()
         || (!actual_dir.join("chunks").exists()
@@ -133,6 +161,7 @@ pub fn handle_load_project(
     let actual_dir_str = actual_dir.to_string_lossy().to_string();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(ui) = ui_h.upgrade() {
+            ui.set_is_busy(false);
             ui.set_active_project_dir(actual_dir_str.into());
             ui.set_selected_index(-1);
             ui.set_active_file_path("".into());
@@ -154,7 +183,17 @@ pub fn handle_clean_rebuild(
         "[*] Performing clean rebuild from vanilla: {:?}",
         actual_dir
     ));
-    match crate::engine::container::sync::clean_rebuild_project(&actual_dir) {
+    set_ui_busy(ui_handle, true, 0.1, "Restoring baseline chunks...");
+
+    let ui_prog = ui_handle.clone();
+    let progress_cb = move |val: f32, msg: &str| {
+        set_ui_busy(&ui_prog, true, val, msg);
+    };
+
+    match crate::engine::container::sync::clean_rebuild_project_with_progress(
+        &actual_dir,
+        Some(&progress_cb),
+    ) {
         Ok(synced) => {
             logger.log(&format!(
                 "[+] Clean rebuild completed: {} assets re-synced.",
@@ -205,8 +244,20 @@ pub fn handle_pack_archive(
 ) {
     let actual_dir = resolve_project_dir(&proj_dir);
     logger.log(&format!("[*] Packing project: {:?}", actual_dir));
+    set_ui_busy(ui_handle, true, 0.05, "Preparing package...");
+
+    let ui_prog = ui_handle.clone();
+    let progress_cb = move |val: f32, msg: &str| {
+        set_ui_busy(&ui_prog, true, val, msg);
+    };
+
     let out = actual_dir.join("rebuilt.prp");
-    match crate::engine::container::project::pack_archive(&actual_dir, &out, 0) {
+    match crate::engine::container::project::pack_archive_with_progress(
+        &actual_dir,
+        &out,
+        0,
+        Some(&progress_cb),
+    ) {
         Ok(size) => {
             logger.log(&format!("[+] Pack complete: {:?} ({} bytes)", out, size));
             set_ui_status(

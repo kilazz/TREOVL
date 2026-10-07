@@ -61,6 +61,7 @@ pub enum WorkerCommand {
     ToggleRootMotion,
     ToggleMeshVis,
     ToggleSkeletonVis,
+    ToggleXRay,
     ToggleBoneNames,
     ToggleWireframe,
     ToggleGrid,

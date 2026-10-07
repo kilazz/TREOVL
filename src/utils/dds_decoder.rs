@@ -1,5 +1,6 @@
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TextureFormat {
+    UncompressedRGB = 3,
     UncompressedRGBA = 5,
     DXT1 = 7,
     DXT3 = 9,
@@ -9,6 +10,7 @@ pub enum TextureFormat {
 impl TextureFormat {
     pub fn from_u32(val: u32) -> Option<Self> {
         match val {
+            3 => Some(Self::UncompressedRGB),
             5 => Some(Self::UncompressedRGBA),
             7 => Some(Self::DXT1),
             9 => Some(Self::DXT3),
@@ -31,6 +33,24 @@ pub fn decode_to_rgba(width: u32, height: u32, format: TextureFormat, data: &[u8
         Some(len) => len,
         None => return Vec::new(),
     };
+
+    // 24-bit uncompressed BGR (Format 3) -> RGBA8
+    if format == TextureFormat::UncompressedRGB {
+        let mut rgba = vec![255u8; expected_len];
+        let pixel_count = (width * height) as usize;
+        let src_chunks = data.as_chunks::<3>().0;
+        let to_copy = src_chunks.len().min(pixel_count);
+
+        for (i, &[b, g, r]) in src_chunks.iter().take(to_copy).enumerate() {
+            let out_idx = i * 4;
+            rgba[out_idx] = r;
+            rgba[out_idx + 1] = g;
+            rgba[out_idx + 2] = b;
+            rgba[out_idx + 3] = 255;
+        }
+
+        return rgba;
+    }
 
     if format == TextureFormat::UncompressedRGBA {
         // Direct3D 9 and TGA store 32-bit uncompressed pixels in BGRA order.

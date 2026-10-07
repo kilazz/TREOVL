@@ -6,7 +6,7 @@ use slint::{Image, ModelRc, VecModel};
 
 use crate::AppWindow;
 use crate::engine::assets::animation::compute_skinning_matrices;
-use crate::engine::math::Vector3;
+use crate::engine::math::{GridVertex, Vector3};
 use crate::gui::{ActiveMeshPreview, AppState};
 use crate::utils::renderer::{
     RenderOptions, SubmeshDrawData, TextureData, ViewportCamera, WgpuRenderer,
@@ -59,7 +59,6 @@ pub fn look_at_rh(eye: Vec3, center: Vec3, up: Vec3) -> Mat4 {
 }
 
 /// Mesh mapping: Flipped 180° around X so the model stands upright on feet in Ground mode by default.
-/// Base: X -> X, Y -> -Z, Z -> Y
 #[inline]
 fn map_mesh_coords(p: Vec3, up_axis: u32) -> [f32; 3] {
     let aligned = [p.x, -p.z, p.y];
@@ -71,8 +70,7 @@ fn map_mesh_coords(p: Vec3, up_axis: u32) -> [f32; 3] {
     }
 }
 
-/// Skeleton mapping: Rotated +90° around X relative to the mesh [p.x, -p.z, p.y]
-/// Orthogonal +90° rotation around X: [p.x, p.y, p.z]
+/// Skeleton mapping: Restored to [p.x, p.y, p.z] to sit perfectly inside the mesh body and limbs
 #[inline]
 fn map_skeleton_coords(p: Vec3, up_axis: u32) -> [f32; 3] {
     let aligned = [p.x, p.y, p.z];
@@ -145,6 +143,7 @@ pub fn evaluate_and_render_animated_frame(
         show_names,
         show_wire,
         show_grid,
+        show_xray,
         is_interacting,
     ) = {
         let st = state.lock();
@@ -156,11 +155,12 @@ pub fn evaluate_and_render_animated_frame(
             st.show_bone_names,
             st.show_wireframe,
             st.show_grid,
+            st.show_xray,
             st.is_interacting || preview.is_playing,
         )
     };
 
-    let (skin_matrices, lines, bone_positions) = if let Some(sm) = preview.submeshes.first() {
+    let (skin_matrices, _, bone_positions) = if let Some(sm) = preview.submeshes.first() {
         if !sm.bones.is_empty() {
             if let Some(clip_idx) = preview.current_clip_index
                 && let Some(clip) = preview.available_clips.get(clip_idx)
@@ -185,14 +185,68 @@ pub fn evaluate_and_render_animated_frame(
 
     let mut debug_lines = Vec::new();
     if show_skeleton {
-        for mut line_vert in lines {
-            let p = Vec3::new(
-                line_vert.position[0],
-                line_vert.position[1],
-                line_vert.position[2],
-            );
-            line_vert.position = map_skeleton_coords(p, cam.up_axis);
-            debug_lines.push(line_vert);
+        let dummy_size = 0.025f32; // Size of the 3D joint marker crosses
+
+        if let Some(sm) = preview.submeshes.first() {
+            let num_bones = sm.bones.len();
+
+            for i in 0..num_bones {
+                if i >= bone_positions.len() {
+                    continue;
+                }
+
+                let p_idx = sm.bones[i].parent_index;
+                let child_raw = bone_positions[i];
+                let child_pos = map_skeleton_coords(child_raw, cam.up_axis);
+
+                // 1. Line connecting parent to child bone
+                if p_idx >= 0 && (p_idx as usize) < bone_positions.len() {
+                    let parent_raw = bone_positions[p_idx as usize];
+                    let parent_pos = map_skeleton_coords(parent_raw, cam.up_axis);
+
+                    debug_lines.push(GridVertex {
+                        position: parent_pos,
+                        color: [1.0, 0.0, 1.0, 0.9],
+                    });
+                    debug_lines.push(GridVertex {
+                        position: child_pos,
+                        color: [0.0, 1.0, 1.0, 0.9],
+                    });
+                }
+
+                // 2. 3D Joint Marker Cross (Dummy)
+                let joint_color = [1.0, 0.8, 0.2, 1.0]; // Yellow-Orange joint markers
+
+                // X Axis
+                debug_lines.push(GridVertex {
+                    position: [child_pos[0] - dummy_size, child_pos[1], child_pos[2]],
+                    color: joint_color,
+                });
+                debug_lines.push(GridVertex {
+                    position: [child_pos[0] + dummy_size, child_pos[1], child_pos[2]],
+                    color: joint_color,
+                });
+
+                // Y Axis
+                debug_lines.push(GridVertex {
+                    position: [child_pos[0], child_pos[1] - dummy_size, child_pos[2]],
+                    color: joint_color,
+                });
+                debug_lines.push(GridVertex {
+                    position: [child_pos[0], child_pos[1] + dummy_size, child_pos[2]],
+                    color: joint_color,
+                });
+
+                // Z Axis
+                debug_lines.push(GridVertex {
+                    position: [child_pos[0], child_pos[1], child_pos[2] - dummy_size],
+                    color: joint_color,
+                });
+                debug_lines.push(GridVertex {
+                    position: [child_pos[0], child_pos[1], child_pos[2] + dummy_size],
+                    color: joint_color,
+                });
+            }
         }
     }
 
@@ -319,6 +373,7 @@ pub fn evaluate_and_render_animated_frame(
         is_skinning_enabled: is_skinning,
         show_grid,
         show_wire,
+        show_xray,
         size: render_size,
         bounds_min: min.into(),
         bounds_max: max.into(),

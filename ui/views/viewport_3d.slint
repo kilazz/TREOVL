@@ -88,23 +88,38 @@ export component Viewport3DView inherits Rectangle {
 
     // 3. OVERLAY BONE PIN LABELS
     for label in root.bone_labels: Rectangle {
-        x: image_container.x + (label.x / 1024.0) * image_container.width - 32px;
-        y: image_container.y + (label.y / 1024.0) * image_container.height - 10px;
-        width: 64px;
-        height: 20px;
-        background: #0f1115f0;
-        border-radius: 3px;
-        border-width: 1px;
-        border-color: #3e6a90;
+        x: image_container.x + (label.x / 1024.0) * image_container.width;
+        y: image_container.y + (label.y / 1024.0) * image_container.height;
 
-        Text {
-            text: label.name;
-            font-family: "Consolas";
-            font-size: 9.5px;
-            color: #58a6ff;
-            horizontal-alignment: center;
-            vertical-alignment: center;
-            overflow: elide;
+        // Pin dot at the exact joint location
+        Rectangle {
+            width: 4px;
+            height: 4px;
+            x: -2px;
+            y: -2px;
+            border-radius: 2px;
+            background: #ffffff;
+        }
+
+        // Floating label slightly offset
+        Rectangle {
+            x: 4px;
+            y: -20px;
+            width: txt.preferred-width + 8px;
+            height: 18px;
+            background: #0f1115b0;
+            border-radius: 3px;
+            border-width: 1px;
+            border-color: #3e6a9080;
+
+            txt := Text {
+                text: label.name;
+                font-family: "Consolas";
+                font-size: 10px;
+                color: #8bb4e3;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
         }
     }
 
