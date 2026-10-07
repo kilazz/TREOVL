@@ -1,14 +1,17 @@
 use anyhow::{Result, bail};
 
 use crate::engine::common::{
-    extract_elements_from_table, magic, parse_raw_container_table, serialize_container_payload,
+    Endian, extract_elements_from_table, magic, parse_raw_container_table,
+    serialize_container_payload_with_endian,
 };
 
 pub mod animation;
 pub mod attachment;
 pub mod audio;
 pub mod character;
+pub mod codec;
 pub mod collision;
+pub mod cptx;
 pub mod dta;
 pub mod environment;
 pub mod event;
@@ -41,6 +44,14 @@ pub fn parse_chunk_elements(data: &[u8]) -> Result<(bool, Vec<ChunkElement>)> {
 }
 
 pub fn build_chunk_from_elements(has_magic: bool, elements: &[ChunkElement]) -> Vec<u8> {
+    build_chunk_from_elements_with_endian(has_magic, elements, Endian::Little)
+}
+
+pub fn build_chunk_from_elements_with_endian(
+    has_magic: bool,
+    elements: &[ChunkElement],
+    endian: Endian,
+) -> Vec<u8> {
     let mut table = Vec::new();
     if has_magic {
         table.extend_from_slice(magic::CONTAINER_MAGIC);
@@ -48,7 +59,7 @@ pub fn build_chunk_from_elements(has_magic: bool, elements: &[ChunkElement]) -> 
     let entries = elements
         .iter()
         .map(|(id, data)| (*id, false, data.as_slice()));
-    table.extend(serialize_container_payload(entries));
+    table.extend(serialize_container_payload_with_endian(entries, endian));
     table
 }
 
@@ -63,11 +74,19 @@ pub fn parse_typed_container(data: &[u8]) -> Result<(u32, Vec<ChunkElement>)> {
 }
 
 pub fn build_typed_container(type_id: u32, elements: &[ChunkElement]) -> Vec<u8> {
+    build_typed_container_with_endian(type_id, elements, Endian::Little)
+}
+
+pub fn build_typed_container_with_endian(
+    type_id: u32,
+    elements: &[ChunkElement],
+    endian: Endian,
+) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(&type_id.to_le_bytes());
+    let _ = endian.write_u32(&mut out, type_id);
     let entries = elements
         .iter()
         .map(|(id, data)| (*id, false, data.as_slice()));
-    out.extend(serialize_container_payload(entries));
+    out.extend(serialize_container_payload_with_endian(entries, endian));
     out
 }

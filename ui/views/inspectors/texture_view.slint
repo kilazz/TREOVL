@@ -1,0 +1,57 @@
+import { CustomButton } from "../../components/buttons.slint";
+
+export component TextureInspectorView inherits VerticalLayout {
+    in property <image> preview_image;
+    in property <string> info_text: "No texture loaded.";
+    callback export_clicked();
+    callback import_clicked();
+
+    spacing: 10px;
+    vertical-stretch: 1;
+
+    HorizontalLayout {
+        spacing: 8px;
+        CustomButton {
+            icon: "📥";
+            text: "Export to Image";
+            primary-color: #3e6a90;
+            min-w: 130px;
+            clicked => { root.export_clicked(); }
+        }
+
+        CustomButton {
+            icon: "📤";
+            text: "Replace from Image";
+            primary-color: #23a55a;
+            min-w: 140px;
+            clicked => { root.import_clicked(); }
+        }
+
+        Rectangle {
+            horizontal-stretch: 1;
+        }
+
+        Text {
+            text: root.info_text;
+            font-family: "Consolas";
+            color: #cfcfcf;
+            vertical-alignment: center;
+            font-size: 11px;
+        }
+    }
+
+    Rectangle {
+        background: #111214;
+        border-radius: 4px;
+        border-width: 1px;
+        border-color: #353535;
+        clip: true;
+        vertical-stretch: 1;
+        Image {
+            source: root.preview_image;
+            width: 100%;
+            height: 100%;
+            image-fit: contain;
+        }
+    }
+}

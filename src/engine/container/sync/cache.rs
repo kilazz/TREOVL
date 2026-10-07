@@ -1,3 +1,4 @@
+use crate::engine::assets::sniffer::AssetKind;
 pub use crate::engine::common::calculate_crc32;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -5,7 +6,7 @@ use std::collections::HashMap;
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AssetSyncEntry {
     pub chunk_rel_path: String,
-    pub asset_kind: String,
+    pub asset_kind: AssetKind,
     pub vanilla_crc32: u32,
     #[serde(default)]
     pub is_modified: bool,

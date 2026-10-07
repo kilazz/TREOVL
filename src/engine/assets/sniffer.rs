@@ -1,7 +1,8 @@
 use super::parse_typed_container;
 use crate::engine::common::magic;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AssetKind {
     Texture = 0,
     Audio = 1,

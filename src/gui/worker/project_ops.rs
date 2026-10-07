@@ -1,5 +1,6 @@
+use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use slint::{ModelRc, VecModel};
 
@@ -35,7 +36,7 @@ pub fn refresh_project_state(
 ) {
     let (items, cached, haystacks) = scan_project_folder(project_dir);
     {
-        let mut st = state.lock().unwrap();
+        let mut st = state.lock();
         st.visible_indices = (0..items.len()).collect();
         st.all_cached_assets = cached;
         st.all_ui_items = items.clone();
@@ -65,7 +66,7 @@ pub fn handle_unpack_archive(
             logger.log(&format!("[+] Unpack complete: {} chunks extracted.", count));
             let (items, cached, haystacks) = scan_project_folder(&dst);
             {
-                let mut st = state.lock().unwrap();
+                let mut st = state.lock();
                 st.visible_indices = (0..items.len()).collect();
                 st.all_cached_assets = cached;
                 st.all_ui_items = items.clone();
@@ -119,7 +120,7 @@ pub fn handle_load_project(
     let (items, cached, haystacks) = scan_project_folder(&actual_dir);
     let total = items.len();
     {
-        let mut st = state.lock().unwrap();
+        let mut st = state.lock();
         st.visible_indices = (0..items.len()).collect();
         st.all_cached_assets = cached;
         st.all_ui_items = items.clone();

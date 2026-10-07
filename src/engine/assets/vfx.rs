@@ -4,9 +4,10 @@ use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 
 use super::{
-    build_chunk_from_elements, build_typed_container, parse_chunk_elements, parse_typed_container,
+    build_chunk_from_elements_with_endian, build_typed_container_with_endian, parse_chunk_elements,
+    parse_typed_container,
 };
-use crate::engine::common::{read_length_prefixed_string, write_length_prefixed_string};
+use crate::engine::common::{Endian, read_length_prefixed_string};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct VfxGraphJson {
@@ -62,7 +63,7 @@ pub struct VfxPropertyBlockJson {
     pub id: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
-    pub ptype: String, // "string", "float", "int", "uint", "vector3", "vector4", "color", "emitter_link", "raw"
+    pub ptype: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub string_val: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -122,11 +123,8 @@ pub fn export_vfx_to_json(chunk_data: &[u8]) -> Result<String> {
             1 => {
                 emitters = extract_all_emitters_recursive(chunk);
             }
-            19 => {
-                // Known sentinel terminator [0xFF, 0xFF, 0xFF, 0xFF], no need to dump in JSON
-            }
+            19 => {}
             _ => {
-                // Only genuinely unknown / unmapped components go here
                 unmapped_components.push(VfxComponentBlockJson {
                     id: *id,
                     role: get_vfx_component_role(*id).to_string(),
@@ -154,6 +152,10 @@ pub fn export_vfx_to_json(chunk_data: &[u8]) -> Result<String> {
 }
 
 pub fn import_vfx_from_json(json_str: &str) -> Result<Vec<u8>> {
+    import_vfx_from_json_with_endian(json_str, Endian::Little)
+}
+
+pub fn import_vfx_from_json_with_endian(json_str: &str, endian: Endian) -> Result<Vec<u8>> {
     let parsed: VfxGraphJson = serde_json::from_str(json_str)?;
     let clean_type_id = parsed._engine_metadata.type_id.trim_start_matches("0x");
     let type_id = u32::from_str_radix(clean_type_id, 16)
@@ -161,54 +163,45 @@ pub fn import_vfx_from_json(json_str: &str) -> Result<Vec<u8>> {
 
     let mut elements = Vec::new();
 
-    // 1. Group Path (ID 20)
     if let Some(ref path) = parsed.group_path {
-        elements.push((20, write_length_prefixed_string(path)));
+        elements.push((20, endian.write_length_prefixed_string(path)));
     }
 
-    // 2. VFX Name (ID 21)
     if let Some(ref name) = parsed.vfx_name {
-        elements.push((21, write_length_prefixed_string(name)));
+        elements.push((21, endian.write_length_prefixed_string(name)));
     }
 
-    // 3. Trigger Flags (ID 22)
     if let Some(ref flags_str) = parsed.trigger_flags {
         let clean = flags_str
             .trim()
             .trim_start_matches("0x")
             .trim_start_matches("0X");
         let mask = u32::from_str_radix(clean, 16).unwrap_or(0x16004007);
-        elements.push((22, mask.to_le_bytes().to_vec()));
+        elements.push((22, endian.u32_to_bytes(mask).to_vec()));
     }
 
-    // 4. Enabled Flag (ID 23)
     if let Some(en) = parsed.enabled {
         elements.push((23, vec![if en { 1 } else { 0 }]));
     }
 
-    // 5. Unmapped Components
     for comp in &parsed._engine_metadata.unmapped_components {
         if let Ok(b) = hex::decode(&comp.hex) {
             elements.push((comp.id, b));
         }
     }
 
-    // 6. Sentinel Terminator (ID 19)
     elements.push((19, vec![0xFF, 0xFF, 0xFF, 0xFF]));
 
-    // 7. Emitters Hierarchy (ID 1)
     if !parsed.emitters.is_empty() {
-        let rebuilt_emitters_container = rebuild_emitter_hierarchy(&parsed.emitters)?;
-        elements.push((1, rebuilt_emitters_container));
+        let rebuilt = rebuild_emitter_hierarchy(&parsed.emitters, endian)?;
+        elements.push((1, rebuilt));
     }
 
     elements.sort_by_key(|&(id, _)| id);
-    Ok(build_typed_container(type_id, &elements))
+    Ok(build_typed_container_with_endian(
+        type_id, &elements, endian,
+    ))
 }
-
-// -----------------------------------------------------------------------------
-// RECURSIVE EMITTER EXTRACTION
-// -----------------------------------------------------------------------------
 
 fn extract_all_emitters_recursive(data: &[u8]) -> Vec<VfxEmitterJson> {
     let mut result = Vec::new();
@@ -322,7 +315,6 @@ fn parse_single_emitter(data: &[u8]) -> Result<VfxEmitterJson> {
         let target_emitter_id = None;
         let mut hex_val = Some(hex::encode_upper(&chunk));
 
-        // 1. Strings
         if (id == 2 || id == 20 || id == 21)
             && let Some(s) = read_length_prefixed_string(&chunk)
         {
@@ -337,7 +329,6 @@ fn parse_single_emitter(data: &[u8]) -> Result<VfxEmitterJson> {
             hex_val = None;
         }
 
-        // 2. Color codes & Texture Hashes
         if ptype == "raw"
             && chunk.len() == 4
             && (id == 40 || id == 41 || id == 46 || id == 58 || id == 69)
@@ -360,7 +351,6 @@ fn parse_single_emitter(data: &[u8]) -> Result<VfxEmitterJson> {
             }
         }
 
-        // 3. 3D Vectors (12 bytes)
         if ptype == "raw" && chunk.len() == 12 {
             let mut cur = Cursor::new(&chunk);
             if let (Ok(x), Ok(y), Ok(z)) = (
@@ -380,7 +370,6 @@ fn parse_single_emitter(data: &[u8]) -> Result<VfxEmitterJson> {
             }
         }
 
-        // 4. 4D Vectors (16 bytes)
         if ptype == "raw" && chunk.len() == 16 {
             let mut cur = Cursor::new(&chunk);
             if let (Ok(x), Ok(y), Ok(z), Ok(w)) = (
@@ -402,7 +391,6 @@ fn parse_single_emitter(data: &[u8]) -> Result<VfxEmitterJson> {
             }
         }
 
-        // 5. Scalar 32-bit floats & ints
         if ptype == "raw" && chunk.len() == 4 {
             let raw_u32 = u32::from_le_bytes(chunk[0..4].try_into().unwrap_or_default());
             let f = f32::from_bits(raw_u32);
@@ -456,7 +444,6 @@ fn parse_single_emitter(data: &[u8]) -> Result<VfxEmitterJson> {
             }
         }
 
-        // 6. Short integers (1-2 bytes)
         if ptype == "raw" && (chunk.len() == 1 || chunk.len() == 2) {
             let mut val = 0u32;
             for (b_i, &byte) in chunk.iter().enumerate() {
@@ -504,11 +491,7 @@ fn parse_single_emitter(data: &[u8]) -> Result<VfxEmitterJson> {
     })
 }
 
-// -----------------------------------------------------------------------------
-// REBUILDING EMITTER BINARY HIERARCHY
-// -----------------------------------------------------------------------------
-
-fn rebuild_emitter_hierarchy(emitters: &[VfxEmitterJson]) -> Result<Vec<u8>> {
+fn rebuild_emitter_hierarchy(emitters: &[VfxEmitterJson], endian: Endian) -> Result<Vec<u8>> {
     let mut rebuilt_layers = Vec::new();
 
     for (idx, em) in emitters.iter().enumerate() {
@@ -520,37 +503,37 @@ fn rebuild_emitter_hierarchy(emitters: &[VfxEmitterJson]) -> Result<Vec<u8>> {
             let chunk = match prop.ptype.as_str() {
                 "string" => {
                     let s = prop.string_val.as_deref().unwrap_or(&em.name);
-                    write_length_prefixed_string(s)
+                    endian.write_length_prefixed_string(s)
                 }
                 "float" => {
                     let f = prop.float_val.unwrap_or(0.0);
-                    f.to_le_bytes().to_vec()
+                    endian.f32_to_bytes(f).to_vec()
                 }
                 "int" => {
                     let i = prop.int_val.unwrap_or(0);
-                    i.to_le_bytes().to_vec()
+                    endian.i32_to_bytes(i).to_vec()
                 }
                 "uint" => {
                     let u = prop.uint_val.unwrap_or(0);
-                    u.to_le_bytes().to_vec()
+                    endian.u32_to_bytes(u).to_vec()
                 }
                 "emitter_link" => {
                     let target_id = prop.target_emitter_id.or(prop.uint_val).unwrap_or(0);
                     if target_id < 64 {
-                        target_id.to_le_bytes().to_vec()
+                        endian.u32_to_bytes(target_id).to_vec()
                     } else {
-                        let link_elements =
-                            vec![(10, target_id.to_le_bytes().to_vec()), (1, vec![0u8])];
-                        build_chunk_from_elements(false, &link_elements)
+                        let link_elements = vec![
+                            (10, endian.u32_to_bytes(target_id).to_vec()),
+                            (1, vec![0u8]),
+                        ];
+                        build_chunk_from_elements_with_endian(false, &link_elements, endian)
                     }
                 }
                 "color" => {
                     if let Some(ref col) = prop.color {
                         let clean = col.trim_start_matches('#');
-                        u32::from_str_radix(clean, 16)
-                            .unwrap_or(0xFFFFFFFF)
-                            .to_le_bytes()
-                            .to_vec()
+                        let val = u32::from_str_radix(clean, 16).unwrap_or(0xFFFFFFFF);
+                        endian.u32_to_bytes(val).to_vec()
                     } else {
                         vec![0xFF, 0xFF, 0xFF, 0xFF]
                     }
@@ -558,18 +541,18 @@ fn rebuild_emitter_hierarchy(emitters: &[VfxEmitterJson]) -> Result<Vec<u8>> {
                 "vector3" => {
                     let [x, y, z] = prop.vector3_val.unwrap_or([0.0, 0.0, 0.0]);
                     let mut b = Vec::with_capacity(12);
-                    b.extend_from_slice(&x.to_le_bytes());
-                    b.extend_from_slice(&y.to_le_bytes());
-                    b.extend_from_slice(&z.to_le_bytes());
+                    let _ = endian.write_f32(&mut b, x);
+                    let _ = endian.write_f32(&mut b, y);
+                    let _ = endian.write_f32(&mut b, z);
                     b
                 }
                 "vector4" => {
                     let [x, y, z, w] = prop.vector4_val.unwrap_or([0.0, 0.0, 0.0, 0.0]);
                     let mut b = Vec::with_capacity(16);
-                    b.extend_from_slice(&x.to_le_bytes());
-                    b.extend_from_slice(&y.to_le_bytes());
-                    b.extend_from_slice(&z.to_le_bytes());
-                    b.extend_from_slice(&w.to_le_bytes());
+                    let _ = endian.write_f32(&mut b, x);
+                    let _ = endian.write_f32(&mut b, y);
+                    let _ = endian.write_f32(&mut b, z);
+                    let _ = endian.write_f32(&mut b, w);
                     b
                 }
                 _ => {
@@ -591,29 +574,27 @@ fn rebuild_emitter_hierarchy(emitters: &[VfxEmitterJson]) -> Result<Vec<u8>> {
                 let mut sub_props = Vec::new();
                 for sp in &sub_em.properties {
                     let s_chunk = match sp.ptype.as_str() {
-                        "string" => write_length_prefixed_string(
+                        "string" => endian.write_length_prefixed_string(
                             sp.string_val.as_deref().unwrap_or(&sub_em.name),
                         ),
-                        "float" => sp.float_val.unwrap_or(0.0).to_le_bytes().to_vec(),
-                        "int" => sp.int_val.unwrap_or(0).to_le_bytes().to_vec(),
-                        "uint" => sp.uint_val.unwrap_or(0).to_le_bytes().to_vec(),
+                        "float" => endian.f32_to_bytes(sp.float_val.unwrap_or(0.0)).to_vec(),
+                        "int" => endian.i32_to_bytes(sp.int_val.unwrap_or(0)).to_vec(),
+                        "uint" => endian.u32_to_bytes(sp.uint_val.unwrap_or(0)).to_vec(),
                         "color" => {
                             let clean = sp
                                 .color
                                 .as_deref()
                                 .unwrap_or("FFFFFFFF")
                                 .trim_start_matches('#');
-                            u32::from_str_radix(clean, 16)
-                                .unwrap_or(0xFFFFFFFF)
-                                .to_le_bytes()
-                                .to_vec()
+                            let val = u32::from_str_radix(clean, 16).unwrap_or(0xFFFFFFFF);
+                            endian.u32_to_bytes(val).to_vec()
                         }
                         "vector3" => {
                             let [x, y, z] = sp.vector3_val.unwrap_or([0.0, 0.0, 0.0]);
                             let mut b = Vec::with_capacity(12);
-                            b.extend_from_slice(&x.to_le_bytes());
-                            b.extend_from_slice(&y.to_le_bytes());
-                            b.extend_from_slice(&z.to_le_bytes());
+                            let _ = endian.write_f32(&mut b, x);
+                            let _ = endian.write_f32(&mut b, y);
+                            let _ = endian.write_f32(&mut b, z);
                             b
                         }
                         _ => sp
@@ -624,24 +605,30 @@ fn rebuild_emitter_hierarchy(emitters: &[VfxEmitterJson]) -> Result<Vec<u8>> {
                     };
                     sub_props.push((sp.id, s_chunk));
                 }
-                let sub_container = build_typed_container(sub_type, &sub_props);
+                let sub_container = build_typed_container_with_endian(sub_type, &sub_props, endian);
                 sub_chunks.push((s_idx as u32, sub_container));
             }
-            let sub_table = build_chunk_from_elements(true, &sub_chunks);
+            let sub_table = build_chunk_from_elements_with_endian(true, &sub_chunks, endian);
             em_elements.push((50, sub_table));
         }
 
         em_elements.sort_by_key(|&(id, _)| id);
-        let emitter_blob = build_typed_container(type_id, &em_elements);
+        let emitter_blob = build_typed_container_with_endian(type_id, &em_elements, endian);
         rebuilt_layers.push((idx as u32, emitter_blob));
     }
 
-    let emitter_list_container = build_chunk_from_elements(true, &rebuilt_layers);
-    let wrapper_sub = vec![(10, vec![38u8, 0, 0, 0]), (1, emitter_list_container)];
-    let wrapper_chunk = build_chunk_from_elements(false, &wrapper_sub);
+    let emitter_list_container =
+        build_chunk_from_elements_with_endian(true, &rebuilt_layers, endian);
+    let wrapper_sub = vec![
+        (10, endian.u32_to_bytes(38).to_vec()),
+        (1, emitter_list_container),
+    ];
+    let wrapper_chunk = build_chunk_from_elements_with_endian(false, &wrapper_sub, endian);
     let top_layer = vec![(30, wrapper_chunk)];
 
-    Ok(build_chunk_from_elements(false, &top_layer))
+    Ok(build_chunk_from_elements_with_endian(
+        false, &top_layer, endian,
+    ))
 }
 
 fn get_vfx_component_role(id: u32) -> &'static str {

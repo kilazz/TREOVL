@@ -1,12 +1,6 @@
 use glam::Vec3;
 
-/// 3D Ground Grid vertex format aligned for WGPU buffer layouts
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct GridVertex {
-    pub position: [f32; 3],
-    pub color: [f32; 4],
-}
+pub use crate::engine::math::GridVertex;
 
 /// Generates 3D ground grid line vertices positioned at the base of the model (`floor_y`),
 /// dynamically scaled to the bounding dimensions of the loaded geometry.

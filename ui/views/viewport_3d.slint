@@ -18,6 +18,7 @@ export component Viewport3DView inherits Rectangle {
     callback rotate_viewport(float, float);
     callback zoom_viewport(float);
     callback select_animation(int);
+    callback set_interacting(bool);
 
     // Collapsible Panel States
     property <bool> show_stats_panel: true;
@@ -65,8 +66,10 @@ export component Viewport3DView inherits Rectangle {
                 root.is_dragging = true;
                 root.drag_last_x = self.mouse-x;
                 root.drag_last_y = self.mouse-y;
+                root.set_interacting(true);
             } else if (event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) {
                 root.is_dragging = false;
+                root.set_interacting(false);
             }
         }
 

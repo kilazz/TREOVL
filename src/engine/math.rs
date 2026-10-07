@@ -1,5 +1,13 @@
+use bytemuck::{Pod, Zeroable};
 use glam::{EulerRot, Quat};
 use serde::{Deserialize, Serialize};
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct GridVertex {
+    pub position: [f32; 3],
+    pub color: [f32; 4],
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Vector2 {
@@ -39,8 +47,7 @@ impl BoneRotation {
         }
     }
 
-    /// Converts Triumph Engine Euler angles into a mathematically normalized Quaternion.
-    /// Safely utilizes the ZYX intrinsic rotation order (Z=Roll, Y=Yaw, X=Pitch) matching the engine.
+    /// Converts Triumph Engine Euler angles into a normalized quaternion (ZYX intrinsic order).
     pub fn to_quaternion(self) -> Vector4 {
         let q = Quat::from_euler(EulerRot::ZYX, self.roll, self.yaw, self.pitch).normalize();
         Vector4 {

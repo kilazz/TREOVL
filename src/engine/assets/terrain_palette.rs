@@ -1,13 +1,14 @@
 use anyhow::{Context, Result, bail};
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{LittleEndian, ReadBytesExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Cursor;
 
 use super::{
-    build_chunk_from_elements, build_typed_container, parse_chunk_elements, parse_typed_container,
+    build_chunk_from_elements_with_endian, build_typed_container_with_endian, parse_chunk_elements,
+    parse_typed_container,
 };
-use crate::engine::common::{read_length_prefixed_string, write_length_prefixed_string};
+use crate::engine::common::{Endian, read_length_prefixed_string};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TerrainPaletteJson {
@@ -198,6 +199,13 @@ pub fn export_terrain_palette_to_json(data: &[u8]) -> Result<String> {
 }
 
 pub fn import_terrain_palette_from_json(json_str: &str) -> Result<Vec<u8>> {
+    import_terrain_palette_from_json_with_endian(json_str, Endian::Little)
+}
+
+pub fn import_terrain_palette_from_json_with_endian(
+    json_str: &str,
+    endian: Endian,
+) -> Result<Vec<u8>> {
     let parsed: TerrainPaletteJson = serde_json::from_str(json_str)?;
     let type_id = u32::from_str_radix(&parsed._engine_metadata.type_id_hex, 16)
         .context("Invalid TypeID hex in Terrain Palette JSON metadata")?;
@@ -211,13 +219,14 @@ pub fn import_terrain_palette_from_json(json_str: &str) -> Result<Vec<u8>> {
         match comp.id {
             40..=53 => {
                 if let Some(tex) = parsed.textures.iter().find(|t| t.slot_id == comp.id) {
-                    raw_bytes = build_texture_link(&tex.pointer_tag, &tex.filename);
+                    raw_bytes = build_texture_link(&tex.pointer_tag, &tex.filename, endian);
                 }
             }
             54 => {
                 if let Ok(rebuilt) = rebuild_splat_and_foliage_container(
                     &parsed.terrain_splat_layers,
                     &parsed.foliage_scatter_groups,
+                    endian,
                 ) {
                     raw_bytes = rebuilt;
                 }
@@ -229,10 +238,10 @@ pub fn import_terrain_palette_from_json(json_str: &str) -> Result<Vec<u8>> {
     }
 
     if let Some(ref tag) = parsed._engine_metadata.resource_tag {
-        elements.push((20, write_length_prefixed_string(tag)));
+        elements.push((20, endian.write_length_prefixed_string(tag)));
     }
     if let Some(ref name) = parsed.palette_name {
-        elements.push((21, write_length_prefixed_string(name)));
+        elements.push((21, endian.write_length_prefixed_string(name)));
     }
     if let Ok(flags_bytes) = hex::decode(&parsed.render_flags.raw_hex) {
         elements.push((22, flags_bytes));
@@ -240,7 +249,7 @@ pub fn import_terrain_palette_from_json(json_str: &str) -> Result<Vec<u8>> {
     elements.push((23, vec![parsed.sub_layer_counter]));
 
     if let Some(ref thumb) = parsed.thumbnail {
-        elements.push((62, write_length_prefixed_string(thumb)));
+        elements.push((62, endian.write_length_prefixed_string(thumb)));
     }
 
     if let Some(ref sent) = parsed._engine_metadata.terminator_sentinel
@@ -250,15 +259,17 @@ pub fn import_terrain_palette_from_json(json_str: &str) -> Result<Vec<u8>> {
     }
 
     elements.sort_by_key(|(id, _)| *id);
-    Ok(build_typed_container(type_id, &elements))
+    Ok(build_typed_container_with_endian(
+        type_id, &elements, endian,
+    ))
 }
 
-fn build_texture_link(pointer_tag: &str, filename: &str) -> Vec<u8> {
+fn build_texture_link(pointer_tag: &str, filename: &str, endian: Endian) -> Vec<u8> {
     let sub_elements = vec![
-        (20, write_length_prefixed_string(pointer_tag)),
-        (21, write_length_prefixed_string(filename)),
+        (20, endian.write_length_prefixed_string(pointer_tag)),
+        (21, endian.write_length_prefixed_string(filename)),
     ];
-    build_chunk_from_elements(false, &sub_elements)
+    build_chunk_from_elements_with_endian(false, &sub_elements, endian)
 }
 
 fn decode_splat_and_foliage_container(
@@ -327,13 +338,14 @@ fn decode_splat_and_foliage_container(
 fn rebuild_splat_and_foliage_container(
     layers: &[SplatLayerJson],
     foliage: &HashMap<String, Vec<FoliageMeshJson>>,
+    endian: Endian,
 ) -> Result<Vec<u8>> {
     let mut entries = Vec::new();
 
     for layer in layers {
         let mut sub_elems = vec![
-            (20, write_length_prefixed_string(&layer.name)),
-            (26, layer.brush_index.to_le_bytes().to_vec()),
+            (20, endian.write_length_prefixed_string(&layer.name)),
+            (26, endian.u32_to_bytes(layer.brush_index).to_vec()),
         ];
 
         if let Some(ref fg) = layer.foliage_group
@@ -342,31 +354,33 @@ fn rebuild_splat_and_foliage_container(
             let mut mesh_chunks = Vec::new();
             for (idx, m) in meshes.iter().enumerate() {
                 let mut float_bytes = Vec::with_capacity(20);
-                let mut cur = Cursor::new(&mut float_bytes);
-                cur.write_f32::<LittleEndian>(m.density)?;
-                cur.write_f32::<LittleEndian>(m.height_min)?;
-                cur.write_f32::<LittleEndian>(m.height_max)?;
-                cur.write_f32::<LittleEndian>(m.width_scale)?;
-                cur.write_f32::<LittleEndian>(m.tint_variation)?;
+                let _ = endian.write_f32(&mut float_bytes, m.density);
+                let _ = endian.write_f32(&mut float_bytes, m.height_min);
+                let _ = endian.write_f32(&mut float_bytes, m.height_max);
+                let _ = endian.write_f32(&mut float_bytes, m.width_scale);
+                let _ = endian.write_f32(&mut float_bytes, m.tint_variation);
 
                 let m_elems = vec![
-                    (20, write_length_prefixed_string(&m.mesh_slot)),
-                    (21, write_length_prefixed_string(&m.mesh_file)),
-                    (22, write_length_prefixed_string(&m.display_name)),
+                    (20, endian.write_length_prefixed_string(&m.mesh_slot)),
+                    (21, endian.write_length_prefixed_string(&m.mesh_file)),
+                    (22, endian.write_length_prefixed_string(&m.display_name)),
                     (30, float_bytes),
                 ];
-                let m_blob = build_typed_container(0x04000079, &m_elems);
+                let m_blob = build_typed_container_with_endian(0x04000079, &m_elems, endian);
                 mesh_chunks.push((idx as u32, m_blob));
             }
-            let foliage_container = build_chunk_from_elements(false, &mesh_chunks);
+            let foliage_container =
+                build_chunk_from_elements_with_endian(false, &mesh_chunks, endian);
             sub_elems.push((1, foliage_container));
         }
 
-        let layer_blob = build_typed_container(0x04000080, &sub_elems);
+        let layer_blob = build_typed_container_with_endian(0x04000080, &sub_elems, endian);
         entries.push((layer.id, layer_blob));
     }
 
-    Ok(build_chunk_from_elements(false, &entries))
+    Ok(build_chunk_from_elements_with_endian(
+        false, &entries, endian,
+    ))
 }
 
 fn scan_foliage_meshes(data: &[u8], out: &mut Vec<FoliageMeshJson>) {

@@ -1,5 +1,6 @@
+use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, mpsc::Sender};
+use std::sync::{Arc, mpsc::Sender};
 
 use crate::AppWindow;
 use crate::gui::commands::WorkerCommand;
@@ -21,7 +22,7 @@ pub fn register(
             return;
         }
 
-        let st = state_sel.lock().unwrap();
+        let st = state_sel.lock();
         if let Some(&real_index) = st.visible_indices.get(filtered_index as usize)
             && let Some(target) = st.all_cached_assets.get(real_index)
         {
@@ -68,6 +69,11 @@ pub fn register(
         let _ = tx_axis.send(WorkerCommand::SetViewportUpAxis {
             mode: mode_idx as u32,
         });
+    });
+
+    let tx_interact = tx.clone();
+    ui.on_set_viewport_interacting(move |is_active| {
+        let _ = tx_interact.send(WorkerCommand::SetViewportInteracting { is_active });
     });
 
     let tx_reset_cam = tx.clone();
@@ -138,7 +144,7 @@ pub fn register(
     let tx_revert = tx.clone();
     let state_revert = state;
     ui.on_revert_asset(move |chunk_str| {
-        let st = state_revert.lock().unwrap();
+        let st = state_revert.lock();
         let resolved_proj_dir = st.current_proj_dir.clone().or_else(|| {
             let p = Path::new(chunk_str.as_str());
             Some(resolve_project_dir(p))
@@ -399,7 +405,6 @@ pub fn register(
         });
     });
 
-    // 8LD -> XML (Single file)
     let tx_dec_8ld = tx.clone();
     ui.on_decompile_8ld(move |src_str, dst_str| {
         let _ = tx_dec_8ld.send(WorkerCommand::Decompile8ldDirect {
@@ -408,7 +413,6 @@ pub fn register(
         });
     });
 
-    // 8LD -> XML (Batch)
     let tx_dec_8ld_batch = tx.clone();
     ui.on_decompile_8ld_batch(move |src_str, dst_str| {
         let _ = tx_dec_8ld_batch.send(WorkerCommand::Decompile8ldBatch {
@@ -417,7 +421,6 @@ pub fn register(
         });
     });
 
-    // XML -> 8LD (Single file)
     let tx_comp_8ld = tx.clone();
     ui.on_compile_8ld(move |src_str, dst_str| {
         let _ = tx_comp_8ld.send(WorkerCommand::Compile8ldDirect {
@@ -426,7 +429,6 @@ pub fn register(
         });
     });
 
-    // XML -> 8LD (Batch)
     let tx_comp_8ld_batch = tx.clone();
     ui.on_compile_8ld_batch(move |src_str, dst_str| {
         let _ = tx_comp_8ld_batch.send(WorkerCommand::Compile8ldBatch {

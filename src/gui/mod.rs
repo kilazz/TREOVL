@@ -4,12 +4,13 @@ pub mod commands;
 pub mod textures;
 pub mod worker;
 
+use parking_lot::Mutex;
 use slint::ComponentHandle;
 use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::thread;
 
 use crate::engine::assets::animation::{AnimationClip, ObjectBone};
@@ -65,6 +66,7 @@ pub struct AppState {
     pub camera: ViewportCamera,
     pub active_mesh: Option<ActiveMeshPreview>,
     pub filter_generation: u64,
+    pub is_interacting: bool,
     pub is_skinning_enabled: bool,
     pub is_root_motion_enabled: bool,
     pub show_mesh: bool,
@@ -84,12 +86,13 @@ impl AppState {
             show_bone_names: false,
             show_wireframe: false,
             show_grid: true,
+            is_interacting: false,
             ..Default::default()
         }
     }
 }
 
-/// Resolves a directory path whether a directory or a child file was passed.
+/// Resolves a directory path whether a directory or an individual file was passed.
 pub fn resolve_project_dir(path: &Path) -> PathBuf {
     if path.is_file() {
         path.parent()

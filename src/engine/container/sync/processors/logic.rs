@@ -30,7 +30,7 @@ impl AssetProcessor for VfxProcessor {
             format!("assets/vfx/{}", out_name),
             AssetSyncEntry {
                 chunk_rel_path: format!("chunks/{}.bin", stem),
-                asset_kind: "Vfx".into(),
+                asset_kind: AssetKind::Vfx,
                 vanilla_crc32: calculate_crc32(json_str.as_bytes()),
                 is_modified: false,
             },
@@ -67,7 +67,7 @@ impl AssetProcessor for EventProcessor {
             format!("assets/events/{}", out_name),
             AssetSyncEntry {
                 chunk_rel_path: format!("chunks/{}.bin", stem),
-                asset_kind: "Event".into(),
+                asset_kind: AssetKind::Event,
                 vanilla_crc32: calculate_crc32(json_str.as_bytes()),
                 is_modified: false,
             },
@@ -91,20 +91,21 @@ impl AssetProcessor for FaceFxProcessor {
         let facefx_json_dir = workspace.assets_dir.join("facefx");
         fs::create_dir_all(&facefx_json_dir)?;
 
-        let json_str = crate::engine::assets::facefx::export_facefx_to_json(
-            data,
-            &workspace.assets_dir,
-            stem,
-        )?;
-        let out_name = build_asset_filename(&sniffed.display_name, stem, "json");
+        let extracted = crate::engine::assets::facefx::export_facefx(data, stem)?;
+        if !extracted.fxe_payload.is_empty() {
+            let fxe_out_path = facefx_json_dir.join(&extracted.fxe_filename);
+            fs::write(&fxe_out_path, &extracted.fxe_payload)?;
+        }
 
+        let json_str = serde_json::to_string_pretty(&extracted.metadata)?;
+        let out_name = build_asset_filename(&sniffed.display_name, stem, "json");
         fs::write(facefx_json_dir.join(&out_name), json_str.as_bytes())?;
 
         Ok(Some((
             format!("assets/facefx/{}", out_name),
             AssetSyncEntry {
                 chunk_rel_path: format!("chunks/{}.bin", stem),
-                asset_kind: "FaceFx".into(),
+                asset_kind: AssetKind::FaceFx,
                 vanilla_crc32: calculate_crc32(json_str.as_bytes()),
                 is_modified: false,
             },
@@ -148,7 +149,7 @@ impl AssetProcessor for LuaProcessor {
             format!("assets/scripts/{}", lua_source_name),
             AssetSyncEntry {
                 chunk_rel_path: format!("chunks/{}.bin", stem),
-                asset_kind: "Lua".into(),
+                asset_kind: AssetKind::Lua,
                 vanilla_crc32: calculate_crc32(decompiled.as_bytes()),
                 is_modified: false,
             },
@@ -182,7 +183,7 @@ impl AssetProcessor for XmlProcessor {
             format!("assets/xml/{}", out_name),
             AssetSyncEntry {
                 chunk_rel_path: format!("chunks/{}.bin", stem),
-                asset_kind: "Xml".into(),
+                asset_kind: AssetKind::Xml,
                 vanilla_crc32: calculate_crc32(xml_payload),
                 is_modified: false,
             },
@@ -216,7 +217,7 @@ impl AssetProcessor for M8ldProcessor {
             format!("assets/xml/{}", out_name),
             AssetSyncEntry {
                 chunk_rel_path: format!("chunks/{}.bin", stem),
-                asset_kind: "M8ldMap".into(),
+                asset_kind: AssetKind::M8ldMap,
                 vanilla_crc32: calculate_crc32(xml_content.as_bytes()),
                 is_modified: false,
             },
@@ -250,7 +251,7 @@ impl AssetProcessor for ParameterProcessor {
             format!("assets/parameters/{}", out_name),
             AssetSyncEntry {
                 chunk_rel_path: format!("chunks/{}.bin", stem),
-                asset_kind: "Parameter".into(),
+                asset_kind: AssetKind::Parameter,
                 vanilla_crc32: calculate_crc32(json_str.as_bytes()),
                 is_modified: false,
             },
@@ -282,7 +283,7 @@ impl AssetProcessor for UiProcessor {
             format!("assets/ui/{}", out_name),
             AssetSyncEntry {
                 chunk_rel_path: format!("chunks/{}.bin", stem),
-                asset_kind: "UI".into(),
+                asset_kind: AssetKind::UI,
                 vanilla_crc32: calculate_crc32(json_str.as_bytes()),
                 is_modified: false,
             },
@@ -310,7 +311,7 @@ impl AssetProcessor for RawProcessor {
             format!("assets/raw_chunks/{}", out_name),
             AssetSyncEntry {
                 chunk_rel_path: format!("chunks/{}.bin", stem),
-                asset_kind: "Raw".into(),
+                asset_kind: AssetKind::Generic,
                 vanilla_crc32: calculate_crc32(data),
                 is_modified: false,
             },

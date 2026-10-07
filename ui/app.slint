@@ -1,14 +1,16 @@
-import {
-    TextEdit,
-    Button,
-    LineEdit,
-    ListView,
-    Slider,
-} from "std-widgets.slint";
+import { TextEdit, LineEdit, ListView, Slider } from "std-widgets.slint";
 import { TabButton, CustomButton } from "./components/buttons.slint";
 import { SectionTitle, SplitterBar } from "./components/common.slint";
 import { Viewport3DView, BoneLabel } from "./views/viewport_3d.slint";
 import { JsonEditorView } from "./views/editor_view.slint";
+import { TextureInspectorView } from "./views/inspectors/texture_view.slint";
+import { AudioInspectorView } from "./views/inspectors/audio_view.slint";
+import {
+    AnimationInspectorView,
+} from "./views/inspectors/animation_view.slint";
+import {
+    CollisionInspectorView,
+} from "./views/inspectors/collision_view.slint";
 
 export { BoneLabel }
 export struct AssetItem {
@@ -106,6 +108,7 @@ export component AppWindow inherits Window {
     callback set_viewport_fov(float);
     callback set_viewport_lighting(int);
     callback set_viewport_up_axis(int);
+    callback set_viewport_interacting(bool);
     callback reset_viewport_camera();
     callback toggle_composite_view();
     callback toggle_skinning();
@@ -162,7 +165,6 @@ export component AppWindow inherits Window {
 
     callback direct_vpk_to_json(string, string);
     callback direct_json_to_vpk(string, string, string);
-
     callback direct_dta_to_json(string, string);
     callback direct_json_to_dta(string, string, string);
     callback direct_env_to_json(string, string);
@@ -172,7 +174,6 @@ export component AppWindow inherits Window {
     callback direct_mesh_import(string, string);
     callback direct_assemble_level(string, string, string);
     callback direct_terrain_export(string, string);
-
     callback direct_collision_export(string, string);
     callback direct_collision_import(string, string);
     callback direct_font_to_json(string, string);
@@ -658,7 +659,7 @@ export component AppWindow inherits Window {
 
                             CustomButton {
                                 icon: "⛰️";
-                                text: "Terrain -> GLB";
+                                text: "Terrain 3D";
                                 primary-color: #4e5058;
                                 min-w: 135px;
                                 clicked => {
@@ -914,84 +915,17 @@ export component AppWindow inherits Window {
                         }
 
                         // Context 0: Textures
-                        if root.active_kind_id == 0: VerticalLayout {
-                            spacing: 10px;
-                            vertical-stretch: 1;
-
-                            HorizontalLayout {
-                                spacing: 8px;
-                                CustomButton {
-                                    icon: "📥";
-                                    text: "Export to Image";
-                                    primary-color: #3e6a90;
-                                    min-w: 130px;
-                                    clicked => { let out = root.save_file(); if (out != "") { root.export_dds(root.active_file_path, out); } }
-                                }
-
-                                CustomButton {
-                                    icon: "📤";
-                                    text: "Replace from Image";
-                                    primary-color: #23a55a;
-                                    min-w: 140px;
-                                    clicked => { let inp = root.browse_file(); if (inp != "") { root.import_dds(root.active_file_path, inp); } }
-                                }
-
-                                Rectangle {
-                                    horizontal-stretch: 1;
-                                }
-
-                                Text {
-                                    text: root.tex_info;
-                                    font-family: "Consolas";
-                                    color: #cfcfcf;
-                                    vertical-alignment: center;
-                                    font-size: 11px;
-                                }
-                            }
-
-                            Rectangle {
-                                background: #111214;
-                                border-radius: 4px;
-                                border-width: 1px;
-                                border-color: #353535;
-                                clip: true;
-                                vertical-stretch: 1;
-                                Image {
-                                    source: root.tex_preview;
-                                    width: 100%;
-                                    height: 100%;
-                                    image-fit: contain;
-                                }
-                            }
+                        if root.active_kind_id == 0: TextureInspectorView {
+                            preview_image: root.tex_preview;
+                            info_text: root.tex_info;
+                            export_clicked => { let out = root.save_file(); if (out != "") { root.export_dds(root.active_file_path, out); } }
+                            import_clicked => { let inp = root.browse_file(); if (inp != "") { root.import_dds(root.active_file_path, inp); } }
                         }
 
                         // Context 1: Audio
-                        if root.active_kind_id == 1: VerticalLayout {
-                            spacing: 12px;
-                            alignment: start;
-                            SectionTitle {
-                                text: "AUDIO EXTRACTION & REPLACEMENT";
-                                text-color: #3e6a90;
-                            }
-
-                            HorizontalLayout {
-                                spacing: 8px;
-                                CustomButton {
-                                    icon: "📥";
-                                    text: "Export to .WAV";
-                                    primary-color: #3e6a90;
-                                    min-w: 125px;
-                                    clicked => { let out = root.save_file(); if (out != "") { root.export_wav(root.active_file_path, out); } }
-                                }
-
-                                CustomButton {
-                                    icon: "📤";
-                                    text: "Replace from .WAV";
-                                    primary-color: #23a55a;
-                                    min-w: 135px;
-                                    clicked => { let inp = root.browse_file(); if (inp != "") { root.import_wav(root.active_file_path, inp); } }
-                                }
-                            }
+                        if root.active_kind_id == 1: AudioInspectorView {
+                            export_clicked => { let out = root.save_file(); if (out != "") { root.export_wav(root.active_file_path, out); } }
+                            import_clicked => { let inp = root.browse_file(); if (inp != "") { root.import_wav(root.active_file_path, inp); } }
                         }
 
                         // Context 2: Materials
@@ -1129,7 +1063,7 @@ export component AppWindow inherits Window {
                                     spacing: 12px;
                                     alignment: space-between;
 
-                                    // Left: Camera Controls (Fit, Zoom +, -, Axis Mode Switcher)
+                                    // Left: Camera Controls
                                     HorizontalLayout {
                                         spacing: 6px;
                                         alignment: center;
@@ -1377,6 +1311,7 @@ export component AppWindow inherits Window {
                                     selected_anim_idx: root.selected_anim_idx;
                                     rotate_viewport(dyaw, dpitch) => { root.rotate_mesh_viewport(dyaw, dpitch); }
                                     zoom_viewport(delta) => { root.zoom_mesh_viewport(delta); }
+                                    set_interacting(is_active) => { root.set_viewport_interacting(is_active); }
                                     select_animation(idx) => {
                                         root.selected_anim_idx = idx;
                                         root.select_active_animation(idx);
@@ -1399,7 +1334,7 @@ export component AppWindow inherits Window {
                                     padding-bottom: 5px;
                                     spacing: 4px;
 
-                                    // Top Row: Transport Buttons, Frame Badges & Speed Selector
+                                    // Top Row: Transport Controls
                                     HorizontalLayout {
                                         spacing: 8px;
                                         alignment: space-between;
@@ -1409,7 +1344,6 @@ export component AppWindow inherits Window {
                                             spacing: 4px;
                                             alignment: start;
 
-                                            // Go to Start (Frame 0)
                                             Rectangle {
                                                 width: 28px;
                                                 height: 22px;
@@ -1431,7 +1365,6 @@ export component AppWindow inherits Window {
                                                 }
                                             }
 
-                                            // Step -1 Frame
                                             Rectangle {
                                                 width: 28px;
                                                 height: 22px;
@@ -1456,7 +1389,6 @@ export component AppWindow inherits Window {
                                                 }
                                             }
 
-                                            // Play / Pause
                                             Rectangle {
                                                 width: 65px;
                                                 height: 22px;
@@ -1480,7 +1412,6 @@ export component AppWindow inherits Window {
                                                 }
                                             }
 
-                                            // Step +1 Frame
                                             Rectangle {
                                                 width: 28px;
                                                 height: 22px;
@@ -1505,7 +1436,6 @@ export component AppWindow inherits Window {
                                                 }
                                             }
 
-                                            // Go to End
                                             Rectangle {
                                                 width: 28px;
                                                 height: 22px;
@@ -1527,7 +1457,6 @@ export component AppWindow inherits Window {
                                                 }
                                             }
 
-                                            // Loop Toggle
                                             Rectangle {
                                                 width: 32px;
                                                 height: 22px;
@@ -1591,7 +1520,7 @@ export component AppWindow inherits Window {
                                             }
                                         }
 
-                                        // Right: Playback Speed Selector (0.5x, 1x, 2x)
+                                        // Right: Playback Speed Selector
                                         HorizontalLayout {
                                             spacing: 4px;
                                             alignment: end;
@@ -1760,58 +1689,11 @@ export component AppWindow inherits Window {
                         }
 
                         // Context 8: Animation Clip
-                        if root.active_kind_id == 8: VerticalLayout {
-                            spacing: 8px;
-                            vertical-stretch: 1;
-                            SectionTitle {
-                                text: "SKELETAL ANIMATION CLIP (TIMELINE & CHANNELS)";
-                                text-color: #f0b132;
-                            }
-
-                            HorizontalLayout {
-                                spacing: 8px;
-                                CustomButton {
-                                    icon: "🎬";
-                                    text: "Export to .GLB";
-                                    primary-color: #3e6a90;
-                                    min-w: 130px;
-                                    clicked => { let out = root.save_file(); if (out != "") { root.export_anim_glb(root.active_file_path, out); } }
-                                }
-
-                                CustomButton {
-                                    icon: "📋";
-                                    text: "Export to .JSON";
-                                    primary-color: #4e5058;
-                                    min-w: 130px;
-                                    clicked => { let out = root.save_file(); if (out != "") { root.export_anim_json(root.active_file_path, out); } }
-                                }
-
-                                Rectangle {
-                                    horizontal-stretch: 1;
-                                }
-
-                                Text {
-                                    text: root.mesh_info;
-                                    font-family: "Consolas";
-                                    color: #cfcfcf;
-                                    font-size: 11px;
-                                    vertical-alignment: center;
-                                }
-                            }
-
-                            Rectangle {
-                                background: #111214;
-                                border-radius: 4px;
-                                border-width: 1px;
-                                border-color: #353535;
-                                vertical-stretch: 1;
-                                TextEdit {
-                                    text <=> root.mat_json_text;
-                                    read-only: true;
-                                    font-family: "Consolas";
-                                    font-size: 11px;
-                                }
-                            }
+                        if root.active_kind_id == 8: AnimationInspectorView {
+                            info_text: root.mesh_info;
+                            json_text: root.mat_json_text;
+                            export_glb_clicked => { let out = root.save_file(); if (out != "") { root.export_anim_glb(root.active_file_path, out); } }
+                            export_json_clicked => { let out = root.save_file(); if (out != "") { root.export_anim_json(root.active_file_path, out); } }
                         }
 
                         // Context 9: Terrain Palette
@@ -1824,45 +1706,10 @@ export component AppWindow inherits Window {
                         }
 
                         // Context 10: 3D Collision (.clb)
-                        if root.active_kind_id == 10: VerticalLayout {
-                            spacing: 10px;
-                            vertical-stretch: 1;
-                            SectionTitle {
-                                text: "3D COLLISION BOUNDARY EDITOR (.CLB / OBB)";
-                                text-color: #4CAF50;
-                            }
-
-                            HorizontalLayout {
-                                spacing: 8px;
-                                CustomButton {
-                                    icon: "🧱";
-                                    text: "Export to 3D .GLB";
-                                    primary-color: #3e6a90;
-                                    min-w: 145px;
-                                    clicked => { let out = root.save_file(); if (out != "") { root.export_collision_glb(root.active_file_path, out); } }
-                                }
-
-                                CustomButton {
-                                    icon: "📤";
-                                    text: "Replace from 3D .GLB";
-                                    primary-color: #23a55a;
-                                    min-w: 155px;
-                                    clicked => { let inp = root.browse_file(); if (inp != "") { root.import_collision_glb(root.active_file_path, inp); } }
-                                }
-                            }
-
-                            Rectangle {
-                                background: #111214;
-                                border-radius: 4px;
-                                border-width: 1px;
-                                border-color: #353535;
-                                vertical-stretch: 1;
-                                TextEdit {
-                                    text <=> root.mat_json_text;
-                                    font-family: "Consolas";
-                                    font-size: 11px;
-                                }
-                            }
+                        if root.active_kind_id == 10: CollisionInspectorView {
+                            content <=> root.mat_json_text;
+                            export_glb_clicked => { let out = root.save_file(); if (out != "") { root.export_collision_glb(root.active_file_path, out); } }
+                            import_glb_clicked => { let inp = root.browse_file(); if (inp != "") { root.import_collision_glb(root.active_file_path, inp); } }
                         }
 
                         // Context 11: Environment (.env)

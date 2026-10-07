@@ -1,10 +1,10 @@
 use anyhow::Result;
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{LittleEndian, ReadBytesExt};
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 
-use super::{build_typed_container, parse_typed_container};
-use crate::engine::common::read_length_prefixed_string;
+use super::{build_typed_container_with_endian, parse_typed_container};
+use crate::engine::common::{Endian, read_length_prefixed_string};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MaterialJson {
@@ -256,6 +256,10 @@ pub fn export_material_to_json(chunk_data: &[u8]) -> Result<String> {
 }
 
 pub fn import_material_from_json(json_str: &str) -> Result<Vec<u8>> {
+    import_material_from_json_with_endian(json_str, Endian::Little)
+}
+
+pub fn import_material_from_json_with_endian(json_str: &str, endian: Endian) -> Result<Vec<u8>> {
     let mat_json: MaterialJson = serde_json::from_str(json_str)?;
     let type_id = u32::from_str_radix(&mat_json._engine_metadata.type_id_hex, 16)
         .map_err(|_| anyhow::anyhow!("Invalid hexadecimal Type ID metadata"))?;
@@ -267,16 +271,16 @@ pub fn import_material_from_json(json_str: &str) -> Result<Vec<u8>> {
         match b.btype.as_str() {
             "string" => {
                 let s = b.value.unwrap_or_default().into_bytes();
-                chunk.write_u32::<LittleEndian>(s.len() as u32)?;
+                let _ = endian.write_u32(&mut chunk, s.len() as u32);
                 chunk.extend(s);
             }
             "float" => {
                 let f = b.float_value.unwrap_or(0.0);
-                chunk.write_f32::<LittleEndian>(f)?;
+                let _ = endian.write_f32(&mut chunk, f);
             }
             "uint" => {
                 let u = b.uint_value.unwrap_or(0);
-                chunk.write_u32::<LittleEndian>(u)?;
+                let _ = endian.write_u32(&mut chunk, u);
             }
             "texture_link" => {
                 let ptr = b.ptr.unwrap_or_default().into_bytes();
@@ -287,14 +291,14 @@ pub fn import_material_from_json(json_str: &str) -> Result<Vec<u8>> {
                     chunk.extend_from_slice(&[20, 0]);
                     chunk.extend_from_slice(&[21, (4 + ptr.len()) as u8]);
 
-                    chunk.write_u32::<LittleEndian>(ptr.len() as u32)?;
+                    let _ = endian.write_u32(&mut chunk, ptr.len() as u32);
                     chunk.extend(ptr);
-                    chunk.write_u32::<LittleEndian>(name.len() as u32)?;
+                    let _ = endian.write_u32(&mut chunk, name.len() as u32);
                     chunk.extend(name);
                 } else {
                     chunk.push(1);
                     chunk.extend_from_slice(&[20, 0]);
-                    chunk.write_u32::<LittleEndian>(ptr.len() as u32)?;
+                    let _ = endian.write_u32(&mut chunk, ptr.len() as u32);
                     chunk.extend(ptr);
                 }
             }
@@ -308,5 +312,7 @@ pub fn import_material_from_json(json_str: &str) -> Result<Vec<u8>> {
         elements.push((b.id, chunk));
     }
 
-    Ok(build_typed_container(type_id, &elements))
+    Ok(build_typed_container_with_endian(
+        type_id, &elements, endian,
+    ))
 }

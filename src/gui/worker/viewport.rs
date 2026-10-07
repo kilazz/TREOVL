@@ -1,4 +1,5 @@
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 use glam::{Mat4, Vec3, Vec4};
 use slint::{Image, ModelRc, VecModel};
@@ -57,59 +58,47 @@ pub fn look_at_rh(eye: Vec3, center: Vec3, up: Vec3) -> Mat4 {
     ])
 }
 
+/// Mesh mapping: Flipped 180° around X so the model stands upright on feet in Ground mode by default.
+/// Base: X -> X, Y -> -Z, Z -> Y
+#[inline]
+fn map_mesh_coords(p: Vec3, up_axis: u32) -> [f32; 3] {
+    let aligned = [p.x, -p.z, p.y];
+    match up_axis {
+        1 => [aligned[0], -aligned[2], aligned[1]], // Pitch Up (+90°)
+        2 => [aligned[0], aligned[2], -aligned[1]], // Pitch Down (-90°)
+        3 => [aligned[0], -aligned[1], -aligned[2]], // Inverted (180°)
+        _ => aligned,                               // 0: Ground (Default)
+    }
+}
+
+/// Skeleton mapping: Rotated +90° around X relative to the mesh [p.x, -p.z, p.y]
+/// Orthogonal +90° rotation around X: [p.x, p.y, p.z]
+#[inline]
+fn map_skeleton_coords(p: Vec3, up_axis: u32) -> [f32; 3] {
+    let aligned = [p.x, p.y, p.z];
+    match up_axis {
+        1 => [aligned[0], -aligned[2], aligned[1]], // Pitch Up (+90°)
+        2 => [aligned[0], aligned[2], -aligned[1]], // Pitch Down (-90°)
+        3 => [aligned[0], -aligned[1], -aligned[2]], // Inverted (180°)
+        _ => aligned,                               // 0: Ground (Default)
+    }
+}
+
 pub fn center_camera_for_preview(
     state: &Arc<Mutex<AppState>>,
     preview: &ActiveMeshPreview,
 ) -> ViewportCamera {
-    let mut st = state.lock().unwrap();
+    let mut st = state.lock();
     let up_axis = st.camera.up_axis;
 
-    let mut min = Vector3 {
-        x: f32::INFINITY,
-        y: f32::INFINITY,
-        z: f32::INFINITY,
-    };
-    let mut max = Vector3 {
-        x: f32::NEG_INFINITY,
-        y: f32::NEG_INFINITY,
-        z: f32::NEG_INFINITY,
-    };
-
-    let transform = |p: Vector3| -> Vector3 {
-        let aligned = Vector3 {
-            x: p.x,
-            y: -p.z,
-            z: p.y,
-        };
-        match up_axis {
-            1 => Vector3 {
-                x: aligned.x,
-                y: -aligned.z,
-                z: aligned.y,
-            },
-            2 => Vector3 {
-                x: aligned.x,
-                y: aligned.z,
-                z: -aligned.y,
-            },
-            3 => Vector3 {
-                x: aligned.x,
-                y: -aligned.y,
-                z: -aligned.z,
-            },
-            _ => aligned,
-        }
-    };
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
 
     for sm in &preview.submeshes {
         for &p in &sm.rest_positions {
-            let tp = transform(p);
-            min.x = min.x.min(tp.x);
-            min.y = min.y.min(tp.y);
-            min.z = min.z.min(tp.z);
-            max.x = max.x.max(tp.x);
-            max.y = max.y.max(tp.y);
-            max.z = max.z.max(tp.z);
+            let tp = map_mesh_coords(Vec3::new(p.x, p.y, p.z), up_axis);
+            min = min.min(Vec3::from(tp));
+            max = max.max(Vec3::from(tp));
         }
     }
 
@@ -140,9 +129,7 @@ pub fn evaluate_and_render_animated_frame(
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(ui) = ui_h.upgrade() {
                 ui.set_has_mesh(false);
-                ui.set_mesh_info(
-                    "3D Viewport unavailable (GPU adapter initialization failed)".into(),
-                );
+                ui.set_mesh_info("3D Viewport unavailable".into());
             }
         });
         return;
@@ -150,8 +137,17 @@ pub fn evaluate_and_render_animated_frame(
 
     let mut bone_labels = Vec::new();
 
-    let (is_skinning, _is_root_motion, show_mesh, show_skeleton, show_names, show_wire, show_grid) = {
-        let st = state.lock().unwrap();
+    let (
+        is_skinning,
+        _is_root_motion,
+        show_mesh,
+        show_skeleton,
+        show_names,
+        show_wire,
+        show_grid,
+        is_interacting,
+    ) = {
+        let st = state.lock();
         (
             st.is_skinning_enabled,
             st.is_root_motion_enabled,
@@ -160,6 +156,7 @@ pub fn evaluate_and_render_animated_frame(
             st.show_bone_names,
             st.show_wireframe,
             st.show_grid,
+            st.is_interacting || preview.is_playing,
         )
     };
 
@@ -168,10 +165,8 @@ pub fn evaluate_and_render_animated_frame(
             if let Some(clip_idx) = preview.current_clip_index
                 && let Some(clip) = preview.available_clips.get(clip_idx)
             {
-                let t = preview.current_time_seconds;
-                compute_skinning_matrices(&sm.bones, clip, t)
+                compute_skinning_matrices(&sm.bones, clip, preview.current_time_seconds)
             } else {
-                // Slot 0: [REST POSE / BIND POSE] - compute pure bind pose skinning
                 let empty_clip = crate::engine::assets::animation::AnimationClip {
                     name: "RestPose".into(),
                     target_rig: "".into(),
@@ -188,45 +183,59 @@ pub fn evaluate_and_render_animated_frame(
         (Vec::new(), Vec::new(), Vec::new())
     };
 
-    // Align skeleton lines and bone labels directly with mesh shader space: [X, -Z, Y]
-    let align_to_viewport = |raw_x: f32, raw_y: f32, raw_z: f32| -> [f32; 3] {
-        let base = [raw_x, -raw_z, raw_y];
-        match cam.up_axis {
-            1 => [base[0], -base[2], base[1]],
-            2 => [base[0], base[2], -base[1]],
-            3 => [base[0], -base[1], -base[2]],
-            _ => base,
-        }
-    };
-
     let mut debug_lines = Vec::new();
     if show_skeleton {
         for mut line_vert in lines {
-            let tp = align_to_viewport(
+            let p = Vec3::new(
                 line_vert.position[0],
                 line_vert.position[1],
                 line_vert.position[2],
             );
-            line_vert.position = tp;
+            line_vert.position = map_skeleton_coords(p, cam.up_axis);
             debug_lines.push(line_vert);
         }
     }
 
     let mut min = Vec3::splat(f32::INFINITY);
     let mut max = Vec3::splat(f32::NEG_INFINITY);
+
     for sm in &preview.submeshes {
-        for &p in &sm.rest_positions {
-            let aligned = [p.x, -p.z, p.y];
-            let tp = match cam.up_axis {
-                1 => [aligned[0], -aligned[2], aligned[1]],
-                2 => [aligned[0], aligned[2], -aligned[1]],
-                3 => [aligned[0], -aligned[1], -aligned[2]],
-                _ => aligned,
-            };
+        for (i, &p) in sm.rest_positions.iter().enumerate() {
+            let mut local_p = Vec3::new(p.x, p.y, p.z);
+
+            if is_skinning && !skin_matrices.is_empty() && !sm.joints.is_empty() {
+                let j = sm.joints[i];
+                let w = sm.weights[i];
+                let w_sum = w.x + w.y + w.z + w.w;
+                if w_sum > 0.001 {
+                    let m0 = skin_matrices
+                        .get(j[0] as usize)
+                        .copied()
+                        .unwrap_or(Mat4::IDENTITY);
+                    let m1 = skin_matrices
+                        .get(j[1] as usize)
+                        .copied()
+                        .unwrap_or(Mat4::IDENTITY);
+                    let m2 = skin_matrices
+                        .get(j[2] as usize)
+                        .copied()
+                        .unwrap_or(Mat4::IDENTITY);
+                    let m3 = skin_matrices
+                        .get(j[3] as usize)
+                        .copied()
+                        .unwrap_or(Mat4::IDENTITY);
+
+                    let blended = m0 * w.x + m1 * w.y + m2 * w.z + m3 * w.w;
+                    local_p = blended.transform_point3(local_p);
+                }
+            }
+
+            let tp = map_mesh_coords(local_p, cam.up_axis);
             min = min.min(Vec3::from(tp));
             max = max.max(Vec3::from(tp));
         }
     }
+
     let center = if min.x.is_finite() {
         (min + max) * 0.5
     } else {
@@ -252,10 +261,10 @@ pub fn evaluate_and_render_animated_frame(
     {
         for (b_idx, bone) in sm.bones.iter().enumerate() {
             if b_idx < bone_positions.len() {
-                let raw_p = bone_positions[b_idx];
-                let tp = align_to_viewport(raw_p.x, raw_p.y, raw_p.z);
+                let tp = map_skeleton_coords(bone_positions[b_idx], cam.up_axis);
                 let world_pos = Vec4::new(tp[0], tp[1], tp[2], 1.0);
                 let clip_pos = view_proj * world_pos;
+
                 if clip_pos.w > 0.05 {
                     let ndc = clip_pos.truncate() / clip_pos.w;
                     if ndc.x >= -1.05
@@ -300,11 +309,17 @@ pub fn evaluate_and_render_animated_frame(
         Vec::new()
     };
 
+    let render_size = if is_interacting {
+        (512, 512)
+    } else {
+        (1024, 1024)
+    };
+
     let options = RenderOptions {
         is_skinning_enabled: is_skinning,
         show_grid,
         show_wire,
-        size: (1024, 1024),
+        size: render_size,
         bounds_min: min.into(),
         bounds_max: max.into(),
     };
@@ -322,9 +337,7 @@ pub fn evaluate_and_render_animated_frame(
                     }
                 });
             }
-            Err(e) => {
-                eprintln!("[!] Viewport render error: {:#}", e);
-            }
+            Err(e) => eprintln!("[!] Viewport render error: {:#}", e),
         }
     }
 }

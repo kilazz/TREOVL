@@ -50,7 +50,8 @@ fn vs_main(model: VertexInput) -> VertexOutput {
         local_norm = (bone_m * vec4<f32>(local_norm, 0.0)).xyz;
     }
 
-    // 2. Map coordinates to WGPU Viewport (Y-up: X=Right, Y=-Z (Height Up), Z=Y (Forward))
+    // 2. Map coordinates to WGPU Viewport: 180° flipped base (X, -Z, Y)
+    // Synchronized with viewport.rs map_mesh_coords
     let base_world_pos = vec3<f32>(local_pos.x, -local_pos.z, local_pos.y);
     let base_world_norm = vec3<f32>(local_norm.x, -local_norm.z, local_norm.y);
 
@@ -135,5 +136,22 @@ fn vs_grid(model: GridVertexInput) -> GridVertexOutput {
 
 @fragment
 fn fs_grid(in: GridVertexOutput) -> @location(0) vec4<f32> {
+    return in.color;
+}
+
+// =========================================================================
+// 3. HARDWARE-ACCELERATED AXIS GIZMO SHADER PIPELINE (SCREEN NDC OVERLAY)
+// =========================================================================
+
+@vertex
+fn vs_gizmo(model: GridVertexInput) -> GridVertexOutput {
+    var out: GridVertexOutput;
+    out.clip_position = vec4<f32>(model.position.xy, 0.0, 1.0);
+    out.color = model.color;
+    return out;
+}
+
+@fragment
+fn fs_gizmo(in: GridVertexOutput) -> @location(0) vec4<f32> {
     return in.color;
 }

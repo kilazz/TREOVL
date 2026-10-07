@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, bail};
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{LittleEndian, ReadBytesExt};
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
+
+use crate::engine::common::Endian;
 
 pub const CPTX_MAGIC: &[u8; 4] = b"CPTX";
 
@@ -22,7 +24,6 @@ pub struct UvRectJson {
     pub v_max: f32,
 }
 
-/// Decodes a binary CPTX texture atlas map into structured UV rectangles
 pub fn export_cptx_to_json(data: &[u8]) -> Result<String> {
     if data.len() < 4 || &data[0..4] != CPTX_MAGIC {
         bail!("Invalid CPTX file: Missing 'CPTX' magic header");
@@ -74,10 +75,17 @@ pub fn export_cptx_to_json(data: &[u8]) -> Result<String> {
     serde_json::to_string_pretty(&json_data).map_err(|e| anyhow::anyhow!(e))
 }
 
-/// Injects modified UV rectangle coordinates back into the baseline CPTX binary
 pub fn import_cptx_from_json(json_str: &str, baseline: &[u8]) -> Result<Vec<u8>> {
-    let parsed: CptxMapJson = serde_json::from_str(json_str)
-        .context("Syntax error in CPTX JSON format")?;
+    import_cptx_from_json_with_endian(json_str, baseline, Endian::Little)
+}
+
+pub fn import_cptx_from_json_with_endian(
+    json_str: &str,
+    baseline: &[u8],
+    endian: Endian,
+) -> Result<Vec<u8>> {
+    let parsed: CptxMapJson =
+        serde_json::from_str(json_str).context("Syntax error in CPTX JSON format")?;
 
     let mut output = baseline.to_vec();
     if output.len() < 4 || &output[0..4] != CPTX_MAGIC {
@@ -100,10 +108,10 @@ pub fn import_cptx_from_json(json_str: &str, baseline: &[u8]) -> Result<Vec<u8>>
         if is_valid_uv(u1) && is_valid_uv(v1) && is_valid_uv(u2) && is_valid_uv(v2) {
             let rect = &parsed.uv_rects[rect_id];
             let mut w_cur = Cursor::new(&mut output[pos..pos + 16]);
-            w_cur.write_f32::<LittleEndian>(rect.u_min)?;
-            w_cur.write_f32::<LittleEndian>(rect.v_min)?;
-            w_cur.write_f32::<LittleEndian>(rect.u_max)?;
-            w_cur.write_f32::<LittleEndian>(rect.v_max)?;
+            let _ = endian.write_f32(&mut w_cur, rect.u_min);
+            let _ = endian.write_f32(&mut w_cur, rect.v_min);
+            let _ = endian.write_f32(&mut w_cur, rect.u_max);
+            let _ = endian.write_f32(&mut w_cur, rect.v_max);
 
             pos += 16;
             rect_id += 1;

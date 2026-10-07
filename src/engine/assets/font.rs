@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{LittleEndian, ReadBytesExt};
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 
-use super::{build_typed_container, parse_typed_container};
-use crate::engine::common::{read_length_prefixed_string, write_length_prefixed_string};
+use super::{build_typed_container_with_endian, parse_typed_container};
+use crate::engine::common::{Endian, read_length_prefixed_string};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FontJson {
@@ -112,7 +112,15 @@ pub fn export_font_to_json(data: &[u8]) -> Result<String> {
     serde_json::to_string_pretty(&font_json).map_err(|e| anyhow::anyhow!(e))
 }
 
-pub fn import_font_from_json(json_str: &str, _baseline: &[u8]) -> Result<Vec<u8>> {
+pub fn import_font_from_json(json_str: &str, baseline: &[u8]) -> Result<Vec<u8>> {
+    import_font_from_json_with_endian(json_str, baseline, Endian::Little)
+}
+
+pub fn import_font_from_json_with_endian(
+    json_str: &str,
+    _baseline: &[u8],
+    endian: Endian,
+) -> Result<Vec<u8>> {
     let parsed: FontJson = serde_json::from_str(json_str)?;
     let type_id =
         u32::from_str_radix(&parsed._engine_metadata.type_id_hex, 16).unwrap_or(0x00410072);
@@ -125,23 +133,25 @@ pub fn import_font_from_json(json_str: &str, _baseline: &[u8]) -> Result<Vec<u8>
         }
     }
 
-    elements.push((20, write_length_prefixed_string(&parsed.font_name)));
+    elements.push((20, endian.write_length_prefixed_string(&parsed.font_name)));
 
     if let Some(ref tlink) = parsed._engine_metadata.texture_link {
-        elements.push((21, write_length_prefixed_string(tlink)));
+        elements.push((21, endian.write_length_prefixed_string(tlink)));
     }
 
     let mut size_bytes = Vec::with_capacity(8);
-    let _ = size_bytes.write_f32::<LittleEndian>(parsed.font_size);
-    let _ = size_bytes.write_f32::<LittleEndian>(parsed.line_height);
+    let _ = endian.write_f32(&mut size_bytes, parsed.font_size);
+    let _ = endian.write_f32(&mut size_bytes, parsed.line_height);
     elements.push((30, size_bytes));
 
     if !parsed.glyphs.is_empty() {
-        elements.push((40, rebuild_glyph_metrics(&parsed.glyphs)?));
+        elements.push((40, rebuild_glyph_metrics(&parsed.glyphs, endian)?));
     }
 
     elements.sort_by_key(|&(id, _)| id);
-    Ok(build_typed_container(type_id, &elements))
+    Ok(build_typed_container_with_endian(
+        type_id, &elements, endian,
+    ))
 }
 
 fn parse_glyph_metrics(data: &[u8]) -> Vec<GlyphMetricJson> {
@@ -172,17 +182,17 @@ fn parse_glyph_metrics(data: &[u8]) -> Vec<GlyphMetricJson> {
     out
 }
 
-fn rebuild_glyph_metrics(glyphs: &[GlyphMetricJson]) -> Result<Vec<u8>> {
+fn rebuild_glyph_metrics(glyphs: &[GlyphMetricJson], endian: Endian) -> Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(glyphs.len() * 32);
     let mut cur = Cursor::new(&mut buf);
     for g in glyphs {
-        cur.write_u32::<LittleEndian>(g.char_code)?;
-        cur.write_f32::<LittleEndian>(g.width)?;
-        cur.write_f32::<LittleEndian>(g.height)?;
-        cur.write_f32::<LittleEndian>(g.uv_min[0])?;
-        cur.write_f32::<LittleEndian>(g.uv_min[1])?;
-        cur.write_f32::<LittleEndian>(g.uv_max[0])?;
-        cur.write_f32::<LittleEndian>(g.uv_max[1])?;
+        let _ = endian.write_u32(&mut cur, g.char_code);
+        let _ = endian.write_f32(&mut cur, g.width);
+        let _ = endian.write_f32(&mut cur, g.height);
+        let _ = endian.write_f32(&mut cur, g.uv_min[0]);
+        let _ = endian.write_f32(&mut cur, g.uv_min[1]);
+        let _ = endian.write_f32(&mut cur, g.uv_max[0]);
+        let _ = endian.write_f32(&mut cur, g.uv_max[1]);
     }
     Ok(buf)
 }

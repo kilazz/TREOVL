@@ -52,6 +52,9 @@ pub enum WorkerCommand {
     SetViewportUpAxis {
         mode: u32,
     },
+    SetViewportInteracting {
+        is_active: bool,
+    },
     ResetViewportCamera,
     ToggleCompositeView,
     ToggleSkinning,

@@ -39,7 +39,7 @@ impl AssetProcessor for TextureProcessor {
             format!("assets/textures/{}", out_name),
             AssetSyncEntry {
                 chunk_rel_path: format!("chunks/{}.bin", stem),
-                asset_kind: "Texture".into(),
+                asset_kind: AssetKind::Texture,
                 vanilla_crc32: calculate_crc32(&dds_or_tga),
                 is_modified: false,
             },
@@ -71,7 +71,7 @@ impl AssetProcessor for AudioProcessor {
             format!("assets/audio/{}", out_name),
             AssetSyncEntry {
                 chunk_rel_path: format!("chunks/{}.bin", stem),
-                asset_kind: "Audio".into(),
+                asset_kind: AssetKind::Audio,
                 vanilla_crc32: calculate_crc32(&wav_bytes),
                 is_modified: false,
             },
@@ -103,7 +103,7 @@ impl AssetProcessor for MaterialProcessor {
             format!("assets/materials/{}", out_name),
             AssetSyncEntry {
                 chunk_rel_path: format!("chunks/{}.bin", stem),
-                asset_kind: "Material".into(),
+                asset_kind: AssetKind::Material,
                 vanilla_crc32: calculate_crc32(json_str.as_bytes()),
                 is_modified: false,
             },
@@ -145,7 +145,7 @@ impl AssetProcessor for MeshProcessor {
             format!("assets/meshes/{}", out_name),
             AssetSyncEntry {
                 chunk_rel_path: format!("chunks/{}.bin", stem),
-                asset_kind: "Mesh".into(),
+                asset_kind: AssetKind::Mesh,
                 vanilla_crc32: calculate_crc32(&glb_bytes),
                 is_modified: false,
             },
@@ -183,7 +183,7 @@ impl AssetProcessor for AnimationProcessor {
             format!("assets/animations/{}", out_name),
             AssetSyncEntry {
                 chunk_rel_path: format!("chunks/{}.bin", stem),
-                asset_kind: "Animation".into(),
+                asset_kind: AssetKind::Animation,
                 vanilla_crc32: calculate_crc32(&glb_bytes),
                 is_modified: false,
             },
@@ -216,7 +216,7 @@ impl AssetProcessor for FontProcessor {
             format!("assets/fonts/{}", out_name),
             AssetSyncEntry {
                 chunk_rel_path: format!("chunks/{}.bin", stem),
-                asset_kind: "Font".into(),
+                asset_kind: AssetKind::Font,
                 vanilla_crc32: calculate_crc32(json_str.as_bytes()),
                 is_modified: false,
             },

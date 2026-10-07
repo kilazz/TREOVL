@@ -1,0 +1,49 @@
+import { TextEdit } from "std-widgets.slint";
+import { CustomButton } from "../../components/buttons.slint";
+import { SectionTitle } from "../../components/common.slint";
+
+export component CollisionInspectorView inherits VerticalLayout {
+    in-out property <string> content;
+    callback export_glb_clicked();
+    callback import_glb_clicked();
+
+    spacing: 10px;
+    vertical-stretch: 1;
+
+    SectionTitle {
+        text: "3D COLLISION BOUNDARY EDITOR (.CLB / OBB)";
+        text-color: #4CAF50;
+    }
+
+    HorizontalLayout {
+        spacing: 8px;
+        CustomButton {
+            icon: "🧱";
+            text: "Export to 3D .GLB";
+            primary-color: #3e6a90;
+            min-w: 145px;
+            clicked => { root.export_glb_clicked(); }
+        }
+
+        CustomButton {
+            icon: "📤";
+            text: "Replace from 3D .GLB";
+            primary-color: #23a55a;
+            min-w: 155px;
+            clicked => { root.import_glb_clicked(); }
+        }
+    }
+
+    Rectangle {
+        background: #111214;
+        border-radius: 4px;
+        border-width: 1px;
+        border-color: #353535;
+        vertical-stretch: 1;
+        TextEdit {
+            text <=> root.content;
+            font-family: "Consolas";
+            font-size: 11px;
+        }
+    }
+}

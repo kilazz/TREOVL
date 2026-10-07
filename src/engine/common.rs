@@ -139,11 +139,40 @@ impl Endian {
         }
     }
 
+    pub fn i32_to_bytes(self, val: i32) -> [u8; 4] {
+        match self {
+            Endian::Little => val.to_le_bytes(),
+            Endian::Big => val.to_be_bytes(),
+        }
+    }
+
     pub fn f32_to_bytes(self, val: f32) -> [u8; 4] {
         match self {
             Endian::Little => val.to_le_bytes(),
             Endian::Big => val.to_be_bytes(),
         }
+    }
+
+    pub fn u16_to_bytes(self, val: u16) -> [u8; 2] {
+        match self {
+            Endian::Little => val.to_le_bytes(),
+            Endian::Big => val.to_be_bytes(),
+        }
+    }
+
+    pub fn i16_to_bytes(self, val: i16) -> [u8; 2] {
+        match self {
+            Endian::Little => val.to_le_bytes(),
+            Endian::Big => val.to_be_bytes(),
+        }
+    }
+
+    pub fn write_length_prefixed_string(self, s: &str) -> Vec<u8> {
+        let bytes = s.as_bytes();
+        let mut out = Vec::with_capacity(4 + bytes.len());
+        let _ = self.write_u32(&mut out, bytes.len() as u32);
+        out.extend_from_slice(bytes);
+        out
     }
 }
 
@@ -181,7 +210,6 @@ pub fn parse_raw_container_table(
     pos: usize,
     allow_magic: bool,
 ) -> Result<ParsedContainerTable> {
-    // We default to Little Endian as 99% of Overlord mods are for PC.
     let mut endian = Endian::Little;
 
     let mut temp_pos = pos;
@@ -192,12 +220,9 @@ pub fn parse_raw_container_table(
         temp_pos += 3;
     }
 
-    // Safely deduce chunk endianness if there is a 'large_count' component.
-    // This prevents interpreting unrelated memory addresses/offsets as large Endian flags.
     if data.len() > temp_pos + 4 {
         let control_byte = data[temp_pos];
         if (control_byte & 0x80) != 0 {
-            // Has large entries
             let l_le = u32::from_le_bytes(
                 data[temp_pos + 1..temp_pos + 5]
                     .try_into()
@@ -208,8 +233,6 @@ pub fn parse_raw_container_table(
                     .try_into()
                     .unwrap_or_default(),
             );
-            // If the element count is completely absurd in Little-Endian but sane (<10,000)
-            // in Big-Endian, we confidently mark this chunk as Xbox/PS3 Big-Endian format.
             if l_le > 10_000 && l_be < 10_000 {
                 endian = Endian::Big;
             }
@@ -405,11 +428,11 @@ pub fn read_length_prefixed_string(data: &[u8]) -> Option<String> {
 }
 
 pub fn write_length_prefixed_string(s: &str) -> Vec<u8> {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(4 + bytes.len());
-    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-    out.extend_from_slice(bytes);
-    out
+    write_length_prefixed_string_with_endian(s, Endian::Little)
+}
+
+pub fn write_length_prefixed_string_with_endian(s: &str, endian: Endian) -> Vec<u8> {
+    endian.write_length_prefixed_string(s)
 }
 
 pub fn calculate_crc32(data: &[u8]) -> u32 {

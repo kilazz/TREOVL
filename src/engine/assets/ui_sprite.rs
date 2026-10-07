@@ -4,9 +4,10 @@ use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 
 use super::{
-    build_chunk_from_elements, build_typed_container, parse_chunk_elements, parse_typed_container,
+    build_chunk_from_elements_with_endian, build_typed_container_with_endian, parse_chunk_elements,
+    parse_typed_container,
 };
-use crate::engine::common::{read_length_prefixed_string, write_length_prefixed_string};
+use crate::engine::common::{Endian, read_length_prefixed_string};
 
 pub const CRL_MAGIC: &[u8; 4] = b"CRL\0";
 pub const CRL_HEADER_SIZE: usize = 24;
@@ -195,6 +196,10 @@ pub fn export_ui_sprite_collection(data: &[u8]) -> Result<String> {
 }
 
 pub fn import_ui_sprite_collection(json_str: &str) -> Result<Vec<u8>> {
+    import_ui_sprite_collection_with_endian(json_str, Endian::Little)
+}
+
+pub fn import_ui_sprite_collection_with_endian(json_str: &str, endian: Endian) -> Result<Vec<u8>> {
     let parsed: SpriteCollectionJson = serde_json::from_str(json_str)?;
 
     let mut slice_entries = Vec::with_capacity(parsed.sprites.len());
@@ -203,31 +208,31 @@ pub fn import_ui_sprite_collection(json_str: &str) -> Result<Vec<u8>> {
         let mut props = Vec::new();
 
         if let Some(ref tag) = s.slot_tag {
-            props.push((20, write_length_prefixed_string(tag)));
+            props.push((20, endian.write_length_prefixed_string(tag)));
         }
         if let Some(ref file) = s.texture_file {
-            props.push((21, write_length_prefixed_string(file)));
+            props.push((21, endian.write_length_prefixed_string(file)));
         }
         if let Some(w) = s.width {
-            props.push((32, w.to_le_bytes().to_vec()));
+            props.push((32, endian.u32_to_bytes(w).to_vec()));
         }
         if let Some(h) = s.height {
-            props.push((33, h.to_le_bytes().to_vec()));
+            props.push((33, endian.u32_to_bytes(h).to_vec()));
         }
         if let Some(ox) = s.offset_x {
-            props.push((40, ox.to_le_bytes().to_vec()));
+            props.push((40, endian.i32_to_bytes(ox).to_vec()));
         }
         if let Some(oy) = s.offset_y {
-            props.push((41, oy.to_le_bytes().to_vec()));
+            props.push((41, endian.i32_to_bytes(oy).to_vec()));
         }
         if let Some(adv) = s.advance_x {
-            props.push((42, adv.to_le_bytes().to_vec()));
+            props.push((42, endian.i32_to_bytes(adv).to_vec()));
         }
         if let Some(cw) = s.cell_width {
-            props.push((43, cw.to_le_bytes().to_vec()));
+            props.push((43, endian.u32_to_bytes(cw).to_vec()));
         }
         if let Some(ao) = s.atlas_offset {
-            props.push((19, ao.to_le_bytes().to_vec()));
+            props.push((19, endian.u32_to_bytes(ao).to_vec()));
         }
 
         for (pid, hex_str) in s.unmapped_data {
@@ -237,18 +242,21 @@ pub fn import_ui_sprite_collection(json_str: &str) -> Result<Vec<u8>> {
         }
 
         props.sort_by_key(|&(id, _)| id);
-        let slice_bin = build_typed_container(SPRITE_SLICE_TYPE_ID, &props);
+        let slice_bin = build_typed_container_with_endian(SPRITE_SLICE_TYPE_ID, &props, endian);
         slice_entries.push((s.slice_id, slice_bin));
     }
 
     slice_entries.sort_by_key(|&(id, _)| id);
 
-    let sprites_subcontainer = build_chunk_from_elements(true, &slice_entries);
+    let sprites_subcontainer = build_chunk_from_elements_with_endian(true, &slice_entries, endian);
     let root_elements = vec![
-        (20, write_length_prefixed_string(&parsed.collection_name)),
+        (
+            20,
+            endian.write_length_prefixed_string(&parsed.collection_name),
+        ),
         (21, sprites_subcontainer),
     ];
-    let root_container_bytes = build_chunk_from_elements(false, &root_elements);
+    let root_container_bytes = build_chunk_from_elements_with_endian(false, &root_elements, endian);
 
     let mut final_file = if let Some(ref hex_hdr) = parsed.raw_header_hex
         && let Ok(hdr) = hex::decode(hex_hdr)
@@ -261,16 +269,16 @@ pub fn import_ui_sprite_collection(json_str: &str) -> Result<Vec<u8>> {
 
         let mut def_hdr = vec![0u8; CRL_HEADER_SIZE];
         def_hdr[..4].copy_from_slice(CRL_MAGIC);
-        def_hdr[4..8].copy_from_slice(&type_id.to_le_bytes());
-        def_hdr[8..12].copy_from_slice(&parsed.header.version.to_le_bytes());
-        def_hdr[12..16].copy_from_slice(&(root_container_bytes.len() as u32).to_le_bytes());
-        def_hdr[16..20].copy_from_slice(&parsed.header.table_offset.to_le_bytes());
-        def_hdr[20..24].copy_from_slice(&parsed.header.reserved.to_le_bytes());
+        def_hdr[4..8].copy_from_slice(&endian.u32_to_bytes(type_id));
+        def_hdr[8..12].copy_from_slice(&endian.u32_to_bytes(parsed.header.version));
+        def_hdr[12..16].copy_from_slice(&endian.u32_to_bytes(root_container_bytes.len() as u32));
+        def_hdr[16..20].copy_from_slice(&endian.u32_to_bytes(parsed.header.table_offset));
+        def_hdr[20..24].copy_from_slice(&endian.u32_to_bytes(parsed.header.reserved));
         def_hdr
     };
 
     let total_payload_len = root_container_bytes.len() as u32;
-    final_file[12..16].copy_from_slice(&total_payload_len.to_le_bytes());
+    final_file[12..16].copy_from_slice(&endian.u32_to_bytes(total_payload_len));
     final_file.extend_from_slice(&root_container_bytes);
 
     Ok(final_file)

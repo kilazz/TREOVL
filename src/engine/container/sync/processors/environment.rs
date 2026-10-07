@@ -31,7 +31,7 @@ impl AssetProcessor for TerrainPaletteProcessor {
             format!("assets/terrain_palettes/{}", out_name),
             AssetSyncEntry {
                 chunk_rel_path: format!("chunks/{}.bin", stem),
-                asset_kind: "TerrainPalette".into(),
+                asset_kind: AssetKind::TerrainPalette,
                 vanilla_crc32: calculate_crc32(json_str.as_bytes()),
                 is_modified: false,
             },
@@ -64,7 +64,7 @@ impl AssetProcessor for CollisionProcessor {
             format!("assets/collisions/{}", out_name),
             AssetSyncEntry {
                 chunk_rel_path: format!("chunks/{}.bin", stem),
-                asset_kind: "Collision".into(),
+                asset_kind: AssetKind::Collision,
                 vanilla_crc32: calculate_crc32(json_str.as_bytes()),
                 is_modified: false,
             },
@@ -97,7 +97,7 @@ impl AssetProcessor for DtaProcessor {
             format!("assets/lightsets/{}", out_name),
             AssetSyncEntry {
                 chunk_rel_path: format!("chunks/{}.bin", stem),
-                asset_kind: "Dta".into(),
+                asset_kind: AssetKind::Dta,
                 vanilla_crc32: calculate_crc32(json_str.as_bytes()),
                 is_modified: false,
             },
@@ -130,7 +130,7 @@ impl AssetProcessor for VoicePackageProcessor {
             format!("assets/voice_packages/{}", out_name),
             AssetSyncEntry {
                 chunk_rel_path: format!("chunks/{}.bin", stem),
-                asset_kind: "VoicePackage".into(),
+                asset_kind: AssetKind::VoicePackage,
                 vanilla_crc32: calculate_crc32(json_str.as_bytes()),
                 is_modified: false,
             },

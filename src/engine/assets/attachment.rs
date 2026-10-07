@@ -1,12 +1,13 @@
 use anyhow::{Context, Result, bail};
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{LittleEndian, ReadBytesExt};
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 
 use super::{
-    build_chunk_from_elements, build_typed_container, parse_chunk_elements, parse_typed_container,
+    build_chunk_from_elements_with_endian, build_typed_container_with_endian, parse_chunk_elements,
+    parse_typed_container,
 };
-use crate::engine::common::{read_length_prefixed_string, write_length_prefixed_string};
+use crate::engine::common::{Endian, read_length_prefixed_string};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ItemAttachmentJson {
@@ -110,14 +111,12 @@ pub fn export_attachment_to_json(data: &[u8]) -> Result<String> {
 
     let mut unmapped_properties = Vec::new();
 
-    // 1. Root tag (Chunk ID 20)
     if let Some((_, tag_bytes)) = root_elements.iter().find(|(id, _)| *id == 20)
         && let Some(s) = read_length_prefixed_string(tag_bytes)
     {
         resource_tag = s;
     }
 
-    // 2. Scan internal item payload (0x0046200D: Item or 0x00462015: Weapon)
     for (_, chunk_bytes) in &root_elements {
         let payload_opt = if let Some(pos) = chunk_bytes
             .windows(4)
@@ -198,7 +197,6 @@ pub fn export_attachment_to_json(data: &[u8]) -> Result<String> {
                             hold_offset = pos;
                         }
                     }
-                    // Weapon specific sound cues
                     _ => {
                         if let Some(s) = read_length_prefixed_string(&chunk) {
                             if s.starts_with("Drop ") {
@@ -221,7 +219,6 @@ pub fn export_attachment_to_json(data: &[u8]) -> Result<String> {
         }
     }
 
-    // 3. Sound Bank Descriptor (0x04000057) in Chunk ID 30
     if let Some((_, snd_bytes)) = root_elements.iter().find(|(id, _)| *id == 30)
         && let Some(pos) = snd_bytes.windows(4).position(|w| w == b"\x57\x00\x00\x04")
         && let Ok((_, s_elements)) = parse_typed_container(&snd_bytes[pos..])
@@ -260,6 +257,10 @@ pub fn export_attachment_to_json(data: &[u8]) -> Result<String> {
 }
 
 pub fn import_attachment_from_json(json_str: &str) -> Result<Vec<u8>> {
+    import_attachment_from_json_with_endian(json_str, Endian::Little)
+}
+
+pub fn import_attachment_from_json_with_endian(json_str: &str, endian: Endian) -> Result<Vec<u8>> {
     let parsed: ItemAttachmentJson =
         serde_json::from_str(json_str).context("Syntax error in Item Attachment JSON format")?;
 
@@ -276,9 +277,9 @@ pub fn import_attachment_from_json(json_str: &str) -> Result<Vec<u8>> {
     let mut item_sub = Vec::new();
     item_sub.push((
         20,
-        write_length_prefixed_string(&parsed.internal_model_slot),
+        endian.write_length_prefixed_string(&parsed.internal_model_slot),
     ));
-    item_sub.push((21, write_length_prefixed_string(&parsed.item_name)));
+    item_sub.push((21, endian.write_length_prefixed_string(&parsed.item_name)));
 
     let raw_hex = parsed
         .flags
@@ -297,19 +298,28 @@ pub fn import_attachment_from_json(json_str: &str) -> Result<Vec<u8>> {
     if parsed.flags.drop_physics {
         flag_bits |= 0x0040_0000;
     }
-    item_sub.push((22, flag_bits.to_le_bytes().to_vec()));
+    item_sub.push((22, endian.u32_to_bytes(flag_bits).to_vec()));
 
     item_sub.push((23, vec![1u8]));
     item_sub.push((28, vec![0u8]));
     item_sub.push((29, build_socket_data(&parsed.socket)));
 
     let mesh_elems = vec![
-        (20, write_length_prefixed_string(&parsed.mesh_package)),
-        (21, write_length_prefixed_string(&parsed.submesh_name)),
+        (
+            20,
+            endian.write_length_prefixed_string(&parsed.mesh_package),
+        ),
+        (
+            21,
+            endian.write_length_prefixed_string(&parsed.submesh_name),
+        ),
     ];
-    item_sub.push((30, build_chunk_from_elements(false, &mesh_elems)));
+    item_sub.push((
+        30,
+        build_chunk_from_elements_with_endian(false, &mesh_elems, endian),
+    ));
 
-    item_sub.push((35, parsed.physics.category_id.to_le_bytes().to_vec()));
+    item_sub.push((35, endian.u32_to_bytes(parsed.physics.category_id).to_vec()));
     item_sub.push((36, vec![1u8, 1, 0, 0]));
     item_sub.push((
         137,
@@ -341,7 +351,7 @@ pub fn import_attachment_from_json(json_str: &str) -> Result<Vec<u8>> {
     item_sub.push((140, vec![1u8, 1, 0, 0]));
     item_sub.push((141, vec![1u8, 1, 0, 0]));
 
-    item_sub.push((143, build_transform_offset(parsed.hold_offset)));
+    item_sub.push((143, build_transform_offset(parsed.hold_offset, endian)));
 
     for prop in parsed._engine_metadata.unmapped_properties {
         if let Ok(b) = hex::decode(&prop.hex) {
@@ -353,13 +363,13 @@ pub fn import_attachment_from_json(json_str: &str) -> Result<Vec<u8>> {
     item_sub.push((1, vec![0u8]));
     item_sub.sort_by_key(|&(id, _)| id);
 
-    let item_resource_blob = build_typed_container(type_id, &item_sub);
+    let item_resource_blob = build_typed_container_with_endian(type_id, &item_sub, endian);
 
     let sound_elems = vec![
-        (10, write_length_prefixed_string(&parsed.sound_bank)),
+        (10, endian.write_length_prefixed_string(&parsed.sound_bank)),
         (11, vec![0, 0, 0, 0]),
     ];
-    let sound_blob = build_typed_container(0x0400_0057, &sound_elems);
+    let sound_blob = build_typed_container_with_endian(0x0400_0057, &sound_elems, endian);
 
     let mut prefix_21 = Vec::new();
     let slot_tag = parsed
@@ -369,19 +379,23 @@ pub fn import_attachment_from_json(json_str: &str) -> Result<Vec<u8>> {
         .unwrap_or("9872")
         .trim_start_matches('[')
         .trim_end_matches(']');
-    prefix_21.extend_from_slice(&write_length_prefixed_string(slot_tag));
+    prefix_21.extend_from_slice(&endian.write_length_prefixed_string(slot_tag));
     prefix_21.extend_from_slice(&item_resource_blob);
 
     let root_elements = vec![
         (
             20,
-            write_length_prefixed_string(&parsed._engine_metadata.resource_tag),
+            endian.write_length_prefixed_string(&parsed._engine_metadata.resource_tag),
         ),
         (21, prefix_21),
         (30, sound_blob),
     ];
 
-    Ok(build_chunk_from_elements(false, &root_elements))
+    Ok(build_chunk_from_elements_with_endian(
+        false,
+        &root_elements,
+        endian,
+    ))
 }
 
 fn parse_transform_offset(chunk: &[u8]) -> Option<[f32; 3]> {
@@ -397,14 +411,14 @@ fn parse_transform_offset(chunk: &[u8]) -> Option<[f32; 3]> {
     None
 }
 
-fn build_transform_offset(offset: [f32; 3]) -> Vec<u8> {
+fn build_transform_offset(offset: [f32; 3], endian: Endian) -> Vec<u8> {
     let mut out = Vec::with_capacity(15);
     out.push(1);
     out.push(20);
     out.push(0);
-    let _ = out.write_f32::<LittleEndian>(offset[0]);
-    let _ = out.write_f32::<LittleEndian>(offset[1]);
-    let _ = out.write_f32::<LittleEndian>(offset[2]);
+    let _ = endian.write_f32(&mut out, offset[0]);
+    let _ = endian.write_f32(&mut out, offset[1]);
+    let _ = endian.write_f32(&mut out, offset[2]);
     out
 }
 

@@ -9,7 +9,9 @@ use rayon::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::engine::assets::codec::reencode_asset_to_chunk;
 use crate::engine::assets::sniffer::sniff_asset;
+use crate::engine::common::Endian;
 use processors::{RawProcessor, get_standard_processors};
 
 pub fn export_smart_assets(project_dir: &Path) -> Result<usize> {
@@ -28,7 +30,6 @@ pub fn export_smart_assets(project_dir: &Path) -> Result<usize> {
         );
     }
 
-    // Create only the root assets/ directory; subfolders are created by processors as needed.
     fs::create_dir_all(&workspace.assets_dir)?;
 
     let processors = get_standard_processors();
@@ -91,6 +92,22 @@ pub fn sync_assets_to_chunks(project_dir: &Path) -> Result<usize> {
     let vanilla_dir = project_dir.join("chunks_vanilla");
     let working_dir = project_dir.join("chunks");
 
+    // Read platform endianness from project manifest if available
+    let manifest_endian = project_dir
+        .join("project.json")
+        .exists()
+        .then(|| {
+            fs::read_to_string(project_dir.join("project.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| {
+                    v.get("endian")
+                        .and_then(|e| serde_json::from_value::<Endian>(e.clone()).ok())
+                })
+        })
+        .flatten()
+        .unwrap_or(Endian::Little);
+
     for (rel_asset_path, entry) in cache.entries.iter_mut() {
         let chunk_file_name = Path::new(&entry.chunk_rel_path)
             .file_name()
@@ -127,149 +144,15 @@ pub fn sync_assets_to_chunks(project_dir: &Path) -> Result<usize> {
                 fs::read(&working_chunk_path)?
             };
 
-            let updated_chunk = match entry.asset_kind.as_str() {
-                "Character" => {
-                    let json_str = String::from_utf8(asset_bytes)
-                        .context("Character JSON is not valid UTF-8")?;
-                    crate::engine::assets::character::import_character_from_json(
-                        &json_str,
-                        Some(project_dir),
-                    )?
-                }
-                "Attachment" => {
-                    let json_str = String::from_utf8(asset_bytes)
-                        .context("Attachment JSON is not valid UTF-8")?;
-                    crate::engine::assets::attachment::import_attachment_from_json(&json_str)?
-                }
-                "Texture" => crate::engine::assets::texture::replace_texture_in_chunk(
-                    &baseline_chunk,
-                    &asset_bytes,
-                )?,
-                "Audio" => {
-                    crate::engine::assets::audio::replace_wav(&baseline_chunk, &asset_bytes)?
-                }
-                "Material" => {
-                    let json_str = String::from_utf8(asset_bytes)
-                        .context("Material JSON is not valid UTF-8")?;
-                    crate::engine::assets::material::import_material_from_json(&json_str)?
-                }
-                "Mesh" => {
-                    if rel_asset_path.ends_with(".glb") {
-                        crate::engine::assets::mesh::import_glb_to_mesh(
-                            &baseline_chunk,
-                            &asset_bytes,
-                        )?
-                    } else {
-                        let obj_str = String::from_utf8(asset_bytes)
-                            .context("OBJ file is not valid UTF-8")?;
-                        crate::engine::assets::mesh::import_obj_to_mesh(&baseline_chunk, &obj_str)?
-                    }
-                }
-                "Lua" => {
-                    let bytecode = if rel_asset_path.ends_with(".lua") {
-                        match crate::engine::assets::lua::compile_lua_script(&abs_asset_path) {
-                            Ok(compiled_bin) => compiled_bin,
-                            Err(e) => {
-                                eprintln!("[!] {}", e);
-                                let luac_path = abs_asset_path.with_extension("luac");
-                                if luac_path.exists() {
-                                    fs::read(luac_path)?
-                                } else {
-                                    bail!("Cannot sync Lua script: {}", e);
-                                }
-                            }
-                        }
-                    } else {
-                        asset_bytes
-                    };
-                    crate::engine::assets::lua::replace_lua_bytecode(&baseline_chunk, &bytecode)?
-                }
-                "UI" => {
-                    let json_str =
-                        String::from_utf8(asset_bytes).context("UI JSON is not valid UTF-8")?;
-                    crate::engine::assets::ui::import_ui_from_json(&json_str)?
-                }
-                "Object" => {
-                    let json_str =
-                        String::from_utf8(asset_bytes).context("Object JSON is not valid UTF-8")?;
-                    crate::engine::assets::object::import_object_from_json(&json_str)?
-                }
-                "TerrainPalette" => {
-                    let json_str = String::from_utf8(asset_bytes)
-                        .context("Terrain Palette JSON is not valid UTF-8")?;
-                    crate::engine::assets::terrain_palette::import_terrain_palette_from_json(
-                        &json_str,
-                    )?
-                }
-                "Vfx" => {
-                    let json_str =
-                        String::from_utf8(asset_bytes).context("VFX JSON is not valid UTF-8")?;
-                    crate::engine::assets::vfx::import_vfx_from_json(&json_str)?
-                }
-                "Event" => {
-                    let json_str =
-                        String::from_utf8(asset_bytes).context("Event JSON is not valid UTF-8")?;
-                    crate::engine::assets::event::import_event_from_json(&json_str)?
-                }
-                "Collision" => {
-                    let json_str = String::from_utf8(asset_bytes)
-                        .context("Collision JSON is not valid UTF-8")?;
-                    crate::engine::assets::collision::import_collision_from_json(
-                        &json_str,
-                        &baseline_chunk,
-                    )?
-                }
-                "Font" => {
-                    let json_str =
-                        String::from_utf8(asset_bytes).context("Font JSON is not valid UTF-8")?;
-                    crate::engine::assets::font::import_font_from_json(&json_str, &baseline_chunk)?
-                }
-                "FaceFx" => {
-                    let fxe_path = abs_asset_path.with_extension("fxe");
-                    if fxe_path.exists() {
-                        let fxe_data = fs::read(&fxe_path)?;
-                        if let Some(pos) = baseline_chunk.windows(4).position(|w| w == b"FACE") {
-                            let mut new_chunk = baseline_chunk[..pos].to_vec();
-                            new_chunk.extend_from_slice(&fxe_data);
-                            new_chunk
-                        } else {
-                            baseline_chunk
-                        }
-                    } else {
-                        baseline_chunk
-                    }
-                }
-                "Animation" => baseline_chunk,
-                "Dta" => {
-                    let json_str =
-                        String::from_utf8(asset_bytes).context("DTA JSON is not valid UTF-8")?;
-                    crate::engine::assets::dta::import_dta_from_json(&json_str, &baseline_chunk)?
-                }
-                "VoicePackage" => {
-                    let json_str = String::from_utf8(asset_bytes)
-                        .context("Voice Package JSON is not valid UTF-8")?;
-                    crate::engine::assets::vpk::import_vpk_from_json(&json_str, &baseline_chunk)?
-                }
-                "M8ldMap" => {
-                    let xml_str = String::from_utf8(asset_bytes)
-                        .context("M8LD XML file is not valid UTF-8")?;
-                    let crc = if baseline_chunk.len() >= 8 && baseline_chunk.starts_with(b"M8LD") {
-                        u32::from_le_bytes(baseline_chunk[4..8].try_into().unwrap_or_default())
-                    } else {
-                        0x3707714B
-                    };
-                    crate::engine::assets::m8ld::compile_xml_to_8ld(&xml_str, crc)
-                }
-                "Parameter" => crate::engine::assets::parameter::import_parameter_from_json(
-                    &asset_bytes,
-                    &baseline_chunk,
-                )?,
-                "Xml" => {
-                    crate::engine::assets::xml::import_xml_payload(&baseline_chunk, &asset_bytes)?
-                }
-                "Raw" => asset_bytes,
-                _ => continue,
-            };
+            // DRY: Dispatch to unified codec with target platform endianness
+            let updated_chunk = reencode_asset_to_chunk(
+                entry.asset_kind,
+                &baseline_chunk,
+                &asset_bytes,
+                manifest_endian,
+                Some(project_dir),
+                Some(rel_asset_path),
+            )?;
 
             fs::write(&working_chunk_path, updated_chunk)?;
             entry.is_modified = true;

@@ -1,0 +1,34 @@
+import { CustomButton } from "../../components/buttons.slint";
+import { SectionTitle } from "../../components/common.slint";
+
+export component AudioInspectorView inherits VerticalLayout {
+    callback export_clicked();
+    callback import_clicked();
+
+    spacing: 12px;
+    alignment: start;
+
+    SectionTitle {
+        text: "AUDIO EXTRACTION & REPLACEMENT";
+        text-color: #3e6a90;
+    }
+
+    HorizontalLayout {
+        spacing: 8px;
+        CustomButton {
+            icon: "📥";
+            text: "Export to .WAV";
+            primary-color: #3e6a90;
+            min-w: 125px;
+            clicked => { root.export_clicked(); }
+        }
+
+        CustomButton {
+            icon: "📤";
+            text: "Replace from .WAV";
+            primary-color: #23a55a;
+            min-w: 135px;
+            clicked => { root.import_clicked(); }
+        }
+    }
+}

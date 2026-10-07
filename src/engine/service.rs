@@ -5,30 +5,94 @@ use walkdir::WalkDir;
 
 use crate::engine::assets::animation::{export_animation_to_glb, export_animation_to_json};
 use crate::engine::assets::audio::{export_wav, replace_wav};
-use crate::engine::assets::collision::{
-    export_collision_to_glb, import_collision_from_glb, import_collision_from_json,
-};
-use crate::engine::assets::dta::{export_dta_to_json, import_dta_from_json};
-use crate::engine::assets::environment::import_environment_from_json;
-use crate::engine::assets::font::import_font_from_json;
+use crate::engine::assets::codec::reencode_asset_to_chunk;
+use crate::engine::assets::collision::{export_collision_to_glb, import_collision_from_glb};
+use crate::engine::assets::dta::export_dta_to_json;
 use crate::engine::assets::lua::{compile_lua_script, extract_lua_bytecode, replace_lua_bytecode};
 use crate::engine::assets::m8ld::{
-    M8LD_MAGIC, M8ldMetaJson, compile_xml_to_8ld, decompile_8ld_to_xml, import_m8ld_from_json,
+    M8LD_MAGIC, M8ldMetaJson, compile_xml_to_8ld, decompile_8ld_to_xml,
 };
-use crate::engine::assets::material::import_material_from_json;
 use crate::engine::assets::mesh::{
     MeshStats, export_mesh_to_glb, export_mesh_to_obj, import_glb_to_mesh, import_obj_to_mesh,
 };
-use crate::engine::assets::object::import_object_from_json;
+use crate::engine::assets::sniffer::AssetKind;
 use crate::engine::assets::terrain::{
     export_terrain_to_glb, export_terrain_to_obj, import_terrain_from_glb, import_terrain_heightmap,
 };
-use crate::engine::assets::terrain_palette::import_terrain_palette_from_json;
 use crate::engine::assets::texture::{export_to_dds, replace_texture_in_chunk};
-use crate::engine::assets::ui::import_ui_from_json;
-use crate::engine::assets::ui_sprite::import_ui_sprite_collection;
-use crate::engine::assets::vpk::{export_vpk_to_json, import_vpk_from_json};
+use crate::engine::assets::vpk::export_vpk_to_json;
 use crate::engine::common::Endian;
+
+// --- High-level JSON/Payload Chunk Saver via Unified Codec ---
+fn save_asset_payload(kind: AssetKind, chunk_path: &Path, payload: &[u8]) -> Result<()> {
+    let baseline = if chunk_path.exists() {
+        fs::read(chunk_path)?
+    } else {
+        Vec::new()
+    };
+    let updated = reencode_asset_to_chunk(
+        kind,
+        &baseline,
+        payload,
+        Endian::Little,
+        chunk_path.parent(),
+        None,
+    )?;
+    fs::write(chunk_path, updated)?;
+    Ok(())
+}
+
+pub fn save_material(chunk_path: &Path, json_data: &str) -> Result<()> {
+    save_asset_payload(AssetKind::Material, chunk_path, json_data.as_bytes())
+}
+
+pub fn save_ui(chunk_path: &Path, json_data: &str) -> Result<()> {
+    save_asset_payload(AssetKind::UI, chunk_path, json_data.as_bytes())
+}
+
+pub fn save_object(chunk_path: &Path, json_data: &str) -> Result<()> {
+    save_asset_payload(AssetKind::Object, chunk_path, json_data.as_bytes())
+}
+
+pub fn save_character(chunk_path: &Path, json_data: &str) -> Result<()> {
+    save_asset_payload(AssetKind::Character, chunk_path, json_data.as_bytes())
+}
+
+pub fn save_attachment(chunk_path: &Path, json_data: &str) -> Result<()> {
+    save_asset_payload(AssetKind::Attachment, chunk_path, json_data.as_bytes())
+}
+
+pub fn save_terrain_palette(chunk_path: &Path, json_data: &str) -> Result<()> {
+    save_asset_payload(AssetKind::TerrainPalette, chunk_path, json_data.as_bytes())
+}
+
+pub fn save_collision(chunk_path: &Path, json_data: &str) -> Result<()> {
+    save_asset_payload(AssetKind::Collision, chunk_path, json_data.as_bytes())
+}
+
+pub fn save_font(chunk_path: &Path, json_data: &str) -> Result<()> {
+    save_asset_payload(AssetKind::Font, chunk_path, json_data.as_bytes())
+}
+
+pub fn save_environment(chunk_path: &Path, json_data: &str) -> Result<()> {
+    save_asset_payload(AssetKind::Environment, chunk_path, json_data.as_bytes())
+}
+
+pub fn save_m8ld(chunk_path: &Path, xml_or_json_data: &str) -> Result<()> {
+    save_asset_payload(AssetKind::M8ldMap, chunk_path, xml_or_json_data.as_bytes())
+}
+
+pub fn save_ui_sprite(chunk_path: &Path, json_data: &str) -> Result<()> {
+    save_asset_payload(AssetKind::UiSprite, chunk_path, json_data.as_bytes())
+}
+
+pub fn save_dta(chunk_path: &Path, json_data: &str) -> Result<()> {
+    save_asset_payload(AssetKind::Dta, chunk_path, json_data.as_bytes())
+}
+
+pub fn save_vpk(chunk_path: &Path, json_data: &str) -> Result<()> {
+    save_asset_payload(AssetKind::VoicePackage, chunk_path, json_data.as_bytes())
+}
 
 pub fn export_texture(chunk_path: &Path, out_path: &Path) -> Result<()> {
     let data = fs::read(chunk_path).with_context(|| format!("Failed to read {:?}", chunk_path))?;
@@ -169,57 +233,6 @@ pub fn export_anim_json(chunk_path: &Path, out_path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn save_material(chunk_path: &Path, json_data: &str) -> Result<()> {
-    let bin = import_material_from_json(json_data)?;
-    fs::write(chunk_path, bin)?;
-    Ok(())
-}
-
-pub fn save_ui(chunk_path: &Path, json_data: &str) -> Result<()> {
-    let bin = import_ui_from_json(json_data)?;
-    fs::write(chunk_path, bin)?;
-    Ok(())
-}
-
-pub fn save_object(chunk_path: &Path, json_data: &str) -> Result<()> {
-    let bin = import_object_from_json(json_data)?;
-    fs::write(chunk_path, bin)?;
-    Ok(())
-}
-
-pub fn save_terrain_palette(chunk_path: &Path, json_data: &str) -> Result<()> {
-    let bin = import_terrain_palette_from_json(json_data)?;
-    fs::write(chunk_path, bin)?;
-    Ok(())
-}
-
-pub fn save_collision(chunk_path: &Path, json_data: &str) -> Result<()> {
-    let baseline = fs::read(chunk_path)?;
-    let bin = import_collision_from_json(json_data, &baseline)?;
-    fs::write(chunk_path, bin)?;
-    Ok(())
-}
-
-pub fn save_font(chunk_path: &Path, json_data: &str) -> Result<()> {
-    let baseline = fs::read(chunk_path)?;
-    let bin = import_font_from_json(json_data, &baseline)?;
-    fs::write(chunk_path, bin)?;
-    Ok(())
-}
-
-pub fn save_environment(chunk_path: &Path, json_data: &str) -> Result<()> {
-    let baseline = fs::read(chunk_path)?;
-    let bin = import_environment_from_json(json_data, &baseline)?;
-    fs::write(chunk_path, bin)?;
-    Ok(())
-}
-
-pub fn save_m8ld(chunk_path: &Path, xml_or_json_data: &str) -> Result<()> {
-    let bin = import_m8ld_from_json(xml_or_json_data)?;
-    fs::write(chunk_path, bin)?;
-    Ok(())
-}
-
 pub fn export_dta(chunk_path: &Path, out_path: &Path) -> Result<()> {
     let data = fs::read(chunk_path).with_context(|| format!("Failed to read {:?}", chunk_path))?;
     let stem = chunk_path.file_stem().unwrap_or_default().to_string_lossy();
@@ -228,24 +241,10 @@ pub fn export_dta(chunk_path: &Path, out_path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn save_dta(chunk_path: &Path, json_data: &str) -> Result<()> {
-    let baseline = fs::read(chunk_path)?;
-    let bin = import_dta_from_json(json_data, &baseline)?;
-    fs::write(chunk_path, bin)?;
-    Ok(())
-}
-
 pub fn export_vpk(chunk_path: &Path, out_path: &Path) -> Result<()> {
     let data = fs::read(chunk_path).with_context(|| format!("Failed to read {:?}", chunk_path))?;
     let json_str = export_vpk_to_json(&data)?;
     fs::write(out_path, json_str.as_bytes())?;
-    Ok(())
-}
-
-pub fn save_vpk(chunk_path: &Path, json_data: &str) -> Result<()> {
-    let baseline = fs::read(chunk_path)?;
-    let bin = import_vpk_from_json(json_data, &baseline)?;
-    fs::write(chunk_path, bin)?;
     Ok(())
 }
 
@@ -264,10 +263,8 @@ pub fn decompile_8ld_file(src_path: &Path, dst_path: &Path) -> Result<PathBuf> {
         fs::create_dir_all(parent)?;
     }
 
-    // 1. Write clean XML text document
     fs::write(&target_file, xml_str.as_bytes())?;
 
-    // 2. Write companion .meta.json file alongside the .xml
     let meta_path = target_file.with_extension("meta.json");
     let meta = M8ldMetaJson {
         magic: "M8LD".to_string(),
@@ -297,7 +294,6 @@ pub fn compile_8ld_file(src_path: &Path, dst_path: &Path) -> Result<PathBuf> {
         fs::create_dir_all(parent)?;
     }
 
-    // Recover seed from companion .meta.json, target container header, or fallback to default
     let meta_path = src_path.with_extension("meta.json");
     let seed = if meta_path.exists()
         && let Ok(meta_str) = fs::read_to_string(&meta_path)
@@ -319,8 +315,6 @@ pub fn compile_8ld_file(src_path: &Path, dst_path: &Path) -> Result<PathBuf> {
     Ok(target_file)
 }
 
-/// Recursively batch-converts all .8ld files in `src_dir` into .xml files in `dst_dir`,
-/// preserving the exact subfolder structure.
 pub fn batch_decompile_8ld(src_dir: &Path, dst_dir: &Path) -> Result<usize> {
     fs::create_dir_all(dst_dir)?;
     let mut count = 0;
@@ -344,8 +338,6 @@ pub fn batch_decompile_8ld(src_dir: &Path, dst_dir: &Path) -> Result<usize> {
     Ok(count)
 }
 
-/// Recursively batch-converts all .xml files in `src_dir` into .8ld files in `dst_dir`,
-/// preserving the exact subfolder structure.
 pub fn batch_compile_8ld(src_dir: &Path, dst_dir: &Path) -> Result<usize> {
     fs::create_dir_all(dst_dir)?;
     let mut count = 0;
@@ -367,10 +359,4 @@ pub fn batch_compile_8ld(src_dir: &Path, dst_dir: &Path) -> Result<usize> {
     }
 
     Ok(count)
-}
-
-pub fn save_ui_sprite(chunk_path: &Path, json_data: &str) -> Result<()> {
-    let bin = import_ui_sprite_collection(json_data)?;
-    fs::write(chunk_path, bin)?;
-    Ok(())
 }
