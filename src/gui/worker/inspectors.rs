@@ -7,6 +7,7 @@ use slint::{Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
 
 use crate::AppWindow;
 use crate::engine::assets::animation::run_deep_skeleton_diagnostics;
+use crate::engine::assets::character::export_character;
 use crate::engine::assets::sniffer::AssetKind;
 use crate::gui::worker::preview;
 use crate::gui::worker::viewport;
@@ -42,6 +43,45 @@ pub fn handle_select_asset(
         let mut st = state.lock();
         st.active_mesh = None;
     }
+
+    // Resolve and populate interactive Asset Links from dependency graph
+    let links: Vec<crate::AssetLinkItem> = {
+        let mut st = state.lock();
+        if st.dependency_graph.is_none()
+            && let Some(ref proj) = st.current_proj_dir
+        {
+            let graph_path = proj.join("assets").join("dependency_graph.json");
+            if graph_path.exists()
+                && let Ok(content) = fs::read_to_string(&graph_path)
+                && let Ok(g) = serde_json::from_str(&content)
+            {
+                st.dependency_graph = Some(g);
+            }
+        }
+
+        if let Some(ref graph) = st.dependency_graph {
+            let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+            graph
+                .find_links_for_asset(&stem)
+                .into_iter()
+                .map(|l| crate::AssetLinkItem {
+                    label: l.label.into(),
+                    target_name: l.target_name.into(),
+                    category: l.category.into(),
+                    icon: l.icon.into(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
+    };
+
+    let ui_links = ui_handle.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = ui_links.upgrade() {
+            ui.set_active_asset_links(ModelRc::from(std::rc::Rc::new(VecModel::from(links))));
+        }
+    });
 
     let mut ctx = InspectorContext {
         ui_handle,
@@ -108,6 +148,7 @@ fn inspect_texture(ctx: &InspectorContext) {
             ui.set_tex_info(tex_desc.into());
             ui.set_has_texture(ok);
             ui.set_has_animations(false);
+            ui.set_has_rigs(false);
         }
     });
 }
@@ -129,11 +170,20 @@ fn inspect_mesh(ctx: &mut InspectorContext) {
     {
         let (_, has_composite) = preview::build_composite_mesh_assembly(&stem, proj_dir.as_deref());
 
+        // Discover all project rigs (embedded mesh rig, objects/*.json, and chunks/*.bin)
+        let discovered_rigs =
+            preview::discover_all_project_rigs(&submesh.bones, proj_dir.as_deref());
+        let has_rigs = !discovered_rigs.is_empty();
+
         if submesh.bones.is_empty()
-            && let Some(master_bones) =
-                preview::find_master_skeleton_for_mesh(&stem, proj_dir.as_deref())
+            && let Some(first_rig) = discovered_rigs.first()
         {
-            submesh.bones = master_bones;
+            submesh.bones = first_rig.bones.clone();
+        }
+
+        let mut rig_names: Vec<slint::SharedString> = Vec::new();
+        for (i, r) in discovered_rigs.iter().enumerate() {
+            rig_names.push(format!("{}: {}", i + 1, r.name).into());
         }
 
         let stats_lines = preview::build_stats_lines(std::slice::from_ref(&submesh));
@@ -159,6 +209,8 @@ fn inspect_mesh(ctx: &mut InspectorContext) {
             composite_name: stem.to_string(),
             available_clips: clips,
             current_clip_index: None,
+            available_rigs: discovered_rigs,
+            current_rig_index: if has_rigs { Some(0) } else { None },
             current_time_seconds: 0.0,
             is_playing: false,
             playback_speed: 1.0,
@@ -204,6 +256,9 @@ fn inspect_mesh(ctx: &mut InspectorContext) {
                 ui.set_mesh_info(mesh_info.into());
                 ui.set_has_composite_available(has_composite);
                 ui.set_is_composite_active(false);
+                ui.set_has_rigs(has_rigs);
+                ui.set_available_rigs(ModelRc::from(std::rc::Rc::new(VecModel::from(rig_names))));
+                ui.set_selected_rig_idx(0);
                 ui.set_has_animations(has_clips);
                 ui.set_is_anim_playing(false);
                 ui.set_available_animations(ModelRc::from(std::rc::Rc::new(VecModel::from(
@@ -236,11 +291,30 @@ fn inspect_object_or_character(ctx: &mut InspectorContext, kind: AssetKind) {
     let (composite_submeshes, has_composite) =
         preview::build_composite_mesh_assembly(&stem, proj_dir.as_deref());
 
+    let mut char_opt = None;
     let json = if kind == AssetKind::Character {
-        crate::engine::assets::character::export_character_to_json(ctx.bytes, &stem)
-            .unwrap_or_default()
+        if let Ok(extracted) = export_character(ctx.bytes, &stem) {
+            if let Some(ref handle) = extracted.character.entity_handle {
+                ctx.logger.log(&format!(
+                    "[*] Recognized Map Entity UID: {}#{} (Handle: {})",
+                    handle.domain_tag, handle.uid, handle.raw_hex
+                ));
+            }
+            char_opt = Some(extracted.character.clone());
+            serde_json::to_string_pretty(&extracted.character).unwrap_or_default()
+        } else {
+            String::new()
+        }
+    } else if let Ok(extracted) = crate::engine::assets::object::export_object(ctx.bytes) {
+        if let Some(ref handle) = extracted.entity.entity_handle {
+            ctx.logger.log(&format!(
+                "[*] Recognized Map Entity UID: {}#{} (Handle: {})",
+                handle.domain_tag, handle.uid, handle.raw_hex
+            ));
+        }
+        serde_json::to_string_pretty(&extracted.entity).unwrap_or_default()
     } else {
-        crate::engine::assets::object::export_object_to_json(ctx.bytes).unwrap_or_default()
+        String::new()
     };
 
     let clips = preview::discover_companion_animations(&display_name, &stem, proj_dir.as_deref());
@@ -252,6 +326,22 @@ fn inspect_object_or_character(ctx: &mut InspectorContext, kind: AssetKind) {
         clip_names.push(format!("{}: {} ({:.2}s)", i + 1, c.name, c.duration_seconds).into());
     }
 
+    let discovered_rigs = preview::discover_all_project_rigs(
+        composite_submeshes
+            .first()
+            .map(|s| s.bones.as_slice())
+            .unwrap_or(&[]),
+        proj_dir.as_deref(),
+    );
+    let has_rigs = !discovered_rigs.is_empty();
+
+    let mut rig_names: Vec<slint::SharedString> = Vec::new();
+    for (i, r) in discovered_rigs.iter().enumerate() {
+        rig_names.push(format!("{}: {}", i + 1, r.name).into());
+    }
+
+    let active_kind_id = if kind == AssetKind::Character { 18 } else { 7 };
+
     if has_composite && !composite_submeshes.is_empty() {
         let mut preview = ActiveMeshPreview {
             submeshes: composite_submeshes,
@@ -259,6 +349,8 @@ fn inspect_object_or_character(ctx: &mut InspectorContext, kind: AssetKind) {
             composite_name: stem.to_string(),
             available_clips: clips,
             current_clip_index: None,
+            available_rigs: discovered_rigs,
+            current_rig_index: if has_rigs { Some(0) } else { None },
             current_time_seconds: 0.0,
             is_playing: false,
             playback_speed: 1.0,
@@ -285,11 +377,34 @@ fn inspect_object_or_character(ctx: &mut InspectorContext, kind: AssetKind) {
             if let Some(ui) = ui_h.upgrade() {
                 ui.set_selected_index(filtered_index);
                 ui.set_active_file_path(p_str.into());
-                ui.set_active_kind_id(7);
+                ui.set_active_kind_id(active_kind_id);
                 ui.set_mat_json_text(json.into());
+
+                if let Some(ref char_data) = char_opt {
+                    ui.set_form_char_name(char_data.character_name.clone().into());
+                    ui.set_form_char_tag(char_data.resource_tag.clone().unwrap_or_default().into());
+                    if let Some(ref a) = char_data.combat_attributes {
+                        ui.set_form_char_health(a.base_health.unwrap_or(100.0));
+                        ui.set_form_char_speed(a.move_speed_scale.unwrap_or(1.0));
+                        ui.set_form_char_aggro(a.aggro_range.unwrap_or(15.0));
+                        ui.set_form_char_perception(a.perception_radius.unwrap_or(20.0));
+                        ui.set_form_char_damage_mult(a.damage_multiplier.unwrap_or(1.0));
+                        ui.set_form_char_faction_id(a.faction_id.unwrap_or(0) as i32);
+                        ui.set_form_char_can_swim(a.can_swim.unwrap_or(false));
+                    }
+                    if let Some(ref f) = char_data.actor_flags {
+                        ui.set_form_char_shadows(f.casts_dynamic_shadows);
+                        ui.set_form_char_targetable(f.can_be_targeted);
+                        ui.set_form_char_ragdoll(f.ragdoll_on_death);
+                    }
+                }
+
                 ui.set_has_mesh(true);
                 ui.set_has_composite_available(true);
                 ui.set_is_composite_active(true);
+                ui.set_has_rigs(has_rigs);
+                ui.set_available_rigs(ModelRc::from(std::rc::Rc::new(VecModel::from(rig_names))));
+                ui.set_selected_rig_idx(0);
                 ui.set_has_animations(has_clips);
                 ui.set_is_anim_playing(false);
                 ui.set_available_animations(ModelRc::from(std::rc::Rc::new(VecModel::from(
@@ -308,10 +423,31 @@ fn inspect_object_or_character(ctx: &mut InspectorContext, kind: AssetKind) {
             if let Some(ui) = ui_h.upgrade() {
                 ui.set_selected_index(filtered_index);
                 ui.set_active_file_path(p_str.into());
-                ui.set_active_kind_id(7);
+                ui.set_active_kind_id(active_kind_id);
                 ui.set_mat_json_text(json.into());
+
+                if let Some(ref char_data) = char_opt {
+                    ui.set_form_char_name(char_data.character_name.clone().into());
+                    ui.set_form_char_tag(char_data.resource_tag.clone().unwrap_or_default().into());
+                    if let Some(ref a) = char_data.combat_attributes {
+                        ui.set_form_char_health(a.base_health.unwrap_or(100.0));
+                        ui.set_form_char_speed(a.move_speed_scale.unwrap_or(1.0));
+                        ui.set_form_char_aggro(a.aggro_range.unwrap_or(15.0));
+                        ui.set_form_char_perception(a.perception_radius.unwrap_or(20.0));
+                        ui.set_form_char_damage_mult(a.damage_multiplier.unwrap_or(1.0));
+                        ui.set_form_char_faction_id(a.faction_id.unwrap_or(0) as i32);
+                        ui.set_form_char_can_swim(a.can_swim.unwrap_or(false));
+                    }
+                    if let Some(ref f) = char_data.actor_flags {
+                        ui.set_form_char_shadows(f.casts_dynamic_shadows);
+                        ui.set_form_char_targetable(f.can_be_targeted);
+                        ui.set_form_char_ragdoll(f.ragdoll_on_death);
+                    }
+                }
+
                 ui.set_has_composite_available(false);
                 ui.set_has_animations(false);
+                ui.set_has_rigs(false);
             }
         });
     }
@@ -327,6 +463,7 @@ fn inspect_audio(ctx: &InspectorContext) {
             ui.set_active_file_path(p_str.into());
             ui.set_active_kind_id(1);
             ui.set_has_animations(false);
+            ui.set_has_rigs(false);
         }
     });
 }
@@ -344,6 +481,7 @@ fn inspect_material(ctx: &InspectorContext) {
             ui.set_active_kind_id(2);
             ui.set_mat_json_text(json.into());
             ui.set_has_animations(false);
+            ui.set_has_rigs(false);
         }
     });
 }
@@ -361,6 +499,7 @@ fn inspect_lua(ctx: &InspectorContext) {
             ui.set_active_kind_id(4);
             ui.set_mat_json_text(disasm.into());
             ui.set_has_animations(false);
+            ui.set_has_rigs(false);
         }
     });
 }
@@ -377,6 +516,7 @@ fn inspect_ui(ctx: &InspectorContext) {
             ui.set_active_kind_id(6);
             ui.set_mat_json_text(json.into());
             ui.set_has_animations(false);
+            ui.set_has_rigs(false);
         }
     });
 }
@@ -384,6 +524,9 @@ fn inspect_ui(ctx: &InspectorContext) {
 fn inspect_attachment(ctx: &InspectorContext) {
     let json =
         crate::engine::assets::attachment::export_attachment_to_json(ctx.bytes).unwrap_or_default();
+    let item_opt: Option<crate::engine::assets::attachment::ItemAttachmentJson> =
+        serde_json::from_str(&json).ok();
+
     let ui_h = ctx.ui_handle.clone();
     let p_str = ctx.path_str.to_string();
     let filtered_index = ctx.filtered_index;
@@ -391,9 +534,27 @@ fn inspect_attachment(ctx: &InspectorContext) {
         if let Some(ui) = ui_h.upgrade() {
             ui.set_selected_index(filtered_index);
             ui.set_active_file_path(p_str.into());
-            ui.set_active_kind_id(7);
+            ui.set_active_kind_id(16);
             ui.set_mat_json_text(json.into());
+
+            if let Some(ref item) = item_opt {
+                ui.set_form_item_name(item.item_name.clone().into());
+                ui.set_form_item_mesh_pkg(item.mesh_package.clone().into());
+                ui.set_form_item_submesh(item.submesh_name.clone().into());
+                ui.set_form_item_sound_bank(item.sound_bank.clone().into());
+                ui.set_form_item_mount_point(item.socket.mount_point.clone().into());
+                ui.set_form_item_pickable(item.flags.is_pickable);
+                ui.set_form_item_shadows(item.flags.cast_shadows);
+                ui.set_form_item_physics(item.flags.drop_physics);
+                if let Some(ref w) = item.weapon_config {
+                    ui.set_form_item_damage(w.damage_multiplier.unwrap_or(1.0));
+                    ui.set_form_item_range(w.attack_range.unwrap_or(2.5));
+                    ui.set_form_item_speed_mod(w.speed_modifier.unwrap_or(1.0));
+                }
+            }
+
             ui.set_has_animations(false);
+            ui.set_has_rigs(false);
         }
     });
 }
@@ -423,6 +584,7 @@ fn inspect_animation(ctx: &InspectorContext) {
             ui.set_mesh_info(info.into());
             ui.set_mat_json_text(json.into());
             ui.set_has_animations(false);
+            ui.set_has_rigs(false);
         }
     });
 }
@@ -440,6 +602,7 @@ fn inspect_terrain_palette(ctx: &InspectorContext) {
             ui.set_active_kind_id(9);
             ui.set_mat_json_text(json.into());
             ui.set_has_animations(false);
+            ui.set_has_rigs(false);
         }
     });
 }
@@ -457,6 +620,7 @@ fn inspect_collision(ctx: &InspectorContext) {
             ui.set_active_kind_id(10);
             ui.set_mat_json_text(json.into());
             ui.set_has_animations(false);
+            ui.set_has_rigs(false);
         }
     });
 }
@@ -474,6 +638,7 @@ fn inspect_environment(ctx: &InspectorContext) {
             ui.set_active_kind_id(11);
             ui.set_mat_json_text(json.into());
             ui.set_has_animations(false);
+            ui.set_has_rigs(false);
         }
     });
 }
@@ -492,6 +657,7 @@ fn inspect_m8ld(ctx: &InspectorContext) {
             ui.set_active_kind_id(12);
             ui.set_mat_json_text(xml_str.into());
             ui.set_has_animations(false);
+            ui.set_has_rigs(false);
         }
     });
 }
@@ -509,6 +675,7 @@ fn inspect_ui_sprite(ctx: &InspectorContext) {
             ui.set_active_kind_id(13);
             ui.set_mat_json_text(json.into());
             ui.set_has_animations(false);
+            ui.set_has_rigs(false);
         }
     });
 }
@@ -527,6 +694,7 @@ fn inspect_dta(ctx: &InspectorContext) {
             ui.set_active_kind_id(14);
             ui.set_mat_json_text(json.into());
             ui.set_has_animations(false);
+            ui.set_has_rigs(false);
         }
     });
 }
@@ -544,6 +712,7 @@ fn inspect_vpk(ctx: &InspectorContext) {
             ui.set_active_kind_id(15);
             ui.set_mat_json_text(json.into());
             ui.set_has_animations(false);
+            ui.set_has_rigs(false);
         }
     });
 }
@@ -558,6 +727,7 @@ fn inspect_generic(ctx: &InspectorContext) {
             ui.set_active_file_path(p_str.into());
             ui.set_active_kind_id(5);
             ui.set_has_animations(false);
+            ui.set_has_rigs(false);
         }
     });
 }

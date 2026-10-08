@@ -70,7 +70,10 @@ pub enum WorkerCommand {
         generation: u64,
     },
 
-    // Real-Time Viewport Animation Playback Commands
+    // Viewport Rig & Animation Commands
+    SelectRig {
+        rig_index: i32,
+    },
     SelectAnimation {
         clip_index: i32,
     },
@@ -253,6 +256,16 @@ pub enum WorkerCommand {
         chunk_path: PathBuf,
         json_data: String,
     },
+    SaveCharacter {
+        chunk_path: PathBuf,
+        json_data: String,
+    },
+    SaveAttachment {
+        chunk_path: PathBuf,
+        json_data: String,
+    },
+    SaveCharacterFromForm,
+    SaveAttachmentFromForm,
     SaveTerrainPalette {
         chunk_path: PathBuf,
         json_data: String,

@@ -8,6 +8,9 @@ use super::{
     parse_typed_container,
 };
 use crate::engine::common::{Endian, read_length_prefixed_string};
+pub use crate::engine::common::{
+    ItemSocketConfigJson, build_socket_data, parse_f32_safe, parse_socket_data,
+};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ItemAttachmentJson {
@@ -54,14 +57,6 @@ pub struct ItemFlagsJson {
 
 fn default_unmapped_flags() -> String {
     "0x21400000".to_string()
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ItemSocketConfigJson {
-    pub mount_point: String,
-    pub primary_slot: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub secondary_slot: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -143,16 +138,6 @@ pub struct RawAttachmentProp {
     pub hex: String,
 }
 
-pub fn parse_f32_safe(chunk: &[u8]) -> Option<f32> {
-    if chunk.len() >= 4 {
-        let val = f32::from_le_bytes(chunk[0..4].try_into().unwrap_or_default());
-        if val.is_finite() && !val.is_subnormal() && (1e-4..=500_000.0).contains(&val.abs()) {
-            return Some(val);
-        }
-    }
-    None
-}
-
 fn parse_embedded_string(chunk: &[u8]) -> Option<String> {
     if let Ok((_, elements)) = parse_chunk_elements(chunk) {
         for (id, data) in elements {
@@ -178,7 +163,7 @@ fn build_embedded_string(s: &str, endian: Endian) -> Vec<u8> {
     }
 }
 
-fn parse_item_trigger_actions(chunk: &[u8]) -> Vec<ItemTriggerActionJson> {
+pub fn parse_item_trigger_actions(chunk: &[u8]) -> Vec<ItemTriggerActionJson> {
     let mut actions = Vec::new();
     if let Ok((_, sub_parts)) = parse_chunk_elements(chunk) {
         for (_, pdata) in sub_parts {
@@ -218,10 +203,23 @@ fn parse_item_trigger_actions(chunk: &[u8]) -> Vec<ItemTriggerActionJson> {
                                     target_resource = Some(s);
                                 }
                             }
+                        } else if let Some(s) = read_length_prefixed_string(&fdata)
+                            && (action_name.is_empty() || action_name == "Trigger")
+                        {
+                            action_name = s;
+                        }
+                    }
+                    41 => {
+                        if let Some(s) = read_length_prefixed_string(&fdata) {
+                            if action_name.is_empty() || action_name == "Trigger" {
+                                action_name = s;
+                            } else if target_resource.is_none() {
+                                target_resource = Some(s);
+                            }
                         }
                     }
                     20 => {
-                        if action_name.is_empty()
+                        if (action_name.is_empty() || action_name == "Trigger")
                             && let Some(s) = read_length_prefixed_string(&fdata)
                         {
                             action_name = s;
@@ -255,7 +253,7 @@ fn parse_item_trigger_actions(chunk: &[u8]) -> Vec<ItemTriggerActionJson> {
     actions
 }
 
-fn rebuild_item_trigger_actions(
+pub fn rebuild_item_trigger_actions(
     actions: &[ItemTriggerActionJson],
     endian: Endian,
 ) -> Result<Vec<u8>> {
@@ -550,7 +548,6 @@ pub fn export_attachment_to_json(data: &[u8]) -> Result<String> {
         }
 
         for (root_id, chunk_bytes) in &root_elements {
-            // Root element 30 is the sound container (0x04000057), parsed separately below
             if *root_id == 30 {
                 continue;
             }
@@ -569,7 +566,6 @@ pub fn export_attachment_to_json(data: &[u8]) -> Result<String> {
             if let Some(payload) = payload_opt
                 && let Ok((type_id, elements)) = parse_typed_container(payload)
             {
-                // Fix: Only update item_type_id if it's from the item/prop family (0x004620xx)
                 if (type_id >> 8) == 0x004620 {
                     item_type_id = type_id;
                 }
@@ -762,7 +758,6 @@ pub fn export_attachment_to_json(data: &[u8]) -> Result<String> {
         }
     }
 
-    // Fallback item name to submesh name if raw name is placeholder
     if (item_name == "Item" || item_name == "noname") && !submesh_name.is_empty() {
         item_name = submesh_name.clone();
     }
@@ -977,7 +972,6 @@ pub fn import_attachment_from_json_with_endian(json_str: &str, endian: Endian) -
         }
     }
 
-    // Automatically reconstruct empty structural framing containers (IDs 75 & 81) if missing
     if matches!(
         type_id,
         0x00462011 | 0x00462015 | 0x00462017 | 0x0046201B | 0x00462021
@@ -1060,28 +1054,4 @@ fn build_transform_offset(offset: [f32; 3], endian: Endian) -> Vec<u8> {
     let _ = endian.write_f32(&mut out, offset[1]);
     let _ = endian.write_f32(&mut out, offset[2]);
     out
-}
-
-pub fn parse_socket_data(chunk: &[u8]) -> ItemSocketConfigJson {
-    if chunk.len() >= 13 && chunk.starts_with(&[1, 40, 0, 2, 40, 0, 43, 4]) {
-        ItemSocketConfigJson {
-            mount_point: "Right_Hand_Carry".into(),
-            primary_slot: 40,
-            secondary_slot: Some(43),
-        }
-    } else {
-        ItemSocketConfigJson {
-            mount_point: "Standard_Grip".into(),
-            primary_slot: 40,
-            secondary_slot: None,
-        }
-    }
-}
-
-pub fn build_socket_data(socket: &ItemSocketConfigJson) -> Vec<u8> {
-    if socket.secondary_slot.is_some() {
-        vec![1, 40, 0, 2, 40, 0, 43, 4, 1, 1, 0, 0, 0]
-    } else {
-        vec![1, 40, 0, 1, 40, 0, 1, 1, 0, 0]
-    }
 }

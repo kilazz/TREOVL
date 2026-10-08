@@ -11,6 +11,7 @@ import {
 import {
     CollisionInspectorView,
 } from "./views/inspectors/collision_view.slint";
+import { PropertyGridView } from "./views/inspectors/property_grid_view.slint";
 
 export { BoneLabel }
 export struct AssetItem {
@@ -21,6 +22,13 @@ export struct AssetItem {
     size_str: string,
     kind_id: int,
     is_modified: bool,
+}
+
+export struct AssetLinkItem {
+    label: string,
+    target_name: string,
+    category: string,
+    icon: string,
 }
 
 export component AppWindow inherits Window {
@@ -53,6 +61,48 @@ export component AppWindow inherits Window {
     in-out property <string> status_msg: "Ready.";
     in-out property <bool> status_is_error: false;
     in-out property <string> log_text: "System Ready.\n";
+
+    // Interactive Asset Links (Cross-references)
+    in-out property <[AssetLinkItem]> active_asset_links: [];
+    callback navigate_to_asset(string);
+
+    // Visual Form Properties: Character Actor
+    in-out property <string> form_char_name: "";
+    in-out property <string> form_char_tag: "";
+    in-out property <float> form_char_health: 100.0;
+    in-out property <float> form_char_speed: 1.0;
+    in-out property <float> form_char_aggro: 15.0;
+    in-out property <float> form_char_perception: 20.0;
+    in-out property <float> form_char_damage_mult: 1.0;
+    in-out property <int> form_char_faction_id: 0;
+    in-out property <bool> form_char_shadows: true;
+    in-out property <bool> form_char_targetable: true;
+    in-out property <bool> form_char_ragdoll: true;
+    in-out property <bool> form_char_can_swim: false;
+
+    // Visual Form Properties: Item / Weapon Attachment
+    in-out property <string> form_item_name: "";
+    in-out property <string> form_item_mesh_pkg: "";
+    in-out property <string> form_item_submesh: "";
+    in-out property <string> form_item_sound_bank: "";
+    in-out property <string> form_item_mount_point: "Right_Hand_Carry";
+    in-out property <float> form_item_damage: 1.0;
+    in-out property <float> form_item_range: 2.5;
+    in-out property <float> form_item_speed_mod: 1.0;
+    in-out property <bool> form_item_pickable: true;
+    in-out property <bool> form_item_shadows: true;
+    in-out property <bool> form_item_physics: true;
+
+    callback save_character_form();
+    callback save_attachment_form();
+    callback save_character(string, string);
+    callback save_attachment(string, string);
+
+    // Rig Selection State
+    in-out property <bool> has_rigs: false;
+    in-out property <[string]> available_rigs: [];
+    in-out property <int> selected_rig_idx: 0;
+    callback select_active_rig(int);
 
     // 3D Viewport Controls & Composite State
     in-out property <float> viewport_fov: 45.0;
@@ -814,7 +864,7 @@ export component AppWindow inherits Window {
             HorizontalLayout {
                 spacing: 0px;
 
-                // --- LEFT EXPLORER SIDEBAR ---
+                // LEFT EXPLORER SIDEBAR
                 Rectangle {
                     width: root.sidebar_width;
                     background: #2b2d31;
@@ -904,7 +954,7 @@ export component AppWindow inherits Window {
                     target-width <=> root.sidebar_width;
                 }
 
-                // --- RIGHT DYNAMIC INSPECTOR PANE ---
+                // RIGHT DYNAMIC INSPECTOR PANE
                 Rectangle {
                     horizontal-stretch: 1;
                     background: #18191b;
@@ -945,6 +995,64 @@ export component AppWindow inherits Window {
                             }
                         }
 
+                        // INTERACTIVE ASSET LINKS BAR
+                        if root.active_asset_links.length > 0: Rectangle {
+                            background: #1e222a;
+                            border-radius: 5px;
+                            border-width: 1px;
+                            border-color: #2c323b;
+                            height: 38px;
+
+                            HorizontalLayout {
+                                padding-left: 10px;
+                                padding-right: 10px;
+                                spacing: 8px;
+                                alignment: start;
+
+                                Text {
+                                    text: "🔗 Linked:";
+                                    font-size: 11px;
+                                    font-weight: 700;
+                                    color: #949ba4;
+                                    vertical-alignment: center;
+                                }
+
+                                for link in root.active_asset_links: Rectangle {
+                                    height: 24px;
+                                    background: link_ta.has-hover ? #3e6a90 : #2a313d;
+                                    border-radius: 3px;
+                                    border-width: 1px;
+                                    border-color: link_ta.has-hover ? #58a6ff : #3d4655;
+                                    y: (parent.height - self.height) / 2;
+
+                                    HorizontalLayout {
+                                        padding-left: 8px;
+                                        padding-right: 8px;
+                                        spacing: 5px;
+                                        Text {
+                                            text: link.icon;
+                                            font-size: 11px;
+                                            vertical-alignment: center;
+                                        }
+
+                                        Text {
+                                            text: link.label;
+                                            font-family: "Consolas";
+                                            font-size: 10.5px;
+                                            font-weight: 700;
+                                            color: #ffffff;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+
+                                    link_ta := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.navigate_to_asset(link.target_name); }
+                                    }
+                                }
+                            }
+                        }
+
                         Rectangle {
                             height: 1px;
                             background: #353535;
@@ -973,7 +1081,7 @@ export component AppWindow inherits Window {
                             save_clicked => { root.save_material(root.active_file_path, root.mat_json_text); }
                         }
 
-                        // Context 3: 3D Mesh / Composite Viewport
+                        // Context 3, 7, 8: 3D Viewport
                         if root.active_kind_id == 3 || root.active_kind_id == 7 || root.active_kind_id == 8: VerticalLayout {
                             spacing: 8px;
                             vertical-stretch: 1;
@@ -983,7 +1091,7 @@ export component AppWindow inherits Window {
                                 text-color: #f0b132;
                             }
 
-                            // --- ROW 1: FILE & MESH OPERATIONS ---
+                            // ROW 1: FILE & MESH OPERATIONS
                             HorizontalLayout {
                                 spacing: 8px;
                                 alignment: start;
@@ -1022,7 +1130,7 @@ export component AppWindow inherits Window {
                                 }
                             }
 
-                            // --- ROW 2: VIEWPORT DEBUG VISIBILITY TOGGLES ---
+                            // ROW 2: VIEWPORT DEBUG VISIBILITY TOGGLES
                             if root.has_animations: HorizontalLayout {
                                 spacing: 6px;
                                 alignment: start;
@@ -1093,7 +1201,7 @@ export component AppWindow inherits Window {
                                 }
                             }
 
-                            // --- ROW 3: CAMERA & SHADING TOOLBAR ---
+                            // ROW 3: CAMERA & SHADING TOOLBAR
                             Rectangle {
                                 background: #20242c;
                                 border-radius: 6px;
@@ -1107,7 +1215,6 @@ export component AppWindow inherits Window {
                                     spacing: 12px;
                                     alignment: space-between;
 
-                                    // Left: Camera Controls
                                     HorizontalLayout {
                                         spacing: 6px;
                                         alignment: center;
@@ -1182,9 +1289,9 @@ export component AppWindow inherits Window {
                                             }
                                         }
 
-                                        // 4-Mode Viewport Axis Switcher
+                                        // 6-Mode Viewport Axis Switcher
                                         Rectangle {
-                                            width: 160px;
+                                            width: 168px;
                                             height: 26px;
                                             y: (parent.height - self.height) / 2;
                                             background: root.viewport_up_axis == 0 ? #23a55a : (root.viewport_up_axis == 1 ? #d28e1b : (root.viewport_up_axis == 2 ? #5865f2 : #2b303c));
@@ -1192,8 +1299,8 @@ export component AppWindow inherits Window {
                                             border-width: 1px;
                                             border-color: root.viewport_up_axis == 0 ? #57f287 : (root.viewport_up_axis == 1 ? #f0b132 : (root.viewport_up_axis == 2 ? #7983f5 : #3e4450));
                                             Text {
-                                                text: root.viewport_up_axis == 0 ? "📐 Ground (Default)" : (root.viewport_up_axis == 1 ? "📐 Pitch Up (+90°)" : (root.viewport_up_axis == 2 ? "📐 Pitch Down (-90°)" : "📐 Inverted (180°)"));
-                                                font-size: 11px;
+                                                text: root.viewport_up_axis == 0 ? "📐 Ground (Default)" : (root.viewport_up_axis == 1 ? "📐 Pitch Up (+90°)" : (root.viewport_up_axis == 2 ? "📐 Pitch Down (-90°)" : (root.viewport_up_axis == 3 ? "📐 Invert (180°)" : (root.viewport_up_axis == 4 ? "📐 Roll Left (+90°)" : "📐 Roll Right (-90°)"))));
+                                                font-size: 10.5px;
                                                 font-weight: 700;
                                                 color: #ffffff;
                                                 vertical-alignment: center;
@@ -1209,6 +1316,10 @@ export component AppWindow inherits Window {
                                                         root.viewport_up_axis = 2;
                                                     } else if (root.viewport_up_axis == 2) {
                                                         root.viewport_up_axis = 3;
+                                                    } else if (root.viewport_up_axis == 3) {
+                                                        root.viewport_up_axis = 4;
+                                                    } else if (root.viewport_up_axis == 4) {
+                                                        root.viewport_up_axis = 5;
                                                     } else {
                                                         root.viewport_up_axis = 0;
                                                     }
@@ -1218,7 +1329,6 @@ export component AppWindow inherits Window {
                                         }
                                     }
 
-                                    // Middle: FOV Slider
                                     HorizontalLayout {
                                         spacing: 8px;
                                         alignment: center;
@@ -1255,7 +1365,6 @@ export component AppWindow inherits Window {
                                         }
                                     }
 
-                                    // Right: Shading Modes (Studio, Bright, Unlit)
                                     HorizontalLayout {
                                         spacing: 6px;
                                         alignment: center;
@@ -1336,7 +1445,7 @@ export component AppWindow inherits Window {
                                 }
                             }
 
-                            // --- VIEWPORT WITH 3D IMAGE, PINNED BONES & LEFT PANELS ---
+                            // 3D VIEWPORT WITH RENDER TARGET & BONE PINS
                             Rectangle {
                                 background: #111214;
                                 border-radius: 4px;
@@ -1350,12 +1459,19 @@ export component AppWindow inherits Window {
                                     has_mesh: root.has_mesh;
                                     stats_lines: root.mesh_stats_lines;
                                     bone_labels: root.bone_labels;
+                                    has_rigs: root.has_rigs;
+                                    available_rigs: root.available_rigs;
+                                    selected_rig_idx: root.selected_rig_idx;
                                     has_animations: root.has_animations;
                                     available_animations: root.available_animations;
                                     selected_anim_idx: root.selected_anim_idx;
                                     rotate_viewport(dyaw, dpitch) => { root.rotate_mesh_viewport(dyaw, dpitch); }
                                     zoom_viewport(delta) => { root.zoom_mesh_viewport(delta); }
                                     set_interacting(is_active) => { root.set_viewport_interacting(is_active); }
+                                    select_rig(idx) => {
+                                        root.selected_rig_idx = idx;
+                                        root.select_active_rig(idx);
+                                    }
                                     select_animation(idx) => {
                                         root.selected_anim_idx = idx;
                                         root.select_active_animation(idx);
@@ -1363,7 +1479,7 @@ export component AppWindow inherits Window {
                                 }
                             }
 
-                            // --- BLENDER-STYLE ANIMATION TIMELINE & TRANSPORT BAR ---
+                            // ANIMATION TIMELINE BAR
                             if root.has_animations: Rectangle {
                                 height: 56px;
                                 background: #1b1e24;
@@ -1378,12 +1494,10 @@ export component AppWindow inherits Window {
                                     padding-bottom: 5px;
                                     spacing: 4px;
 
-                                    // Top Row: Transport Controls
                                     HorizontalLayout {
                                         spacing: 8px;
                                         alignment: space-between;
 
-                                        // Left: Transport Player Controls
                                         HorizontalLayout {
                                             spacing: 4px;
                                             alignment: start;
@@ -1522,7 +1636,6 @@ export component AppWindow inherits Window {
                                             }
                                         }
 
-                                        // Center: Frame Index / Timecode
                                         HorizontalLayout {
                                             spacing: 6px;
                                             alignment: center;
@@ -1564,7 +1677,6 @@ export component AppWindow inherits Window {
                                             }
                                         }
 
-                                        // Right: Playback Speed Selector
                                         HorizontalLayout {
                                             spacing: 4px;
                                             alignment: end;
@@ -1644,7 +1756,6 @@ export component AppWindow inherits Window {
                                         }
                                     }
 
-                                    // Bottom Row: Interactive Timeline Scrubber
                                     Rectangle {
                                         height: 18px;
                                         background: #111317;
@@ -1800,6 +1911,49 @@ export component AppWindow inherits Window {
                             content <=> root.mat_json_text;
                             save_clicked => { root.save_vpk(root.active_file_path, root.mat_json_text); }
                         }
+
+                        // Context 16: Items & Attachments (Dedicated Visual Property Grid)
+                        if root.active_kind_id == 16: PropertyGridView {
+                            title_text: "ITEM & WEAPON ATTACHMENT (TREITEMRESOURCE)";
+                            title_color: #58a6ff;
+                            is_character: false;
+                            raw_json_text <=> root.mat_json_text;
+                            item_name <=> root.form_item_name;
+                            item_mesh_pkg <=> root.form_item_mesh_pkg;
+                            item_submesh <=> root.form_item_submesh;
+                            item_sound_bank <=> root.form_item_sound_bank;
+                            item_mount_point <=> root.form_item_mount_point;
+                            item_damage_mult <=> root.form_item_damage;
+                            item_attack_range <=> root.form_item_range;
+                            item_speed_mod <=> root.form_item_speed_mod;
+                            item_pickable <=> root.form_item_pickable;
+                            item_shadows <=> root.form_item_shadows;
+                            item_drop_physics <=> root.form_item_physics;
+                            save_form_clicked => { root.save_attachment_form(); }
+                            save_json_clicked => { root.save_attachment(root.active_file_path, root.mat_json_text); }
+                        }
+
+                        // Context 18: Character Actor (Dedicated Visual Property Grid)
+                        if root.active_kind_id == 18: PropertyGridView {
+                            title_text: "CHARACTER & NPC CONTROLLER (TREACTOR)";
+                            title_color: #f0b132;
+                            is_character: true;
+                            raw_json_text <=> root.mat_json_text;
+                            char_name <=> root.form_char_name;
+                            char_tag <=> root.form_char_tag;
+                            char_health <=> root.form_char_health;
+                            char_speed <=> root.form_char_speed;
+                            char_aggro_range <=> root.form_char_aggro;
+                            char_perception <=> root.form_char_perception;
+                            char_damage_mult <=> root.form_char_damage_mult;
+                            char_faction_id <=> root.form_char_faction_id;
+                            char_casts_shadows <=> root.form_char_shadows;
+                            char_targetable <=> root.form_char_targetable;
+                            char_ragdoll <=> root.form_char_ragdoll;
+                            char_can_swim <=> root.form_char_can_swim;
+                            save_form_clicked => { root.save_character_form(); }
+                            save_json_clicked => { root.save_character(root.active_file_path, root.mat_json_text); }
+                        }
                     }
                 }
             }
@@ -1830,7 +1984,6 @@ export component AppWindow inherits Window {
             border-radius: 4px;
             clip: true;
 
-            // Background Smooth Animated Progress Fill
             if root.is_busy: Rectangle {
                 x: 0px;
                 y: 0px;

@@ -9,6 +9,7 @@ const SHADER_SRC: &str = include_str!("shader.wgsl");
 pub struct Vertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
+    pub tangent: [f32; 4],
     pub tex_coords: [f32; 2],
     pub joints: [u32; 4],
     pub weights: [f32; 4],
@@ -39,6 +40,7 @@ pub struct Pipelines {
     pub texture_bind_group_layout: wgpu::BindGroupLayout,
     pub default_sampler: wgpu::Sampler,
     pub default_texture_bind_group: wgpu::BindGroup,
+    pub fallback_normal_view: wgpu::TextureView,
 }
 
 pub fn create_pipelines(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Pipelines> {
@@ -103,9 +105,10 @@ pub fn create_pipelines(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Pi
         ],
     });
 
+    // Texture Bind Group Layout supporting Diffuse and Normal maps
     let texture_bind_group_layout =
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Texture Bind Group Layout"),
+            label: Some("Texture & Normal Map Bind Group Layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -123,6 +126,22 @@ pub fn create_pipelines(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Pi
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
 
@@ -135,14 +154,16 @@ pub fn create_pipelines(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Pi
         ..Default::default()
     });
 
-    let fallback_extent = wgpu::Extent3d {
+    let extent_1x1 = wgpu::Extent3d {
         width: 1,
         height: 1,
         depth_or_array_layers: 1,
     };
+
+    // 1x1 Neutral Gray Diffuse Texture
     let fallback_tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("1x1 Neutral Gray Texture"),
-        size: fallback_extent,
+        size: extent_1x1,
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -164,13 +185,43 @@ pub fn create_pipelines(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Pi
             bytes_per_row: Some(4),
             rows_per_image: Some(1),
         },
-        fallback_extent,
+        extent_1x1,
+    );
+
+    // 1x1 Flat Normal Map (Vector [0, 0, 1] mapped to RGB [128, 128, 255])
+    let fallback_normal_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("1x1 Flat Normal Map"),
+        size: extent_1x1,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &fallback_normal_tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &[128u8, 128, 255, 255],
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4),
+            rows_per_image: Some(1),
+        },
+        extent_1x1,
     );
 
     let fallback_view = fallback_tex.create_view(&wgpu::TextureViewDescriptor::default());
+    let fallback_normal_view =
+        fallback_normal_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
     let default_texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("Fallback Texture Bind Group"),
+        label: Some("Default Texture & Normal Bind Group"),
         layout: &texture_bind_group_layout,
         entries: &[
             wgpu::BindGroupEntry {
@@ -179,6 +230,14 @@ pub fn create_pipelines(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Pi
             },
             wgpu::BindGroupEntry {
                 binding: 1,
+                resource: wgpu::BindingResource::Sampler(&default_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&fallback_normal_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
                 resource: wgpu::BindingResource::Sampler(&default_sampler),
             },
         ],
@@ -204,11 +263,12 @@ pub fn create_pipelines(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Pi
                 array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &wgpu::vertex_attr_array![
-                    0 => Float32x3,
-                    1 => Float32x3,
-                    2 => Float32x2,
-                    3 => Uint32x4,
-                    4 => Float32x4,
+                    0 => Float32x3, // position
+                    1 => Float32x3, // normal
+                    2 => Float32x4, // tangent
+                    3 => Float32x2, // tex_coords
+                    4 => Uint32x4,  // joints
+                    5 => Float32x4,  // weights
                 ],
             })],
         },
@@ -316,7 +376,7 @@ pub fn create_pipelines(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Pi
         depth_stencil: Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
             depth_write_enabled: Some(false),
-            depth_compare: Some(wgpu::CompareFunction::Always), // X-RAY: draw over mesh
+            depth_compare: Some(wgpu::CompareFunction::Always), // X-RAY: draws directly on top
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
@@ -326,7 +386,7 @@ pub fn create_pipelines(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Pi
     });
 
     let skeleton_depth_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("TREOVL Depth Skeleton Pipeline"),
+        label: Some("TREOVL Depth-Tested Skeleton Pipeline"),
         layout: Some(&grid_pipeline_layout),
         vertex: wgpu::VertexState {
             module: &shader,
@@ -356,7 +416,7 @@ pub fn create_pipelines(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Pi
         depth_stencil: Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
             depth_write_enabled: Some(true),
-            depth_compare: Some(wgpu::CompareFunction::LessEqual), // DEPTH TESTED (hides inside mesh)
+            depth_compare: Some(wgpu::CompareFunction::LessEqual), // Hidden when inside mesh
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
@@ -423,5 +483,6 @@ pub fn create_pipelines(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Pi
         texture_bind_group_layout,
         default_sampler,
         default_texture_bind_group,
+        fallback_normal_view,
     })
 }

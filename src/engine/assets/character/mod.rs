@@ -13,9 +13,8 @@ use crate::engine::assets::{
     build_chunk_from_elements_with_endian, build_typed_container_with_endian, parse_chunk_elements,
     parse_typed_container,
 };
-use crate::engine::common::{Endian, read_length_prefixed_string};
+use crate::engine::common::{Endian, parse_entity_handle, read_length_prefixed_string};
 
-/// Result of in-memory character extraction without filesystem side-effects
 pub struct ExtractedCharacter {
     pub character: CharacterActorJson,
     pub embedded_lua_source: Option<String>,
@@ -23,7 +22,6 @@ pub struct ExtractedCharacter {
     pub embedded_facefx: Option<Vec<u8>>,
 }
 
-/// Pure in-memory extraction of a character actor or breakable chunk
 pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> {
     if data.len() < 5 {
         bail!("Data too short for a Character / Actor container");
@@ -36,6 +34,7 @@ pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> 
 
     let mut character_name = String::from("Unnamed_Character");
     let mut resource_tag = None;
+    let mut entity_handle = None;
     let mut is_baby = None;
     let mut model_binding = None;
     let mut collapse_target_model = None;
@@ -63,6 +62,9 @@ pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> 
     let mut ragdoll_config = None;
     let mut collision_filter = None;
     let mut equipment = None;
+    let mut equipment_loadout = None;
+    let mut armor_tier_customizations = Vec::new();
+    let mut armor_tint_palette = Vec::new();
     let mut unmapped_raw_blocks = Vec::new();
 
     let mut brk_health = 5.0f32;
@@ -81,15 +83,21 @@ pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> 
                     resource_tag = Some(s);
                 }
             }
-            21 | 25 => {
-                if let Some(s) = read_length_prefixed_string(chunk)
-                    && character_name == "Unnamed_Character"
+            21 => {
+                if character_name == "Unnamed_Character"
+                    && let Some(s) = read_length_prefixed_string(chunk)
                 {
+                    character_name = s;
+                }
+            }
+            25 => {
+                if let Some(s) = read_length_prefixed_string(chunk) {
                     character_name = s;
                 }
             }
             22 if chunk.len() >= 4 => {
                 let mask = u32::from_le_bytes(chunk[0..4].try_into().unwrap_or_default());
+                entity_handle = parse_entity_handle(mask);
                 flags = CharacterFlagsJson {
                     casts_dynamic_shadows: (mask & 0x2000_0000) != 0,
                     can_be_targeted: (mask & 0x0100_0000) != 0,
@@ -116,8 +124,16 @@ pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> 
             29 | 63 => {
                 if is_breakable {
                     brk_can_be_carried = chunk.len() >= 4 && chunk[0] != 0;
-                } else if equipment.is_none() {
-                    equipment = parse_equipment_definition(&elements, &character_name);
+                } else {
+                    if equipment.is_none() {
+                        equipment = parse_equipment_definition(&elements, &character_name);
+                    }
+                    if *id == 63 {
+                        let loadout = parse_full_equipment_loadout(chunk);
+                        if !loadout.slots.is_empty() {
+                            equipment_loadout = Some(loadout);
+                        }
+                    }
                 }
             }
             31 | 37 | 67 => {
@@ -138,13 +154,27 @@ pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> 
             70 if is_breakable && !chunk.is_empty() => {
                 brk_debris_count = chunk[0] as usize;
             }
+            70 if type_id == 0x0046300D => {
+                if animation_states.is_empty() {
+                    animation_states = parse_animation_graph(chunk);
+                }
+            }
             75 if chunk.len() >= 4 => {
                 attributes.interaction_distance = parse_f32_safe(chunk);
+            }
+            78 if chunk.len() >= 4 => {
+                attributes.interaction_height = parse_f32_safe(chunk);
             }
             79 if chunk.len() >= 4 => {
                 if let Some(rad) = parse_f32_safe(chunk) {
                     attributes.vision_cone_degrees = Some(rad.to_degrees());
                 }
+            }
+            81 if chunk.len() >= 4 => {
+                attributes.step_height = parse_f32_safe(chunk);
+            }
+            82 if chunk.len() >= 4 => {
+                attributes.stopping_distance = parse_f32_safe(chunk);
             }
             84 if !chunk.is_empty() => {
                 attributes.max_attackers_count = Some(chunk[0] as u32);
@@ -155,6 +185,9 @@ pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> 
             86 | 128 => {
                 let mut sockets = parse_actor_attachments(chunk);
                 socket_offsets.append(&mut sockets);
+            }
+            87 if !chunk.is_empty() => {
+                attributes.can_be_mounted = Some(chunk[0] != 0);
             }
             88 => {
                 ai_actions = parse_ai_actions(chunk);
@@ -235,6 +268,21 @@ pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> 
             136 if chunk.len() >= 4 => {
                 attributes.ranged_cooldown_sec = parse_f32_safe(chunk);
             }
+            137 if chunk.len() >= 4 => {
+                attributes.explosion_damage = parse_f32_safe(chunk);
+            }
+            138 if chunk.len() >= 4 => {
+                attributes.wander_radius = parse_f32_safe(chunk);
+            }
+            140 if chunk.len() >= 4 => {
+                attributes.aggro_range = parse_f32_safe(chunk);
+            }
+            142 if chunk.len() >= 4 => {
+                timings.stumble_cooldown_sec = parse_f32_safe(chunk);
+            }
+            143 if chunk.len() >= 4 => {
+                timings.secondary_cooldown_sec = parse_f32_safe(chunk);
+            }
             144 if chunk.len() >= 4 => {
                 timings.hit_recovery_cooldown_sec = parse_f32_safe(chunk);
             }
@@ -266,17 +314,47 @@ pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> 
             203 if is_breakable && !chunk.is_empty() => {
                 brk_spawn_particles = chunk[0] != 0;
             }
-            300 if chunk.len() >= 15 => {
-                let mut cur = Cursor::new(&chunk[3..15]);
-                let x = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-                let y = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-                let z = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-                if x.is_finite() && y.is_finite() && z.is_finite() {
+            300 => {
+                if let Some(pos) = parse_hold_offset(chunk) {
                     if is_breakable {
-                        brk_center_offset = [x, y, z];
+                        brk_center_offset = pos;
                     } else {
-                        hold_offset = Some([x, y, z]);
+                        hold_offset = Some(pos);
                     }
+                }
+            }
+            303 => {
+                armor_tier_customizations = parse_armor_tier_customizations(chunk);
+            }
+            304 => {
+                armor_tint_palette = parse_armor_tint_palette(chunk);
+            }
+            305 if chunk.len() >= 4 => {
+                if let Some(r) = parse_f32_safe(chunk) {
+                    let mut radii = attributes.aura_radii.unwrap_or([0.0; 4]);
+                    radii[0] = r;
+                    attributes.aura_radii = Some(radii);
+                }
+            }
+            306 if chunk.len() >= 4 => {
+                if let Some(r) = parse_f32_safe(chunk) {
+                    let mut radii = attributes.aura_radii.unwrap_or([0.0; 4]);
+                    radii[1] = r;
+                    attributes.aura_radii = Some(radii);
+                }
+            }
+            307 if chunk.len() >= 4 => {
+                if let Some(r) = parse_f32_safe(chunk) {
+                    let mut radii = attributes.aura_radii.unwrap_or([0.0; 4]);
+                    radii[2] = r;
+                    attributes.aura_radii = Some(radii);
+                }
+            }
+            308 if chunk.len() >= 4 => {
+                if let Some(r) = parse_f32_safe(chunk) {
+                    let mut radii = attributes.aura_radii.unwrap_or([0.0; 4]);
+                    radii[3] = r;
+                    attributes.aura_radii = Some(radii);
                 }
             }
             50 => {
@@ -379,16 +457,10 @@ pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> 
             133 if chunk.len() >= 4 => {
                 timings.invulnerability_time_sec = parse_f32_safe(chunk);
             }
-            137 if chunk.len() >= 4 => {
-                attributes.explosion_damage = parse_f32_safe(chunk);
-            }
             139 => {
                 if let Some(s) = read_length_prefixed_string(chunk) {
                     facefx_actor = Some(s);
                 }
-            }
-            140 if chunk.len() >= 4 => {
-                attributes.aggro_range = parse_f32_safe(chunk);
             }
             146 => {
                 transformations = parse_transformation_container(chunk);
@@ -410,9 +482,7 @@ pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> 
                 }
             }
             19 | 1 | 41 | 42 | 45 | 71 | 72 | 90 | 92 | 93 | 94 | 96 | 97 | 98 | 102 | 105
-            | 111 | 118 | 124 | 147 | 148 | 152 | 153 | 161 | 167 | 301 => {
-                // Engine internal control, framing, and automatic state blocks (rebuilt on import)
-            }
+            | 111 | 118 | 124 | 147 | 148 | 152 | 153 | 161 | 167 | 301 => {}
             _ => {
                 unmapped_raw_blocks.push(RawCharacterBlock {
                     id: *id,
@@ -425,6 +495,9 @@ pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> 
     let engine_class = match type_id {
         0x00463018 => "TREBreakable".to_string(),
         0x0046305B => "TRECaptiveObject".to_string(),
+        0x0046300D => "TRECritter".to_string(),
+        0x0046401C => "TREPlayerActor".to_string(),
+        0x00464003 => "TREActor".to_string(),
         _ => "TREActorController".to_string(),
     };
 
@@ -458,6 +531,7 @@ pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> 
         _engine_metadata: metadata,
         character_name,
         resource_tag,
+        entity_handle,
         is_baby,
         model_binding,
         breakable_config,
@@ -477,6 +551,7 @@ pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> 
         ragdoll_config,
         collision_filter,
         equipment,
+        equipment_loadout,
         facefx_actor,
         embedded_facefx_file: None,
         lifeforce_color,
@@ -489,6 +564,9 @@ pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> 
         transformations,
         effect_receptors,
         minion_grapple_bones,
+        armor_tier_customizations,
+        armor_tint_palette,
+        raw_customization_set_hex: None,
     };
 
     Ok(ExtractedCharacter {
@@ -597,42 +675,44 @@ pub fn import_character_from_json_with_externals(
         elements.push((162, vec![if baby { 1 } else { 0 }]));
     }
 
-    if let Some(ref flags) = parsed.actor_flags {
-        let mut mask = if let Some(ref raw_h) = parsed._engine_metadata.raw_flags_hex {
-            let clean_hex = raw_h
-                .trim()
-                .trim_start_matches("0x")
-                .trim_start_matches("0X");
-            u32::from_str_radix(clean_hex, 16).unwrap_or(0x2140_0000)
-        } else {
-            0x2140_0000
-        };
-
+    // Reconstruction of Chunk 22 (Preserving Entity Handle / Map UID)
+    let chunk22_val = if let Some(ref handle) = parsed.entity_handle {
+        let tag_byte = handle
+            .domain_tag
+            .as_bytes()
+            .first()
+            .copied()
+            .unwrap_or(b'M');
+        (tag_byte as u32) << 24 | (handle.uid & 0x00FF_FFFF)
+    } else if let Some(ref raw_h) = parsed._engine_metadata.raw_flags_hex {
+        let clean_hex = raw_h
+            .trim()
+            .trim_start_matches("0x")
+            .trim_start_matches("0X");
+        u32::from_str_radix(clean_hex, 16).unwrap_or(0x4D00_0000)
+    } else if let Some(ref flags) = parsed.actor_flags {
+        let mut mask = 0x2140_0000u32;
         if flags.casts_dynamic_shadows {
             mask |= 0x2000_0000;
-        } else {
-            mask &= !0x2000_0000;
         }
         if flags.can_be_targeted {
             mask |= 0x0100_0000;
-        } else {
-            mask &= !0x0100_0000;
         }
         if flags.ragdoll_on_death {
             mask |= 0x0040_0000;
-        } else {
-            mask &= !0x0040_0000;
         }
-        if !is_breakable && let Some(civilian) = flags.is_civilian {
-            if civilian {
-                mask |= 0x0000_0002;
-            } else {
-                mask &= !0x0000_0002;
-            }
+        if !is_breakable
+            && let Some(civilian) = flags.is_civilian
+            && civilian
+        {
+            mask |= 0x0000_0002;
         }
+        mask
+    } else {
+        0x4D00_0001
+    };
 
-        elements.push((22, endian.u32_to_bytes(mask).to_vec()));
-    }
+    elements.push((22, endian.u32_to_bytes(chunk22_val).to_vec()));
 
     let is_en = parsed
         .combat_attributes
@@ -708,6 +788,9 @@ pub fn import_character_from_json_with_externals(
             if let Some(dist) = attrs.interaction_distance {
                 elements.push((75, endian.f32_to_bytes(dist).to_vec()));
             }
+            if let Some(v) = attrs.interaction_height {
+                elements.push((78, endian.f32_to_bytes(v).to_vec()));
+            }
             if let Some(active) = attrs.is_active_on_spawn {
                 elements.push((77, vec![if active { 1 } else { 0 }]));
             }
@@ -717,6 +800,12 @@ pub fn import_character_from_json_with_externals(
             if let Some(v) = attrs.mass {
                 elements.push((80, endian.f32_to_bytes(v).to_vec()));
             }
+            if let Some(v) = attrs.step_height {
+                elements.push((81, endian.f32_to_bytes(v).to_vec()));
+            }
+            if let Some(v) = attrs.stopping_distance {
+                elements.push((82, endian.f32_to_bytes(v).to_vec()));
+            }
             if let Some(v) = attrs.base_health {
                 elements.push((83, endian.f32_to_bytes(v).to_vec()));
             }
@@ -725,6 +814,9 @@ pub fn import_character_from_json_with_externals(
             }
             if let Some(v) = attrs.aggro_decay_rate {
                 elements.push((85, endian.f32_to_bytes(v).to_vec()));
+            }
+            if let Some(mounted) = attrs.can_be_mounted {
+                elements.push((87, vec![if mounted { 1 } else { 0 }]));
             }
             if let Some(v) = attrs.max_chase_distance {
                 elements.push((89, endian.f32_to_bytes(v).to_vec()));
@@ -767,8 +859,17 @@ pub fn import_character_from_json_with_externals(
             if let Some(v) = attrs.explosion_damage {
                 elements.push((137, endian.f32_to_bytes(v).to_vec()));
             }
+            if let Some(v) = attrs.wander_radius {
+                elements.push((138, endian.f32_to_bytes(v).to_vec()));
+            }
             if let Some(v) = attrs.aggro_range {
                 elements.push((140, endian.f32_to_bytes(v).to_vec()));
+            }
+            if let Some(radii) = attrs.aura_radii {
+                elements.push((305, endian.f32_to_bytes(radii[0]).to_vec()));
+                elements.push((306, endian.f32_to_bytes(radii[1]).to_vec()));
+                elements.push((307, endian.f32_to_bytes(radii[2]).to_vec()));
+                elements.push((308, endian.f32_to_bytes(radii[3]).to_vec()));
             }
             if let Some(aim) = attrs.forward_aim_vector {
                 let mut buf = Vec::with_capacity(12);
@@ -785,11 +886,31 @@ pub fn import_character_from_json_with_externals(
             }
         }
 
-        if let Some(ref eq) = parsed.equipment {
+        if let Some(ref loadout) = parsed.equipment_loadout {
+            if !elements.iter().any(|(id, _)| *id == 63) {
+                elements.push((63, build_full_equipment_loadout(loadout, endian)));
+            }
+        } else if let Some(ref eq) = parsed.equipment
+            && !elements.iter().any(|(id, _)| *id == 63)
+        {
             elements.push((29, vec![1, 40, 0, 2, 40, 0, 43, 4, 1, 1, 0, 0, 0]));
             let item_sub = vec![(20, endian.write_length_prefixed_string(&eq.item_name))];
             let item_blob = build_typed_container_with_endian(0x00464010, &item_sub, endian);
             elements.push((63, item_blob));
+        }
+
+        if !parsed.armor_tint_palette.is_empty() && !elements.iter().any(|(id, _)| *id == 304) {
+            elements.push((
+                304,
+                build_armor_tint_palette(&parsed.armor_tint_palette, endian),
+            ));
+        }
+
+        if let Some(ref hex_str) = parsed.raw_customization_set_hex
+            && let Ok(raw_bytes) = hex::decode(hex_str)
+            && !elements.iter().any(|(id, _)| *id == 303)
+        {
+            elements.push((303, raw_bytes));
         }
 
         if let Some(ref timings) = parsed.timing_parameters {
@@ -807,6 +928,12 @@ pub fn import_character_from_json_with_externals(
             }
             if let Some(v) = timings.invulnerability_time_sec {
                 elements.push((133, endian.f32_to_bytes(v).to_vec()));
+            }
+            if let Some(v) = timings.stumble_cooldown_sec {
+                elements.push((142, endian.f32_to_bytes(v).to_vec()));
+            }
+            if let Some(v) = timings.secondary_cooldown_sec {
+                elements.push((143, endian.f32_to_bytes(v).to_vec()));
             }
             if let Some(v) = timings.hit_recovery_cooldown_sec {
                 elements.push((144, endian.f32_to_bytes(v).to_vec()));
@@ -827,7 +954,9 @@ pub fn import_character_from_json_with_externals(
         if !parsed.socket_offsets.is_empty() {
             elements.push((128, build_actor_attachments(&parsed.socket_offsets, endian)));
         }
-        if let Some(ho) = parsed.hold_offset {
+        if let Some(ho) = parsed.hold_offset
+            && !elements.iter().any(|(id, _)| *id == 300)
+        {
             let mut b = vec![1u8, 20, 0];
             let _ = endian.write_f32(&mut b, ho[0]);
             let _ = endian.write_f32(&mut b, ho[1]);
@@ -835,7 +964,6 @@ pub fn import_character_from_json_with_externals(
             elements.push((300, b));
         }
 
-        // Automatic engine control & state blocks
         elements.push((72, vec![1, 0x16, 0, 1, 0x14, 0, 0x7E, 0, 0, 0]));
         elements.push((88, vec![1, 1, 0, 0]));
         elements.push((90, endian.u32_to_bytes(3).to_vec()));

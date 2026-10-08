@@ -7,14 +7,17 @@ use crate::engine::assets::{
     build_chunk_from_elements_with_endian, build_typed_container_with_endian, parse_chunk_elements,
     parse_typed_container,
 };
-use crate::engine::common::{Endian, read_length_prefixed_string};
+pub use crate::engine::common::parse_f32_safe;
+use crate::engine::common::{Endian, EntityHandleJson, read_length_prefixed_string};
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct CharacterActorJson {
     pub _engine_metadata: CharacterEngineMetadataJson,
     pub character_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_tag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entity_handle: Option<EntityHandleJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_baby: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -40,6 +43,8 @@ pub struct CharacterActorJson {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub equipment: Option<CharacterEquipmentJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub equipment_loadout: Option<FullEquipmentLoadoutJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub facefx_actor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embedded_facefx_file: Option<String>,
@@ -63,6 +68,12 @@ pub struct CharacterActorJson {
     pub effect_receptors: Vec<CharacterAttachmentReceptorJson>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub minion_grapple_bones: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub armor_tier_customizations: Vec<ArmorTierMeshBindingJson>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub armor_tint_palette: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_customization_set_hex: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -123,9 +134,17 @@ pub struct CharacterAttributesJson {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interaction_distance: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub interaction_height: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mass: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_health: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step_height: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stopping_distance: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub can_be_mounted: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hit_reaction_force: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -154,6 +173,10 @@ pub struct CharacterAttributesJson {
     pub ranged_attack_range: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ranged_cooldown_sec: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wander_radius: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aura_radii: Option<[f32; 4]>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -163,6 +186,36 @@ pub struct CharacterEquipmentJson {
     pub primary_slot: u32,
     pub support_slot: u32,
     pub equipped_slot: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct FullEquipmentLoadoutJson {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_item: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub slots: Vec<EquipmentSlotJson>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct EquipmentSlotJson {
+    pub slot_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_item: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secondary_item: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tertiary_item: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_item: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_binding: Option<CharacterModelBinding>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ArmorTierMeshBindingJson {
+    pub tier_name: String,
+    pub object_path: String,
+    pub part_name: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -179,6 +232,10 @@ pub struct CharacterCombatTimingsJson {
     pub invulnerability_time_sec: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hit_recovery_cooldown_sec: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stumble_cooldown_sec: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secondary_cooldown_sec: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub physics_damping: Option<f32>,
 }
@@ -233,7 +290,7 @@ pub struct CharacterMorphParamsJson {
     pub blend_scale: Option<f32>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct CharacterModelBinding {
     pub object_path: String,
     pub model_name: String,
@@ -284,11 +341,27 @@ pub struct RawCharacterBlock {
     pub hex: String,
 }
 
-pub fn parse_f32_safe(chunk: &[u8]) -> Option<f32> {
-    if chunk.len() >= 4 {
-        let val = f32::from_le_bytes(chunk[0..4].try_into().unwrap_or_default());
-        if val.is_finite() && !val.is_subnormal() && (1e-4..=500_000.0).contains(&val.abs()) {
-            return Some(val);
+fn extract_equipment_string(data: &[u8]) -> Option<String> {
+    if let Some(s) = read_length_prefixed_string(data)
+        && !s.is_empty()
+        && (!s.starts_with('[') || s.starts_with("[REPLACE]"))
+        && !s.contains('\\')
+        && s != "dummy"
+    {
+        return Some(s);
+    }
+    if let Ok((_, elements)) = parse_chunk_elements(data) {
+        for (_, chunk) in elements {
+            if let Some(s) = extract_equipment_string(&chunk) {
+                return Some(s);
+            }
+        }
+    }
+    if let Ok((_, elements)) = parse_typed_container(data) {
+        for (_, chunk) in elements {
+            if let Some(s) = extract_equipment_string(&chunk) {
+                return Some(s);
+            }
         }
     }
     None
@@ -371,25 +444,281 @@ pub fn build_collision_filter(f: &ActorCollisionFilterJson, endian: Endian) -> V
 
 pub fn parse_equipment_definition(
     elements: &[(u32, Vec<u8>)],
-    character_name: &str,
+    _character_name: &str,
 ) -> Option<CharacterEquipmentJson> {
     if let Some((_, chunk63)) = elements.iter().find(|(id, _)| *id == 63) {
-        let mut i = 0;
-        while i + 4 <= chunk63.len() {
-            if let Some(s) = read_length_prefixed_string(&chunk63[i..]) {
-                if !s.is_empty() && !s.starts_with('[') && s != character_name {
-                    return Some(CharacterEquipmentJson {
-                        item_name: s,
-                        mount_socket: "Right_Hand_Carry".to_string(),
-                        primary_slot: 40,
-                        support_slot: 43,
-                        equipped_slot: 40,
+        let loadout = parse_full_equipment_loadout(chunk63);
+        if let Some(item) = loadout.active_item {
+            return Some(CharacterEquipmentJson {
+                item_name: item,
+                mount_socket: "Right_Hand_Carry".to_string(),
+                primary_slot: 40,
+                support_slot: 43,
+                equipped_slot: 40,
+            });
+        }
+    }
+    None
+}
+
+/// Recursively discovers and parses all TREEquipmentSlot (0x00464010) containers within Chunk 63.
+pub fn parse_full_equipment_loadout(chunk63: &[u8]) -> FullEquipmentLoadoutJson {
+    let mut slots = Vec::new();
+    let mut active_item = None;
+
+    let target_magic = b"\x10\x40\x46\x00";
+    let mut pos = 0;
+
+    while pos + 4 <= chunk63.len() {
+        if let Some(rel) = chunk63[pos..].windows(4).position(|w| w == target_magic) {
+            let start = pos + rel;
+            if let Ok((type_id, fields)) = parse_typed_container(&chunk63[start..])
+                && type_id == 0x00464010
+            {
+                let mut slot_name = String::new();
+                let mut primary_item = None;
+                let mut secondary_item = None;
+                let mut tertiary_item = None;
+                let mut fallback_item = None;
+                let mut model_binding = None;
+
+                for (fid, fdata) in fields {
+                    match fid {
+                        31 => {
+                            if let Some(s) = extract_equipment_string(&fdata) {
+                                slot_name = s;
+                            }
+                        }
+                        40 => {
+                            if let Some(s) = extract_equipment_string(&fdata) {
+                                if slot_name.is_empty()
+                                    || slot_name == "dummy"
+                                    || slot_name.starts_with("Slot_")
+                                {
+                                    slot_name = s;
+                                } else if primary_item.is_none() {
+                                    primary_item = Some(s);
+                                }
+                            }
+                        }
+                        41 => {
+                            if let Some(mb) = parse_model_binding(&fdata) {
+                                model_binding = Some(mb);
+                            } else if let Some(s) = extract_equipment_string(&fdata) {
+                                if primary_item.is_none() {
+                                    primary_item = Some(s);
+                                } else if secondary_item.is_none() {
+                                    secondary_item = Some(s);
+                                }
+                            }
+                        }
+                        42 => {
+                            if let Some(s) = extract_equipment_string(&fdata) {
+                                secondary_item = Some(s);
+                            }
+                        }
+                        43 => {
+                            if let Some(s) = extract_equipment_string(&fdata) {
+                                tertiary_item = Some(s);
+                            }
+                        }
+                        64 => {
+                            if let Some(s) = extract_equipment_string(&fdata) {
+                                fallback_item = Some(s);
+                            }
+                        }
+                        _ => {
+                            if model_binding.is_none() {
+                                model_binding = parse_model_binding(&fdata);
+                            }
+                        }
+                    }
+                }
+
+                if slot_name.is_empty() {
+                    if let Some(ref pri) = primary_item {
+                        slot_name = pri.clone();
+                    } else if secondary_item.is_some() {
+                        slot_name = "Overlord Armor & Helmet".to_string();
+                    }
+                }
+
+                if active_item.is_none() {
+                    active_item = secondary_item
+                        .clone()
+                        .or_else(|| primary_item.clone())
+                        .or_else(|| {
+                            (!slot_name.is_empty()
+                                && slot_name != "dummy"
+                                && !slot_name.starts_with("Slot_")
+                                && !slot_name.starts_with("Lord"))
+                            .then(|| slot_name.clone())
+                        });
+                }
+
+                if !slot_name.is_empty() || primary_item.is_some() || model_binding.is_some() {
+                    slots.push(EquipmentSlotJson {
+                        slot_name,
+                        primary_item,
+                        secondary_item,
+                        tertiary_item,
+                        fallback_item,
+                        model_binding,
                     });
                 }
-                i += 4 + s.len();
+                pos = start + 4;
             } else {
-                i += 1;
+                pos += 1;
             }
+        } else {
+            break;
+        }
+    }
+
+    FullEquipmentLoadoutJson { active_item, slots }
+}
+
+pub fn build_full_equipment_loadout(loadout: &FullEquipmentLoadoutJson, endian: Endian) -> Vec<u8> {
+    let mut slot_chunks = Vec::new();
+
+    for (i, slot) in loadout.slots.iter().enumerate() {
+        let mut slot_fields = Vec::new();
+
+        slot_fields.push((31, endian.write_length_prefixed_string(&slot.slot_name)));
+
+        if let Some(ref primary) = slot.primary_item {
+            slot_fields.push((40, endian.write_length_prefixed_string(primary)));
+        } else {
+            slot_fields.push((40, endian.write_length_prefixed_string(&slot.slot_name)));
+        }
+
+        if let Some(ref mb) = slot.model_binding {
+            slot_fields.push((
+                41,
+                build_model_binding(&mb.object_path, &mb.model_name, endian),
+            ));
+        }
+
+        if let Some(ref sec) = slot.secondary_item {
+            let sub = vec![
+                (19, vec![0x94, 0x01, 0x00, 0x00]),
+                (20, endian.write_length_prefixed_string(sec)),
+            ];
+            slot_fields.push((
+                42,
+                build_chunk_from_elements_with_endian(false, &sub, endian),
+            ));
+        }
+
+        if let Some(ref tert) = slot.tertiary_item {
+            let sub = vec![
+                (19, vec![0x90, 0x01, 0x00, 0x00]),
+                (20, endian.write_length_prefixed_string(tert)),
+            ];
+            slot_fields.push((
+                43,
+                build_chunk_from_elements_with_endian(false, &sub, endian),
+            ));
+        }
+
+        if let Some(ref fb) = slot.fallback_item {
+            slot_fields.push((64, endian.write_length_prefixed_string(fb)));
+        }
+
+        let slot_blob = build_typed_container_with_endian(0x00464010, &slot_fields, endian);
+        slot_chunks.push((i as u32, slot_blob));
+    }
+
+    let inner_container = build_chunk_from_elements_with_endian(true, &slot_chunks, endian);
+    let root_sub = vec![(20, inner_container)];
+    build_chunk_from_elements_with_endian(false, &root_sub, endian)
+}
+
+pub fn parse_armor_tier_customizations(chunk303: &[u8]) -> Vec<ArmorTierMeshBindingJson> {
+    let mut customizations = Vec::new();
+
+    let mut str_list = Vec::new();
+    let mut i = 0;
+    while i + 4 <= chunk303.len() {
+        if let Some(s) = read_length_prefixed_string(&chunk303[i..]) {
+            if !s.is_empty() {
+                str_list.push(s.clone());
+            }
+            i += 4 + s.len();
+        } else {
+            i += 1;
+        }
+    }
+
+    let mut idx = 0;
+    while idx + 1 < str_list.len() {
+        let path = &str_list[idx];
+        let part = &str_list[idx + 1];
+
+        if path.starts_with('[') && path.contains("OBJ\\") {
+            let tier = if path.contains("MINION") {
+                "Minion".to_string()
+            } else if path.contains("STEEL") {
+                "Steel".to_string()
+            } else if path.contains("ARCADIUM") {
+                "Arcanium".to_string()
+            } else {
+                "Standard".to_string()
+            };
+
+            customizations.push(ArmorTierMeshBindingJson {
+                tier_name: tier,
+                object_path: path.clone(),
+                part_name: part.clone(),
+            });
+            idx += 2;
+        } else {
+            idx += 1;
+        }
+    }
+
+    customizations
+}
+
+pub fn parse_armor_tint_palette(chunk304: &[u8]) -> Vec<String> {
+    let mut palette = Vec::new();
+    if let Ok((_, elements)) = parse_chunk_elements(chunk304) {
+        for (_, d) in elements {
+            if d.len() >= 3 {
+                palette.push(format!("#{:02X}{:02X}{:02X}", d[0], d[1], d[2]));
+            }
+        }
+    }
+    palette
+}
+
+pub fn build_armor_tint_palette(palette: &[String], endian: Endian) -> Vec<u8> {
+    let mut elements = Vec::new();
+    for (i, hex_str) in palette.iter().enumerate() {
+        let clean = hex_str.trim_start_matches('#');
+        let val = u32::from_str_radix(clean, 16).unwrap_or(0);
+        let color_bytes = vec![(val >> 16) as u8, (val >> 8) as u8, val as u8, 0];
+        elements.push(((40 + i) as u32, color_bytes));
+    }
+    build_chunk_from_elements_with_endian(false, &elements, endian)
+}
+
+pub fn parse_hold_offset(chunk: &[u8]) -> Option<[f32; 3]> {
+    if chunk.len() >= 15 && chunk[0] == 1 && chunk[1] == 20 {
+        let mut cur = Cursor::new(&chunk[3..15]);
+        let x = cur.read_f32::<LittleEndian>().ok()?;
+        let y = cur.read_f32::<LittleEndian>().ok()?;
+        let z = cur.read_f32::<LittleEndian>().ok()?;
+        if x.is_finite() && y.is_finite() && z.is_finite() {
+            return Some([x, y, z]);
+        }
+    } else if chunk.len() >= 12 {
+        let mut cur = Cursor::new(&chunk[0..12]);
+        let x = cur.read_f32::<LittleEndian>().ok()?;
+        let y = cur.read_f32::<LittleEndian>().ok()?;
+        let z = cur.read_f32::<LittleEndian>().ok()?;
+        if x.is_finite() && y.is_finite() && z.is_finite() {
+            return Some([x, y, z]);
         }
     }
     None
@@ -757,47 +1086,6 @@ pub fn parse_actor_attachments(data: &[u8]) -> Vec<ActorSocketOffsetJson> {
                     translation,
                     rotation_quat,
                 });
-            }
-        }
-    }
-
-    if out.is_empty() {
-        let mut i = 0;
-        while i + 4 <= data.len() {
-            if let Some(s) = read_length_prefixed_string(&data[i..]) {
-                let clean = s.trim();
-                if (clean.ends_with("_item")
-                    || clean.starts_with("Hookup")
-                    || clean.contains("hand"))
-                    && i + 4 + s.len() + 28 <= data.len()
-                {
-                    let mut cur = Cursor::new(&data[i + 4 + s.len()..]);
-                    let tx = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-                    let ty = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-                    let tz = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-
-                    let qx = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-                    let qy = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-                    let qz = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-                    let qw = cur.read_f32::<LittleEndian>().unwrap_or(1.0);
-
-                    if tx.is_finite()
-                        && ty.is_finite()
-                        && tz.is_finite()
-                        && !tx.is_subnormal()
-                        && !ty.is_subnormal()
-                        && !tz.is_subnormal()
-                    {
-                        out.push(ActorSocketOffsetJson {
-                            socket_name: clean.to_string(),
-                            translation: [tx, ty, tz],
-                            rotation_quat: [qx, qy, qz, qw],
-                        });
-                    }
-                }
-                i += 4 + s.len();
-            } else {
-                i += 1;
             }
         }
     }

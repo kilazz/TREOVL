@@ -1,15 +1,19 @@
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use byteorder::{LittleEndian, ReadBytesExt};
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 
 use super::physics::{BoneGroupJson, BoundingBoxJson, EntityPhysicsStateJson, FullObjectBoneJson};
 use super::placement::{ObjectModelBindingJson, PlacementConfigJson};
+use crate::engine::assets::attachment::ItemTriggerActionJson;
 use crate::engine::assets::{
     build_chunk_from_elements_with_endian, build_typed_container_with_endian, parse_chunk_elements,
-    parse_typed_container,
 };
-use crate::engine::common::{Endian, read_length_prefixed_string};
+use crate::engine::common::{Endian, EntityHandleJson, read_length_prefixed_string};
+
+pub trait ComponentParser {
+    fn parse_chunk(&mut self, id: u32, chunk: &[u8]) -> Result<()>;
+}
 
 #[inline]
 pub fn is_empty_container(chunk: &[u8]) -> bool {
@@ -17,12 +21,50 @@ pub fn is_empty_container(chunk: &[u8]) -> bool {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct LogicEventLinkJson {
+    pub target_event: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_hex_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub linked_environment_handle: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DoorStateJson {
+    pub state_id: u32,
+    pub state_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_anim_clip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_anim_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transition_anim_clip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transition_anim_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_binding: Option<ObjectModelBindingJson>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct PointLightConfigJson {
+    pub color: String,
+    pub radius: f32,
+    pub intensity: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub falloff: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub light_type: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct ObjectEntityJson {
     pub _engine_metadata: ObjectEngineMetadataJson,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group_tag: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entity_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entity_handle: Option<EntityHandleJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scale: Option<[f32; 3]>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -39,6 +81,18 @@ pub struct ObjectEntityJson {
     pub stand_model: Option<ObjectModelBindingJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub placed_object: Option<ObjectModelBindingJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_collision_model: Option<ObjectModelBindingJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closed_collision_model: Option<ObjectModelBindingJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub point_light: Option<PointLightConfigJson>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub door_states: Vec<DoorStateJson>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub interaction_actions: Vec<ItemTriggerActionJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logic_event_link: Option<LogicEventLinkJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub placement_offset: Option<[f32; 3]>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -93,6 +147,139 @@ pub struct AttachmentSlotJson {
     pub data_hex: String,
 }
 
+// -----------------------------------------------------------------------------
+// Component Parsers (Strict `Result` based)
+// -----------------------------------------------------------------------------
+
+pub fn read_scale_vector(data: &[u8]) -> Result<[f32; 3]> {
+    if data.len() < 12 {
+        bail!("Chunk too small to contain a scale vector (requires 12 bytes)");
+    }
+    let mut cur = Cursor::new(data);
+    let x = cur
+        .read_f32::<LittleEndian>()
+        .context("Failed to read scale X")?;
+    let y = cur
+        .read_f32::<LittleEndian>()
+        .context("Failed to read scale Y")?;
+    let z = cur
+        .read_f32::<LittleEndian>()
+        .context("Failed to read scale Z")?;
+
+    if x.is_finite() && y.is_finite() && z.is_finite() {
+        Ok([x, y, z])
+    } else {
+        bail!("Scale vector contains invalid (NaN/Infinite) floating point values");
+    }
+}
+
+pub fn parse_placement_offset(chunk: &[u8]) -> Result<[f32; 3]> {
+    if chunk.len() >= 15 && chunk[0] == 1 && chunk[1] == 20 {
+        let mut cur = Cursor::new(&chunk[3..15]);
+        let x = cur
+            .read_f32::<LittleEndian>()
+            .context("Failed to read offset X")?;
+        let y = cur
+            .read_f32::<LittleEndian>()
+            .context("Failed to read offset Y")?;
+        let z = cur
+            .read_f32::<LittleEndian>()
+            .context("Failed to read offset Z")?;
+        if x.is_finite() && y.is_finite() && z.is_finite() {
+            return Ok([x, y, z]);
+        }
+    }
+    bail!("Invalid or unreadable placement offset format");
+}
+
+pub fn build_placement_offset(offset: [f32; 3], endian: Endian) -> Vec<u8> {
+    let mut out = vec![1u8, 20, 0];
+    let _ = endian.write_f32(&mut out, offset[0]);
+    let _ = endian.write_f32(&mut out, offset[1]);
+    let _ = endian.write_f32(&mut out, offset[2]);
+    out
+}
+
+pub fn parse_point_light_params(chunk: &[u8]) -> Result<PointLightConfigJson> {
+    let (_, elements) =
+        parse_chunk_elements(chunk).context("Failed to parse point light elements")?;
+    let mut light = PointLightConfigJson {
+        color: String::from("#FFFFFF"),
+        radius: 5.0,
+        intensity: 1.0,
+        falloff: None,
+        light_type: None,
+    };
+
+    for (id, data) in elements {
+        match id {
+            0x0BCD if data.len() >= 4 => {
+                light.intensity = f32::from_le_bytes(data[0..4].try_into()?).clamp(0.0, 10_000.0);
+            }
+            0x0BD0 if data.len() >= 3 => {
+                light.color = format!("#{:02X}{:02X}{:02X}", data[0], data[1], data[2]);
+            }
+            0x0BD1 if data.len() >= 4 => {
+                light.falloff = Some(f32::from_le_bytes(data[0..4].try_into()?));
+            }
+            0x0BCF if data.len() >= 4 => {
+                light.light_type = Some(u32::from_le_bytes(data[0..4].try_into()?));
+            }
+            0x0BD3 if data.len() >= 4 => {
+                let r = f32::from_le_bytes(data[0..4].try_into()?);
+                if !r.is_finite() {
+                    bail!("Light radius contains NaN or Infinity");
+                }
+                light.radius = r;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(light)
+}
+
+pub fn build_point_light_params(light: &PointLightConfigJson, endian: Endian) -> Vec<u8> {
+    let parse_hex_color = |hex_str: &str| -> [u8; 4] {
+        let clean = hex_str.trim_start_matches('#');
+        if let Ok(val) = u32::from_str_radix(clean, 16) {
+            [
+                ((val >> 16) & 0xFF) as u8,
+                ((val >> 8) & 0xFF) as u8,
+                (val & 0xFF) as u8,
+                0,
+            ]
+        } else {
+            [255, 255, 255, 0]
+        }
+    };
+
+    let mut elements = vec![
+        (0x0BCC, vec![0, 0, 0, 0]),
+        (0x0BCD, endian.f32_to_bytes(light.intensity).to_vec()),
+        (0x0BCE, vec![0, 0, 0, 0x3F]),
+        (
+            0x0BCF,
+            endian.u32_to_bytes(light.light_type.unwrap_or(1)).to_vec(),
+        ),
+        (0x0BD0, parse_hex_color(&light.color).to_vec()),
+    ];
+
+    if let Some(fo) = light.falloff {
+        let mut b = vec![0u8; 12];
+        let fo_bytes = endian.f32_to_bytes(fo);
+        b[6..10].copy_from_slice(&fo_bytes);
+        elements.push((0x0BD1, b));
+    } else {
+        elements.push((0x0BD1, vec![0, 0, 0, 0, 0, 0, 0x20, 0x40, 0, 0, 0, 0]));
+    }
+
+    elements.push((0x0BD2, vec![0x16]));
+    elements.push((0x0BD3, endian.f32_to_bytes(light.radius).to_vec()));
+
+    crate::engine::assets::build_chunk_from_elements_with_endian(false, &elements, endian)
+}
+
 pub fn parse_mesh_material_bindings(chunk_data: &[u8]) -> Vec<MeshMaterialBindingJson> {
     let mut bindings = Vec::new();
     let elements = if let Ok((_, elems)) = parse_chunk_elements(chunk_data) {
@@ -103,7 +290,7 @@ pub fn parse_mesh_material_bindings(chunk_data: &[u8]) -> Vec<MeshMaterialBindin
 
     for (_, elem_data) in elements {
         if elem_data.starts_with(b"\x67\x00\x41\x00")
-            && let Ok((_, sub_parts)) = parse_typed_container(&elem_data)
+            && let Ok((_, sub_parts)) = crate::engine::assets::parse_typed_container(&elem_data)
         {
             let mut mesh_path = String::new();
             let mut mesh_part_name = String::new();
@@ -256,19 +443,6 @@ pub fn rebuild_attachment_slots(slots: &[AttachmentSlotJson], endian: Endian) ->
         }
     }
     build_chunk_from_elements_with_endian(false, &elements, endian)
-}
-
-pub fn read_scale_vector(data: &[u8]) -> Option<[f32; 3]> {
-    if data.len() >= 12 {
-        let mut cur = Cursor::new(data);
-        let x = cur.read_f32::<LittleEndian>().ok()?;
-        let y = cur.read_f32::<LittleEndian>().ok()?;
-        let z = cur.read_f32::<LittleEndian>().ok()?;
-        if x.is_finite() && y.is_finite() && z.is_finite() {
-            return Some([x, y, z]);
-        }
-    }
-    None
 }
 
 pub fn write_scale_vector(s: [f32; 3], endian: Endian) -> Vec<u8> {

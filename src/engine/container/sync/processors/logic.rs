@@ -47,10 +47,7 @@ impl AssetProcessor for EventProcessor {
         sniffed: &SniffedAsset,
         workspace: &ProjectWorkspace,
     ) -> Result<Option<(String, AssetSyncEntry)>> {
-        if sniffed.kind != AssetKind::Event
-            && !data.starts_with(magic::EVENT)
-            && !data.starts_with(b"\x83\x00\x00\x04")
-        {
+        if sniffed.kind != AssetKind::Event && !data.starts_with(magic::EVENT) {
             return Ok(None);
         }
 

@@ -9,76 +9,33 @@ use crate::engine::assets::animation::compute_skinning_matrices;
 use crate::engine::math::{GridVertex, Vector3};
 use crate::gui::{ActiveMeshPreview, AppState};
 use crate::utils::renderer::{
-    RenderOptions, SubmeshDrawData, TextureData, ViewportCamera, WgpuRenderer,
+    RenderOptions, SubmeshDrawData, TextureData, ViewportCamera, WgpuRenderer, look_at_rh,
+    perspective_rh_zo,
 };
 
-pub fn perspective_rh_zo(fov_y_radians: f32, aspect_ratio: f32, z_near: f32, z_far: f32) -> Mat4 {
-    let f = 1.0 / (fov_y_radians / 2.0).tan();
-    Mat4::from_cols_array(&[
-        f / aspect_ratio,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        f,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        z_far / (z_near - z_far),
-        -1.0,
-        0.0,
-        0.0,
-        (z_far * z_near) / (z_near - z_far),
-        0.0,
-    ])
-}
-
-pub fn look_at_rh(eye: Vec3, center: Vec3, up: Vec3) -> Mat4 {
-    let f = (center - eye).normalize();
-    let s = f.cross(up).normalize();
-    let u = s.cross(f);
-    Mat4::from_cols_array(&[
-        s.x,
-        u.x,
-        -f.x,
-        0.0,
-        s.y,
-        u.y,
-        -f.y,
-        0.0,
-        s.z,
-        u.z,
-        -f.z,
-        0.0,
-        -eye.dot(s),
-        -eye.dot(u),
-        eye.dot(f),
-        1.0,
-    ])
-}
-
-/// Mesh mapping: Flipped 180° around X so the model stands upright on feet in Ground mode by default.
 #[inline]
 fn map_mesh_coords(p: Vec3, up_axis: u32) -> [f32; 3] {
     let aligned = [p.x, -p.z, p.y];
     match up_axis {
-        1 => [aligned[0], -aligned[2], aligned[1]], // Pitch Up (+90°)
-        2 => [aligned[0], aligned[2], -aligned[1]], // Pitch Down (-90°)
-        3 => [aligned[0], -aligned[1], -aligned[2]], // Inverted (180°)
-        _ => aligned,                               // 0: Ground (Default)
+        1 => [aligned[0], -aligned[2], aligned[1]],
+        2 => [aligned[0], aligned[2], -aligned[1]],
+        3 => [aligned[0], -aligned[1], -aligned[2]],
+        4 => [-aligned[1], aligned[0], aligned[2]],
+        5 => [aligned[1], -aligned[0], aligned[2]],
+        _ => aligned,
     }
 }
 
-/// Skeleton mapping: Restored to [p.x, p.y, p.z] to sit perfectly inside the mesh body and limbs
 #[inline]
 fn map_skeleton_coords(p: Vec3, up_axis: u32) -> [f32; 3] {
-    let aligned = [p.x, p.y, p.z];
+    let aligned = [p.x, -p.z, p.y];
     match up_axis {
-        1 => [aligned[0], -aligned[2], aligned[1]], // Pitch Up (+90°)
-        2 => [aligned[0], aligned[2], -aligned[1]], // Pitch Down (-90°)
-        3 => [aligned[0], -aligned[1], -aligned[2]], // Inverted (180°)
-        _ => aligned,                               // 0: Ground (Default)
+        1 => [aligned[0], -aligned[2], aligned[1]],
+        2 => [aligned[0], aligned[2], -aligned[1]],
+        3 => [aligned[0], -aligned[1], -aligned[2]],
+        4 => [-aligned[1], aligned[0], aligned[2]],
+        5 => [aligned[1], -aligned[0], aligned[2]],
+        _ => aligned,
     }
 }
 
@@ -184,69 +141,61 @@ pub fn evaluate_and_render_animated_frame(
     };
 
     let mut debug_lines = Vec::new();
-    if show_skeleton {
-        let dummy_size = 0.025f32; // Size of the 3D joint marker crosses
+    if show_skeleton && let Some(sm) = preview.submeshes.first() {
+        let dummy_size = 0.025f32;
+        let num_bones = sm.bones.len();
 
-        if let Some(sm) = preview.submeshes.first() {
-            let num_bones = sm.bones.len();
+        for i in 0..num_bones {
+            if i >= bone_positions.len() {
+                continue;
+            }
 
-            for i in 0..num_bones {
-                if i >= bone_positions.len() {
-                    continue;
-                }
+            let p_idx = sm.bones[i].parent_index;
+            let child_raw = bone_positions[i];
+            let child_pos = map_skeleton_coords(child_raw, cam.up_axis);
 
-                let p_idx = sm.bones[i].parent_index;
-                let child_raw = bone_positions[i];
-                let child_pos = map_skeleton_coords(child_raw, cam.up_axis);
+            if p_idx >= 0 && (p_idx as usize) < bone_positions.len() {
+                let parent_raw = bone_positions[p_idx as usize];
+                let parent_pos = map_skeleton_coords(parent_raw, cam.up_axis);
 
-                // 1. Line connecting parent to child bone
-                if p_idx >= 0 && (p_idx as usize) < bone_positions.len() {
-                    let parent_raw = bone_positions[p_idx as usize];
-                    let parent_pos = map_skeleton_coords(parent_raw, cam.up_axis);
-
-                    debug_lines.push(GridVertex {
-                        position: parent_pos,
-                        color: [1.0, 0.0, 1.0, 0.9],
-                    });
-                    debug_lines.push(GridVertex {
-                        position: child_pos,
-                        color: [0.0, 1.0, 1.0, 0.9],
-                    });
-                }
-
-                // 2. 3D Joint Marker Cross (Dummy)
-                let joint_color = [1.0, 0.8, 0.2, 1.0]; // Yellow-Orange joint markers
-
-                // X Axis
                 debug_lines.push(GridVertex {
-                    position: [child_pos[0] - dummy_size, child_pos[1], child_pos[2]],
-                    color: joint_color,
+                    position: parent_pos,
+                    color: [1.0, 0.0, 1.0, 0.9],
                 });
                 debug_lines.push(GridVertex {
-                    position: [child_pos[0] + dummy_size, child_pos[1], child_pos[2]],
-                    color: joint_color,
-                });
-
-                // Y Axis
-                debug_lines.push(GridVertex {
-                    position: [child_pos[0], child_pos[1] - dummy_size, child_pos[2]],
-                    color: joint_color,
-                });
-                debug_lines.push(GridVertex {
-                    position: [child_pos[0], child_pos[1] + dummy_size, child_pos[2]],
-                    color: joint_color,
-                });
-
-                // Z Axis
-                debug_lines.push(GridVertex {
-                    position: [child_pos[0], child_pos[1], child_pos[2] - dummy_size],
-                    color: joint_color,
-                });
-                debug_lines.push(GridVertex {
-                    position: [child_pos[0], child_pos[1], child_pos[2] + dummy_size],
-                    color: joint_color,
+                    position: child_pos,
+                    color: [0.0, 1.0, 1.0, 0.9],
                 });
             }
+
+            let joint_color = [1.0, 0.8, 0.2, 1.0];
+
+            debug_lines.push(GridVertex {
+                position: [child_pos[0] - dummy_size, child_pos[1], child_pos[2]],
+                color: joint_color,
+            });
+            debug_lines.push(GridVertex {
+                position: [child_pos[0] + dummy_size, child_pos[1], child_pos[2]],
+                color: joint_color,
+            });
+
+            debug_lines.push(GridVertex {
+                position: [child_pos[0], child_pos[1] - dummy_size, child_pos[2]],
+                color: joint_color,
+            });
+            debug_lines.push(GridVertex {
+                position: [child_pos[0], child_pos[1] + dummy_size, child_pos[2]],
+                color: joint_color,
+            });
+
+            debug_lines.push(GridVertex {
+                position: [child_pos[0], child_pos[1], child_pos[2] - dummy_size],
+                color: joint_color,
+            });
+            debug_lines.push(GridVertex {
+                position: [child_pos[0], child_pos[1], child_pos[2] + dummy_size],
+                color: joint_color,
+            });
         }
     }
 
@@ -349,10 +298,16 @@ pub fn evaluate_and_render_animated_frame(
                 positions: &sm.rest_positions,
                 indices: &sm.indices,
                 normals: &sm.rest_normals,
+                tangents: &sm.rest_tangents,
                 uvs: &sm.uvs,
                 joints: &sm.joints,
                 weights: &sm.weights,
                 texture: sm.texture.as_ref().map(|t| TextureData {
+                    width: t.0,
+                    height: t.1,
+                    rgba: &t.2,
+                }),
+                normal_texture: sm.normal_texture.as_ref().map(|t| TextureData {
                     width: t.0,
                     height: t.1,
                     rgba: &t.2,

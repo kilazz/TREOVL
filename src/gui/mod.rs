@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 
+use crate::engine::analysis::graph::DependencyGraph;
 use crate::engine::assets::animation::{AnimationClip, ObjectBone};
 use crate::engine::assets::sniffer::{AssetKind, sniff_asset};
 use crate::engine::container::sync::{AssetSyncCache, calculate_crc32};
@@ -22,6 +23,14 @@ use crate::utils::renderer::ViewportCamera;
 use crate::{AppWindow, AssetItem};
 use commands::WorkerCommand;
 use worker::BackgroundWorker;
+
+#[derive(Clone, Debug)]
+pub struct AvailableRig {
+    pub name: String,
+    pub bone_count: usize,
+    pub bones: Vec<ObjectBone>,
+    pub source_file: String,
+}
 
 #[derive(Clone)]
 pub struct CachedAsset {
@@ -34,14 +43,17 @@ pub struct RenderSubmesh {
     pub name: String,
     pub positions: Vec<Vector3>,
     pub normals: Vec<Vector3>,
+    pub tangents: Vec<Vector4>,
     pub rest_positions: Vec<Vector3>,
     pub rest_normals: Vec<Vector3>,
+    pub rest_tangents: Vec<Vector4>,
     pub joints: Vec<[u16; 4]>,
     pub weights: Vec<Vector4>,
     pub bones: Vec<ObjectBone>,
     pub indices: Vec<u32>,
     pub uvs: Vec<Vector2>,
     pub texture: Option<Arc<(u32, u32, Vec<u8>)>>,
+    pub normal_texture: Option<Arc<(u32, u32, Vec<u8>)>>,
 }
 
 #[derive(Clone)]
@@ -51,6 +63,8 @@ pub struct ActiveMeshPreview {
     pub composite_name: String,
     pub available_clips: Vec<AnimationClip>,
     pub current_clip_index: Option<usize>,
+    pub available_rigs: Vec<AvailableRig>,
+    pub current_rig_index: Option<usize>,
     pub current_time_seconds: f32,
     pub is_playing: bool,
     pub playback_speed: f32,
@@ -63,6 +77,7 @@ pub struct AppState {
     pub all_search_haystack: Vec<String>,
     pub visible_indices: Vec<usize>,
     pub current_proj_dir: Option<PathBuf>,
+    pub dependency_graph: Option<DependencyGraph>,
     pub camera: ViewportCamera,
     pub active_mesh: Option<ActiveMeshPreview>,
     pub filter_generation: u64,
@@ -147,7 +162,7 @@ pub fn scan_project_folder(project_dir: &Path) -> (Vec<AssetItem>, Vec<CachedAss
                 let bytes = fs::read(&path).unwrap_or_default();
                 let size_str = format!("{:.1} KB", bytes.len() as f64 / 1024.0);
                 let sniffed = sniff_asset(&bytes, &filename);
-                let kind_id = sniffed.kind.to_ui_kind_id();
+                let kind_id = i32::from(sniffed.kind);
 
                 let rel_key = format!("chunks/{}", filename);
                 let is_modified = cache_map.get(&rel_key).copied().unwrap_or_else(|| {

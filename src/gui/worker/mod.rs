@@ -7,6 +7,7 @@ pub mod viewport;
 pub use preview::ResolvedTexture;
 
 use parking_lot::Mutex;
+use std::path::PathBuf;
 use std::sync::{Arc, mpsc::Receiver};
 
 use slint::{ModelRc, VecModel};
@@ -208,6 +209,78 @@ impl BackgroundWorker {
                     &path,
                     kind,
                 );
+            }
+
+            WorkerCommand::SelectRig { rig_index } => {
+                let mut re_render_opt = None;
+                let mut new_anim_names = Vec::new();
+
+                let (proj_dir, active_preview_opt) = {
+                    let st = self.state.lock();
+                    (st.current_proj_dir.clone(), st.active_mesh.clone())
+                };
+
+                if let Some(mut preview) = active_preview_opt
+                    && (rig_index as usize) < preview.available_rigs.len()
+                {
+                    let actual_idx = rig_index as usize;
+                    preview.current_rig_index = Some(actual_idx);
+                    let selected_rig = &preview.available_rigs[actual_idx];
+
+                    // 1. Assign new bones across all submeshes
+                    for sm in &mut preview.submeshes {
+                        sm.bones = selected_rig.bones.clone();
+                    }
+
+                    // 2. Discover companion animations for this specific rig
+                    let clips = preview::discover_companion_animations(
+                        &selected_rig.name,
+                        &selected_rig.source_file,
+                        proj_dir.as_deref(),
+                    );
+
+                    new_anim_names.push("0: [REST POSE / BIND POSE]".into());
+                    for (i, c) in clips.iter().enumerate() {
+                        new_anim_names.push(
+                            format!("{}: {} ({:.2}s)", i + 1, c.name, c.duration_seconds).into(),
+                        );
+                    }
+
+                    preview.available_clips = clips;
+                    preview.current_clip_index = None;
+                    preview.current_time_seconds = 0.0;
+                    preview.is_playing = false;
+
+                    let cam = self.state.lock().camera;
+                    re_render_opt = Some((preview.clone(), cam, new_anim_names));
+
+                    self.state.lock().active_mesh = Some(preview);
+                }
+
+                if let Some((mut preview, cam, anims)) = re_render_opt {
+                    viewport::evaluate_and_render_animated_frame(
+                        &self.ui_handle,
+                        &self.state,
+                        &mut self.gpu_renderer,
+                        &mut preview,
+                        &cam,
+                    );
+
+                    let ui_h = self.ui_handle.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = ui_h.upgrade() {
+                            ui.set_selected_rig_idx(rig_index);
+                            ui.set_has_animations(!anims.is_empty());
+                            ui.set_available_animations(ModelRc::from(std::rc::Rc::new(
+                                VecModel::from(anims),
+                            )));
+                            ui.set_selected_anim_idx(0);
+                            ui.set_anim_duration(0.0);
+                            ui.set_anim_current_time(0.0);
+                            ui.set_is_anim_playing(false);
+                        }
+                    });
+                }
             }
 
             WorkerCommand::SelectAnimation { clip_index } => {
@@ -1124,6 +1197,129 @@ impl BackgroundWorker {
                 )),
                 Err(e) => self.logger.log(&format!("[!] Object save error: {}", e)),
             },
+            WorkerCommand::SaveCharacter {
+                chunk_path,
+                json_data,
+            } => match service::save_character(&chunk_path, &json_data) {
+                Ok(_) => self
+                    .logger
+                    .log(&format!("[+] Character chunk {:?} updated.", chunk_path)),
+                Err(e) => self.logger.log(&format!("[!] Character save error: {}", e)),
+            },
+            WorkerCommand::SaveAttachment {
+                chunk_path,
+                json_data,
+            } => match service::save_attachment(&chunk_path, &json_data) {
+                Ok(_) => self
+                    .logger
+                    .log(&format!("[+] Attachment chunk {:?} updated.", chunk_path)),
+                Err(e) => self
+                    .logger
+                    .log(&format!("[!] Attachment save error: {}", e)),
+            },
+            WorkerCommand::SaveCharacterFromForm => {
+                let ui_h = self.ui_handle.clone();
+                let logger = self.logger.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_h.upgrade() {
+                        let path_str = ui.get_active_file_path().to_string();
+                        if path_str.is_empty() {
+                            return;
+                        }
+                        let path = PathBuf::from(&path_str);
+                        let json_str = ui.get_mat_json_text().to_string();
+                        let mut char_actor: crate::engine::assets::character::CharacterActorJson =
+                            match serde_json::from_str(&json_str) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    logger
+                                        .log(&format!("[!] JSON parse error on form save: {}", e));
+                                    return;
+                                }
+                            };
+
+                        char_actor.character_name = ui.get_form_char_name().to_string();
+                        if !ui.get_form_char_tag().is_empty() {
+                            char_actor.resource_tag = Some(ui.get_form_char_tag().to_string());
+                        }
+
+                        if let Some(ref mut attrs) = char_actor.combat_attributes {
+                            attrs.base_health = Some(ui.get_form_char_health());
+                            attrs.move_speed_scale = Some(ui.get_form_char_speed());
+                            attrs.aggro_range = Some(ui.get_form_char_aggro());
+                            attrs.perception_radius = Some(ui.get_form_char_perception());
+                            attrs.damage_multiplier = Some(ui.get_form_char_damage_mult());
+                            attrs.can_swim = Some(ui.get_form_char_can_swim());
+                        }
+
+                        if let Some(ref mut flags) = char_actor.actor_flags {
+                            flags.casts_dynamic_shadows = ui.get_form_char_shadows();
+                            flags.can_be_targeted = ui.get_form_char_targetable();
+                            flags.ragdoll_on_death = ui.get_form_char_ragdoll();
+                        }
+
+                        if let Ok(updated_json) = serde_json::to_string_pretty(&char_actor) {
+                            ui.set_mat_json_text(updated_json.clone().into());
+                            match service::save_character(&path, &updated_json) {
+                                Ok(_) => logger
+                                    .log(&format!("[+] Character properties saved for {:?}", path)),
+                                Err(e) => logger
+                                    .log(&format!("[!] Error saving character properties: {}", e)),
+                            }
+                        }
+                    }
+                });
+            }
+            WorkerCommand::SaveAttachmentFromForm => {
+                let ui_h = self.ui_handle.clone();
+                let logger = self.logger.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_h.upgrade() {
+                        let path_str = ui.get_active_file_path().to_string();
+                        if path_str.is_empty() {
+                            return;
+                        }
+                        let path = PathBuf::from(&path_str);
+                        let json_str = ui.get_mat_json_text().to_string();
+                        let mut item_att: crate::engine::assets::attachment::ItemAttachmentJson =
+                            match serde_json::from_str(&json_str) {
+                                Ok(i) => i,
+                                Err(e) => {
+                                    logger
+                                        .log(&format!("[!] JSON parse error on form save: {}", e));
+                                    return;
+                                }
+                            };
+
+                        item_att.item_name = ui.get_form_item_name().to_string();
+                        item_att.mesh_package = ui.get_form_item_mesh_pkg().to_string();
+                        item_att.submesh_name = ui.get_form_item_submesh().to_string();
+                        item_att.sound_bank = ui.get_form_item_sound_bank().to_string();
+                        item_att.socket.mount_point = ui.get_form_item_mount_point().to_string();
+                        item_att.flags.is_pickable = ui.get_form_item_pickable();
+                        item_att.flags.cast_shadows = ui.get_form_item_shadows();
+                        item_att.flags.drop_physics = ui.get_form_item_physics();
+
+                        if let Some(ref mut w) = item_att.weapon_config {
+                            w.damage_multiplier = Some(ui.get_form_item_damage());
+                            w.attack_range = Some(ui.get_form_item_range());
+                            w.speed_modifier = Some(ui.get_form_item_speed_mod());
+                        }
+
+                        if let Ok(updated_json) = serde_json::to_string_pretty(&item_att) {
+                            ui.set_mat_json_text(updated_json.clone().into());
+                            match service::save_attachment(&path, &updated_json) {
+                                Ok(_) => logger.log(&format!(
+                                    "[+] Attachment properties saved for {:?}",
+                                    path
+                                )),
+                                Err(e) => logger
+                                    .log(&format!("[!] Error saving attachment properties: {}", e)),
+                            }
+                        }
+                    }
+                });
+            }
             WorkerCommand::SaveTerrainPalette {
                 chunk_path,
                 json_data,

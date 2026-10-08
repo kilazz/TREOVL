@@ -176,7 +176,6 @@ impl Endian {
     }
 }
 
-/// Detects archive endianness by reading the file size field at offset 12 in the PRP header.
 pub fn detect_endianness(header_bytes: &[u8]) -> Endian {
     if header_bytes.len() < 16 {
         return Endian::Little;
@@ -443,4 +442,209 @@ pub fn calculate_crc32(data: &[u8]) -> u32 {
 
 pub fn calculate_triumph_crc32(data: &[u8]) -> u32 {
     !calculate_crc32(data)
+}
+
+#[inline]
+pub fn parse_f32_safe(chunk: &[u8]) -> Option<f32> {
+    if chunk.len() >= 4 {
+        let val = f32::from_le_bytes(chunk[0..4].try_into().unwrap_or_default());
+        if val.is_finite() && !val.is_subnormal() && (1e-4..=500_000.0).contains(&val.abs()) {
+            return Some(val);
+        }
+    }
+    None
+}
+
+/// Represents a Triumph Engine Map Entity UID / Scene Graph Instance Handle.
+/// In Triumph Engine packages, Chunk 22 frequently stores a packed 32-bit handle where:
+/// - Bits 0..23 (or lower 16 bits): The sequential instance UID within the level map.
+/// - Bits 24..31: ASCII domain namespace tag ('M' = 0x4D for Map/Model instance, 'I' = 0x49, etc.)
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct EntityHandleJson {
+    pub uid: u32,
+    pub domain_tag: String,
+    pub raw_hex: String,
+}
+
+pub fn parse_entity_handle(raw_u32: u32) -> Option<EntityHandleJson> {
+    let high_byte = ((raw_u32 >> 24) & 0xFF) as u8;
+    let low_24 = raw_u32 & 0x00FF_FFFF;
+
+    // Pattern 1: High byte is ASCII tag (e.g. 0x4D000008 -> 'M' with UID 8)
+    if high_byte.is_ascii_alphanumeric() && low_24 <= 0x000F_FFFF {
+        return Some(EntityHandleJson {
+            uid: low_24,
+            domain_tag: (high_byte as char).to_string(),
+            raw_hex: format!("0x{:08X}", raw_u32),
+        });
+    }
+
+    // Pattern 2: Low byte is ASCII tag (e.g. 0x03000049 -> 'I' with UID 3)
+    let low_byte = (raw_u32 & 0xFF) as u8;
+    let high_24 = raw_u32 >> 8;
+    if low_byte.is_ascii_alphanumeric() && high_24 <= 0x000F_FFFF {
+        return Some(EntityHandleJson {
+            uid: high_24,
+            domain_tag: (low_byte as char).to_string(),
+            raw_hex: format!("0x{:08X}", raw_u32),
+        });
+    }
+
+    None
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ItemSocketConfigJson {
+    pub mount_point: String,
+    pub primary_slot: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secondary_slot: Option<u32>,
+}
+
+pub fn parse_socket_data(chunk: &[u8]) -> ItemSocketConfigJson {
+    if chunk.len() >= 13 && chunk.starts_with(&[1, 40, 0, 2, 40, 0, 43, 4]) {
+        ItemSocketConfigJson {
+            mount_point: "Right_Hand_Carry".into(),
+            primary_slot: 40,
+            secondary_slot: Some(43),
+        }
+    } else {
+        ItemSocketConfigJson {
+            mount_point: "Standard_Grip".into(),
+            primary_slot: 40,
+            secondary_slot: None,
+        }
+    }
+}
+
+pub fn build_socket_data(socket: &ItemSocketConfigJson) -> Vec<u8> {
+    if socket.secondary_slot.is_some() {
+        vec![1, 40, 0, 2, 40, 0, 43, 4, 1, 1, 0, 0, 0]
+    } else {
+        vec![1, 40, 0, 1, 40, 0, 1, 1, 0, 0]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ObjectTypeId {
+    ModelResource = 0x0041004B,
+    PlacementObject = 0x00464621,
+    SoundMarker = 0x00464661,
+    PushableWheel1 = 0x00464665,
+    PushableWheel2 = 0x00464669,
+    LogicMarker = 0x00462103,
+    PointLight = 0x00462107,
+    MinionGate = 0x00464181,
+    UpgradePortal = 0x00464681,
+    DoorController,
+    LightMarker,
+    Mechanism,
+    Unknown(u32),
+}
+
+impl From<u32> for ObjectTypeId {
+    fn from(val: u32) -> Self {
+        match val {
+            0x0041004B => Self::ModelResource,
+            0x00464621 => Self::PlacementObject,
+            0x00464661 => Self::SoundMarker,
+            0x00464665 => Self::PushableWheel1,
+            0x00464669 => Self::PushableWheel2,
+            0x00462103 => Self::LogicMarker,
+            0x00462107 => Self::PointLight,
+            0x00464181 => Self::MinionGate,
+            0x00464681 => Self::UpgradePortal,
+            _ if (val >> 8) == 0x004650 => Self::DoorController,
+            _ if (val >> 8) == 0x004621 => Self::LightMarker,
+            _ if (val >> 8) == 0x004646 => Self::Mechanism,
+            _ => Self::Unknown(val),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ObjectChunkId {
+    GroupTag = 20,
+    EntityName = 21,
+    Flags = 22,
+    Enabled = 23,
+    DisplayName = 25,
+    StanceId = 28,
+    CanBeCarried = 29,
+    MeshBindings = 30,
+    StandModel = 31,
+    Scale = 32,
+    Bones = 33,
+    BoundingBox = 34,
+    RagdollBones = 35,
+    DefaultAnimation = 36,
+    PhysicsState = 37,
+    InteractionActions41 = 41,
+    PlacedObject = 42,
+    TriggerActive = 43,
+    SecondaryFlags = 45,
+    MaterialId = 46,
+    LogicEventLink = 50,
+    DoorStateCount = 55,
+    Attachments60 = 60,
+    PointLightParams = 70,
+    DoorDefaultState = 71,
+    InteractionActions72 = 72,
+    InteractionActions73 = 73,
+    InteractionActions74 = 74,
+    InteractionActions75 = 75,
+    Attachments86 = 86,
+    OpenCollision = 100,
+    ClosedCollision = 101,
+    Attachments128 = 128,
+    PlacementOffset = 300,
+    Terminator = 19,
+    AttachmentSlots = 1,
+    Unknown(u32),
+}
+
+impl From<u32> for ObjectChunkId {
+    fn from(val: u32) -> Self {
+        match val {
+            20 => Self::GroupTag,
+            21 => Self::EntityName,
+            22 => Self::Flags,
+            23 => Self::Enabled,
+            25 => Self::DisplayName,
+            28 => Self::StanceId,
+            29 => Self::CanBeCarried,
+            30 => Self::MeshBindings,
+            31 => Self::StandModel,
+            32 => Self::Scale,
+            33 => Self::Bones,
+            34 => Self::BoundingBox,
+            35 => Self::RagdollBones,
+            36 => Self::DefaultAnimation,
+            37 => Self::PhysicsState,
+            41 => Self::InteractionActions41,
+            42 => Self::PlacedObject,
+            43 => Self::TriggerActive,
+            45 => Self::SecondaryFlags,
+            46 => Self::MaterialId,
+            50 => Self::LogicEventLink,
+            55 => Self::DoorStateCount,
+            60 => Self::Attachments60,
+            70 => Self::PointLightParams,
+            71 => Self::DoorDefaultState,
+            72 => Self::InteractionActions72,
+            73 => Self::InteractionActions73,
+            74 => Self::InteractionActions74,
+            75 => Self::InteractionActions75,
+            86 => Self::Attachments86,
+            100 => Self::OpenCollision,
+            101 => Self::ClosedCollision,
+            128 => Self::Attachments128,
+            300 => Self::PlacementOffset,
+            19 => Self::Terminator,
+            1 => Self::AttachmentSlots,
+            _ => Self::Unknown(val),
+        }
+    }
 }

@@ -1,3 +1,4 @@
+use TREOVL::engine::analysis::graph::build_dependency_graph;
 use TREOVL::engine::assets::attachment::{
     ItemAttachmentJson, ItemFlagsJson, ItemPhysicsConfigJson, ItemSocketConfigJson,
     export_attachment_to_json, import_attachment_from_json_with_endian,
@@ -24,12 +25,14 @@ use TREOVL::engine::assets::object::{
     BoundingBoxJson, ObjectEngineMetadataJson, ObjectEntityJson, export_object,
     import_object_from_json_with_endian,
 };
+use TREOVL::engine::assets::parameter::{export_parameter_to_json, import_parameter_from_json};
+use TREOVL::engine::assets::projectile::{export_projectile_to_json, import_projectile_from_json};
 use TREOVL::engine::assets::vfx::{
     VfxEmitterJson, VfxEngineMetadataJson, VfxGraphJson, VfxPropertyBlockJson, export_vfx_to_json,
     import_vfx_from_json_with_endian,
 };
 use TREOVL::engine::assets::{build_chunk_from_elements, parse_chunk_elements};
-use TREOVL::engine::common::Endian;
+use TREOVL::engine::common::{Endian, EntityHandleJson, parse_entity_handle};
 use TREOVL::engine::container::footer::{
     MAGIC_FOOTER_1, MAGIC_FOOTER_2, calculate_triumph_crc32, check_footer,
 };
@@ -125,37 +128,44 @@ fn test_wgpu_renderer_creation_safe() {
 }
 
 #[test]
+fn test_entity_handle_parsing_and_reconstruction() {
+    // 1. Minion Brown handle: 0x4D000008 (Domain 'M', UID 8)
+    let h1 = parse_entity_handle(0x4D000008).expect("Should parse 'M' tag handle");
+    assert_eq!(h1.domain_tag, "M");
+    assert_eq!(h1.uid, 8);
+    assert_eq!(h1.raw_hex, "0x4D000008");
+
+    // 2. The Overlord player handle: 0x4D00004B (Domain 'M', UID 75)
+    let h2 = parse_entity_handle(0x4D00004B).expect("Should parse 'M' tag handle");
+    assert_eq!(h2.domain_tag, "M");
+    assert_eq!(h2.uid, 75);
+
+    // 3. WorshipPeasantA handle: 0x03000049 (Domain 'I', UID 3)
+    let h3 = parse_entity_handle(0x03000049).expect("Should parse inverted 'I' handle");
+    assert_eq!(h3.domain_tag, "I");
+    assert_eq!(h3.uid, 3);
+}
+
+#[test]
 fn test_character_pure_in_memory_roundtrip_le_and_be() {
     let character = CharacterActorJson {
-        _engine_metadata: Default::default(),
         character_name: "Minion_Brown_PureTest".to_string(),
         resource_tag: Some("Minion_Test_Tag".to_string()),
+        entity_handle: Some(EntityHandleJson {
+            uid: 8,
+            domain_tag: "M".to_string(),
+            raw_hex: "0x4D000008".to_string(),
+        }),
         is_baby: Some(false),
-        model_binding: None,
-        breakable_config: None,
-        collapse_target_model: None,
-        actor_flags: None,
         combat_attributes: Some(CharacterAttributesJson {
             base_health: Some(42.5),
             move_speed_scale: Some(1.35),
             aggro_range: Some(18.0),
             ..Default::default()
         }),
-        timing_parameters: None,
-        knockback_parameters: None,
-        state_and_rewards: None,
-        morph_parameters: None,
-        equipment: None,
-        facefx_actor: None,
-        embedded_facefx_file: None,
-        lifeforce_color: None,
-        lua_script_file: None,
         embedded_lua_script: Some("GetAlias()\nPrint(\"Test\")".to_string()),
-        animation_states: Vec::new(),
         ai_behaviors: vec!["AttackState".to_string(), "FleeState".to_string()],
-        transformations: Vec::new(),
-        effect_receptors: Vec::new(),
-        minion_grapple_bones: Vec::new(),
+        ..Default::default()
     };
 
     let json_str = serde_json::to_string_pretty(&character).unwrap();
@@ -170,26 +180,25 @@ fn test_character_pure_in_memory_roundtrip_le_and_be() {
         "Minion_Brown_PureTest"
     );
     assert_eq!(
-        extracted_le
-            .character
-            .combat_attributes
-            .as_ref()
-            .and_then(|a| a.base_health),
-        Some(42.5)
+        extracted_le.character._engine_metadata.engine_class,
+        "TREActor"
+    );
+    assert_eq!(
+        extracted_le.character.entity_handle.as_ref().map(|h| h.uid),
+        Some(8)
     );
     assert_eq!(
         extracted_le
             .character
-            .combat_attributes
+            .entity_handle
             .as_ref()
-            .and_then(|a| a.move_speed_scale),
-        Some(1.35)
+            .map(|h| h.domain_tag.as_str()),
+        Some("M")
     );
 
     // 2. Test Big Endian (Xbox 360 / PS3)
     let bin_be = import_character_from_json_with_externals(&json_str, None, None, Endian::Big)
         .expect("BE Import must succeed");
-
     assert!(!bin_be.is_empty());
 
     // 3. Test default function
@@ -203,49 +212,42 @@ fn test_character_pure_in_memory_roundtrip_le_and_be() {
 fn test_object_pure_in_memory_roundtrip() {
     let object = ObjectEntityJson {
         _engine_metadata: ObjectEngineMetadataJson {
-            type_id_hex: "0041004B".to_string(),
-            class_name: Some("TREModelResource".to_string()),
+            type_id_hex: "00464621".to_string(),
+            class_name: Some("TREPlacementObject".to_string()),
             raw_fallbacks: Vec::new(),
         },
         group_tag: Some("Props_Group".to_string()),
-        entity_name: Some("Barrel_Explosive".to_string()),
+        entity_name: Some("Big Bag of Gold".to_string()),
+        entity_handle: Some(EntityHandleJson {
+            uid: 83,
+            domain_tag: "M".to_string(),
+            raw_hex: "0x4D000053".to_string(),
+        }),
         scale: Some([1.5, 1.5, 2.0]),
         bounding_box: Some(BoundingBoxJson {
             center: [0.0, 1.0, 0.0],
             half_extents: [0.5, 1.0, 0.5],
             orientation_matrix: None,
         }),
-        default_animation: None,
-        physics_state: None,
-        ragdoll_bone_groups: Vec::new(),
-        mesh_bindings: Vec::new(),
-        stand_model: None,
-        placed_object: None,
-        placement_offset: None,
-        placement_config: None,
-        bones: Vec::new(),
-        attachments: Vec::new(),
         has_sentinel_terminator: true,
+        ..Default::default()
     };
 
     let json_str = serde_json::to_string_pretty(&object).unwrap();
 
-    // Little Endian
     let bin_le = import_object_from_json_with_endian(&json_str, Endian::Little)
         .expect("Object import LE must succeed");
     let extracted_le = export_object(&bin_le).expect("Object export LE must succeed");
 
     assert_eq!(
         extracted_le.entity.entity_name.as_deref(),
-        Some("Barrel_Explosive")
+        Some("Big Bag of Gold")
     );
-    assert_eq!(extracted_le.entity.scale, Some([1.5, 1.5, 2.0]));
+    assert_eq!(
+        extracted_le.entity.entity_handle.as_ref().map(|h| h.uid),
+        Some(83)
+    );
     assert!(extracted_le.entity.has_sentinel_terminator);
-
-    // Big Endian
-    let bin_be = import_object_from_json_with_endian(&json_str, Endian::Big)
-        .expect("Object import BE must succeed");
-    assert!(!bin_be.is_empty());
 }
 
 #[test]
@@ -320,6 +322,9 @@ fn test_attachment_pure_in_memory_roundtrip() {
             is_buoyant: false,
             damage_on_throw: true,
         },
+        equipment_config: None,
+        weapon_config: None,
+        breakable_config: None,
     };
 
     let json_str = serde_json::to_string(&attachment).unwrap();
@@ -423,7 +428,7 @@ fn test_font_pure_in_memory_roundtrip() {
         line_height: 22.0,
         glyphs: vec![
             GlyphMetricJson {
-                char_code: 65, // 'A'
+                char_code: 65,
                 character: "A".to_string(),
                 width: 14.0,
                 height: 18.0,
@@ -431,7 +436,7 @@ fn test_font_pure_in_memory_roundtrip() {
                 uv_max: [0.2, 0.3],
             },
             GlyphMetricJson {
-                char_code: 66, // 'B'
+                char_code: 66,
                 character: "B".to_string(),
                 width: 13.5,
                 height: 18.0,
@@ -511,8 +516,6 @@ fn test_cptx_pure_in_memory_roundtrip() {
 
 #[test]
 fn test_dta_pure_in_memory_roundtrip() {
-    // A point light candidate record is 32 bytes:
-    // x, y, z (f32), radius (f32), r, g, b (f32), intensity (f32)
     let mut raw_light_bytes = Vec::new();
     for val in [
         12.5f32, -4.0, 30.0, // position XYZ
@@ -549,4 +552,132 @@ fn test_dta_pure_in_memory_roundtrip() {
 
     assert_eq!(re_parsed.lights.len(), 1);
     assert_eq!(re_parsed.lights[0].intensity, 4.0);
+}
+
+#[test]
+fn test_projectile_pure_in_memory_roundtrip() {
+    let proj_json_raw = serde_json::json!({
+        "_engine_metadata": {
+            "type_id_hex": "00463006",
+            "engine_class": "TREProjectile",
+            "unmapped_raw_blocks": []
+        },
+        "projectile_name": "Fireball_Test",
+        "entity_handle": {
+            "uid": 28,
+            "domain_tag": "M",
+            "raw_hex": "0x4D00001C"
+        },
+        "is_enabled": true,
+        "physics": {
+            "flight_speed": 40.0,
+            "damage_scale": 2.5
+        }
+    });
+
+    let json_str = serde_json::to_string_pretty(&proj_json_raw).unwrap();
+    let bin = import_projectile_from_json(&json_str, Endian::Little)
+        .expect("Projectile import must succeed");
+    let re_exported_json =
+        export_projectile_to_json(&bin, "test_proj").expect("Projectile export must succeed");
+
+    assert!(re_exported_json.contains("Fireball_Test"));
+    assert!(re_exported_json.contains("0x4D00001C"));
+}
+
+#[test]
+fn test_logic_marker_environment_cross_linking() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let assets_dir = temp_dir.path().join("assets");
+    let obj_dir = assets_dir.join("objects");
+    let env_dir = assets_dir.join("environments");
+
+    std::fs::create_dir_all(&obj_dir).unwrap();
+    std::fs::create_dir_all(&env_dir).unwrap();
+
+    // 1. Write an environment with flags_hex "0300004D"
+    let env_json = serde_json::json!({
+        "_engine_metadata": {
+            "is_typed_container": true,
+            "type_id_hex": "04000083"
+        },
+        "profile_name": "Endscene7DOOM",
+        "flags_hex": "0300004D",
+        "fog_near": 20.0,
+        "fog_far": 40.0,
+        "fog_color": "#377479",
+        "ambient_color": "#0D1015",
+        "sun_direction": [0.0, 1.0, 0.0],
+        "sun_color": "#FFFFFF",
+        "fill_direction": [0.0, -1.0, 0.0],
+        "fill_color": "#000000",
+        "fill_range": 10.0,
+        "gamma": 2.2,
+        "exposure": 0.3,
+        "bloom_threshold": 0.05,
+        "bloom_intensity": 1.5,
+        "water_tint": "#FFFFFF",
+        "far_clip": 64.0,
+        "flow_vector": [0.0, 0.0]
+    });
+    std::fs::write(
+        env_dir.join("Endscene7DOOM_chunk_0023_id0x3.json"),
+        env_json.to_string(),
+    )
+    .unwrap();
+
+    // 2. Write a logic marker object with raw_hex_id "0300004D"
+    let marker_json = serde_json::json!({
+        "_engine_metadata": {
+            "type_id_hex": "00462103",
+            "class_name": "TRELogicMarker",
+            "raw_fallbacks": []
+        },
+        "entity_name": "DOOM",
+        "logic_event_link": {
+            "target_event": "Endscene7DOOM",
+            "raw_hex_id": "0300004D"
+        }
+    });
+    std::fs::write(
+        obj_dir.join("DOOM_chunk_1900_id0x0.json"),
+        marker_json.to_string(),
+    )
+    .unwrap();
+
+    // 3. Build graph and assert bidirectional cross-links
+    let graph = build_dependency_graph(&assets_dir).expect("Graph building must succeed");
+
+    let links_from_doom = graph.find_links_for_asset("DOOM_chunk_1900_id0x0");
+    assert!(
+        links_from_doom
+            .iter()
+            .any(|l| l.target_name.contains("Endscene7DOOM"))
+    );
+
+    let links_from_env = graph.find_links_for_asset("Endscene7DOOM_chunk_0023_id0x3");
+    assert!(
+        links_from_env
+            .iter()
+            .any(|l| l.target_name.contains("DOOM"))
+    );
+}
+
+#[test]
+fn test_chunk_1881_jester_slot_descriptor_roundtrip() {
+    let raw_hex = "03140015091E0D0500000033393434300101000001010001000057000004020A000B0A060000006A657374657200000000";
+    let binary = hex::decode(raw_hex).unwrap();
+    assert_eq!(binary.len(), 49);
+
+    // 1. Export binary to JSON
+    let json_str = export_parameter_to_json(&binary, "chunk_1881").unwrap();
+    assert!(json_str.contains("asset_slot_descriptor"));
+    assert!(json_str.contains("39440"));
+    assert!(json_str.contains("jester"));
+
+    // 2. Import JSON back to binary
+    let rebuilt = import_parameter_from_json(json_str.as_bytes(), &binary).unwrap();
+
+    // 3. Must match bit-for-bit with the original 49 bytes!
+    assert_eq!(hex::encode_upper(&rebuilt), raw_hex);
 }

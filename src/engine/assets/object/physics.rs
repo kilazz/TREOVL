@@ -26,18 +26,27 @@ pub struct EntityPhysicsStateJson {
     pub collision_radius: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logic_flags: Option<PhysicsFlagsJson>,
-    pub raw_w_hex: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_w_hex: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_parameters: Option<[u32; 4]>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct PhysicsFlagsJson {
     pub is_equippable: bool,
     pub cast_shadows: bool,
     pub spatial_query_enabled: bool,
     pub is_dynamic_actor: bool,
-    pub unmapped_bits_hex: String,
+    pub is_indestructible: bool,
+    pub ignore_gravity: bool,
+    pub is_projectile: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_value: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category_mask: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unmapped_bits_hex: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -171,31 +180,72 @@ pub fn parse_physics_state(chunk: &[u8]) -> Option<EntityPhysicsStateJson> {
     let w_bytes = cur.read_u32::<LittleEndian>().ok()?;
 
     let w_f32 = f32::from_bits(w_bytes);
-    let is_clean_float = w_f32.is_finite() && w_f32.abs() >= 1e-4 && w_f32.abs() <= 100_000.0;
+
+    let is_clean_float = w_f32.is_finite()
+        && !w_f32.is_subnormal()
+        && (0.005..=1000.0).contains(&w_f32.abs())
+        && (w_bytes & 0xFF000000) != 0xFF000000;
 
     let p0 = u32::from_le_bytes(chunk[0..4].try_into().unwrap_or_default());
     let p1 = u32::from_le_bytes(chunk[4..8].try_into().unwrap_or_default());
     let p2 = u32::from_le_bytes(chunk[8..12].try_into().unwrap_or_default());
+
     let is_subnormal = (p0 != 0 && ox.is_subnormal()) || (p1 != 0 && oy.is_subnormal());
 
-    let (collision_radius, logic_flags) = if is_clean_float {
-        (Some(w_f32), None)
+    let mut collision_radius = None;
+    let mut logic_flags = None;
+    let mut raw_w_hex = None;
+
+    if is_clean_float {
+        collision_radius = Some(w_f32);
     } else {
-        let flags = PhysicsFlagsJson {
-            is_equippable: (w_bytes & 0x0002) != 0,
-            cast_shadows: (w_bytes & 0x0008) != 0,
-            spatial_query_enabled: (w_bytes & 0x0010) != 0,
-            is_dynamic_actor: (w_bytes & 0x0100) != 0,
-            unmapped_bits_hex: format!("0x{:08X}", w_bytes & !(0x0002 | 0x0008 | 0x0010 | 0x0100)),
-        };
-        (None, Some(flags))
-    };
+        // C++ Uninitialized memory markers (MSVC Debug Heap)
+        if w_bytes == 0xEDEDEDED || w_bytes == 0xCACFCACF || w_bytes == 0xCDCDCDCD {
+            raw_w_hex = Some(format!("0x{:08X}", w_bytes));
+        } else {
+            let known_bool_mask = 0x0002 | 0x0008 | 0x0010 | 0x0100 | 0x0004 | 0x0020 | 0x1000;
+
+            // Extract encoded 16-bit integer value (e.g. 0x01170000 -> 279)
+            let value_encoded = (w_bytes & 0x00FF0000) >> 16;
+
+            // Extract top 8-bit category mask (e.g. 0xFF000000 -> 255)
+            let category = (w_bytes & 0xFF000000) >> 24;
+
+            let mut unmapped = w_bytes & !known_bool_mask;
+            unmapped &= 0x0000FFFF; // Clear top 16 bits as they are handled by value/category
+
+            logic_flags = Some(PhysicsFlagsJson {
+                is_equippable: (w_bytes & 0x0002) != 0,
+                cast_shadows: (w_bytes & 0x0008) != 0,
+                spatial_query_enabled: (w_bytes & 0x0010) != 0,
+                is_dynamic_actor: (w_bytes & 0x0100) != 0,
+                is_indestructible: (w_bytes & 0x0004) != 0,
+                ignore_gravity: (w_bytes & 0x0020) != 0,
+                is_projectile: (w_bytes & 0x1000) != 0,
+                resource_value: if value_encoded > 0 {
+                    Some(value_encoded)
+                } else {
+                    None
+                },
+                category_mask: if category > 0 {
+                    Some(category as u8)
+                } else {
+                    None
+                },
+                unmapped_bits_hex: if unmapped != 0 {
+                    Some(format!("0x{:08X}", unmapped))
+                } else {
+                    None
+                },
+            });
+        }
+    }
 
     Some(EntityPhysicsStateJson {
         offset: [ox, oy, oz],
         collision_radius,
         logic_flags,
-        raw_w_hex: format!("0x{:08X}", w_bytes),
+        raw_w_hex,
         raw_parameters: if is_subnormal {
             Some([p0, p1, p2, w_bytes])
         } else {
@@ -218,7 +268,9 @@ pub fn rebuild_physics_state(state: &EntityPhysicsStateJson, endian: Endian) -> 
     let _ = endian.write_f32(&mut out, state.offset[1]);
     let _ = endian.write_f32(&mut out, state.offset[2]);
 
-    let w_u32 = if let Some(ref flags) = state.logic_flags {
+    let w_u32 = if let Some(r) = state.collision_radius {
+        r.to_bits()
+    } else if let Some(ref flags) = state.logic_flags {
         let mut val = 0u32;
         if flags.is_equippable {
             val |= 0x0002;
@@ -232,16 +284,34 @@ pub fn rebuild_physics_state(state: &EntityPhysicsStateJson, endian: Endian) -> 
         if flags.is_dynamic_actor {
             val |= 0x0100;
         }
-        if let Ok(unmapped) =
-            u32::from_str_radix(flags.unmapped_bits_hex.trim_start_matches("0x"), 16)
+        if flags.is_indestructible {
+            val |= 0x0004;
+        }
+        if flags.ignore_gravity {
+            val |= 0x0020;
+        }
+        if flags.is_projectile {
+            val |= 0x1000;
+        }
+
+        if let Some(res_val) = flags.resource_value {
+            val |= (res_val & 0xFF) << 16;
+        }
+
+        if let Some(cat_mask) = flags.category_mask {
+            val |= (cat_mask as u32) << 24;
+        }
+
+        if let Some(unmapped) = flags.unmapped_bits_hex.as_ref()
+            && let Ok(unmapped_val) = u32::from_str_radix(unmapped.trim_start_matches("0x"), 16)
         {
-            val |= unmapped;
+            val |= unmapped_val & 0x0000FFFF;
         }
         val
-    } else if let Some(r) = state.collision_radius {
-        r.to_bits()
+    } else if let Some(raw) = state.raw_w_hex.as_ref() {
+        u32::from_str_radix(raw.trim_start_matches("0x"), 16).unwrap_or(0)
     } else {
-        u32::from_str_radix(state.raw_w_hex.trim_start_matches("0x"), 16).unwrap_or(0)
+        0
     };
 
     let _ = endian.write_u32(&mut out, w_u32);

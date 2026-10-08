@@ -1,0 +1,398 @@
+import { TextEdit, LineEdit, CheckBox, Slider } from "std-widgets.slint";
+import { CustomButton } from "../../components/buttons.slint";
+import { SectionTitle, FormRow } from "../../components/common.slint";
+
+export component PropertyGridView inherits VerticalLayout {
+    in property <string> title_text: "ENTITY PROPERTY GRID";
+    in property <color> title_color: #58a6ff;
+    in property <bool> is_character: true;
+
+    // View Mode: 0 = Form Inspector (Property Grid), 1 = Raw JSON
+    in-out property <int> active_mode: 0;
+    in-out property <string> raw_json_text: "";
+
+    // Character Actor Properties
+    in-out property <string> char_name: "";
+    in-out property <string> char_tag: "";
+    in-out property <float> char_health: 100.0;
+    in-out property <float> char_speed: 1.0;
+    in-out property <float> char_aggro_range: 15.0;
+    in-out property <float> char_perception: 20.0;
+    in-out property <float> char_damage_mult: 1.0;
+    in-out property <int> char_faction_id: 0;
+    in-out property <bool> char_casts_shadows: true;
+    in-out property <bool> char_targetable: true;
+    in-out property <bool> char_ragdoll: true;
+    in-out property <bool> char_can_swim: false;
+
+    // Item / Weapon Attachment Properties
+    in-out property <string> item_name: "";
+    in-out property <string> item_mesh_pkg: "";
+    in-out property <string> item_submesh: "";
+    in-out property <string> item_sound_bank: "";
+    in-out property <string> item_mount_point: "Right_Hand_Carry";
+    in-out property <float> item_damage_mult: 1.0;
+    in-out property <float> item_attack_range: 2.5;
+    in-out property <float> item_speed_mod: 1.0;
+    in-out property <bool> item_pickable: true;
+    in-out property <bool> item_shadows: true;
+    in-out property <bool> item_drop_physics: true;
+
+    callback save_form_clicked();
+    callback save_json_clicked();
+
+    spacing: 8px;
+    vertical-stretch: 1;
+
+    // Top Header with Inspector Mode Toggle Chips
+    HorizontalLayout {
+        alignment: space-between;
+        SectionTitle {
+            text: root.title_text;
+            text-color: root.title_color;
+        }
+
+        HorizontalLayout {
+            spacing: 4px;
+            Rectangle {
+                width: 108px;
+                height: 24px;
+                background: root.active_mode == 0 ? #3e6a90 : #2b2d31;
+                border-radius: 3px;
+                Text {
+                    text: "📋 Property Grid";
+                    font-size: 11px;
+                    font-weight: 700;
+                    color: #ffffff;
+                    vertical-alignment: center;
+                    horizontal-alignment: center;
+                }
+
+                TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.active_mode = 0; }
+                }
+            }
+
+            Rectangle {
+                width: 90px;
+                height: 24px;
+                background: root.active_mode == 1 ? #3e6a90 : #2b2d31;
+                border-radius: 3px;
+                Text {
+                    text: "📝 Raw JSON";
+                    font-size: 11px;
+                    font-weight: 700;
+                    color: #ffffff;
+                    vertical-alignment: center;
+                    horizontal-alignment: center;
+                }
+
+                TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.active_mode = 1; }
+                }
+            }
+        }
+    }
+
+    // MODE 0: VISUAL FORM INSPECTOR (PROPERTY GRID)
+    if root.active_mode == 0: VerticalLayout {
+        spacing: 8px;
+        vertical-stretch: 1;
+
+        HorizontalLayout {
+            spacing: 8px;
+            CustomButton {
+                icon: "💾";
+                text: "Save Properties";
+                primary-color: #23a55a;
+                min-w: 160px;
+                clicked => { root.save_form_clicked(); }
+            }
+        }
+
+        Rectangle {
+            background: #111214;
+            border-radius: 4px;
+            border-width: 1px;
+            border-color: #353535;
+            vertical-stretch: 1;
+
+            Flickable {
+                content-y: 0px;
+                content-height: 520px;
+
+                VerticalLayout {
+                    padding: 12px;
+                    spacing: 10px;
+
+                    // CHARACTER FIELDS
+                    if root.is_character: VerticalLayout {
+                        spacing: 8px;
+
+                        Text {
+                            text: "👤 General Character Identifiers";
+                            font-size: 12px;
+                            font-weight: 700;
+                            color: #f0b132;
+                        }
+
+                        FormRow {
+                            title: "Name:";
+                            LineEdit {
+                                text <=> root.char_name;
+                            }
+                        }
+
+                        FormRow {
+                            title: "Resource Tag:";
+                            LineEdit {
+                                text <=> root.char_tag;
+                            }
+                        }
+
+                        Rectangle {
+                            height: 1px;
+                            background: #2c323b;
+                        }
+
+                        Text {
+                            text: "⚔️ Combat & AI Attributes";
+                            font-size: 12px;
+                            font-weight: 700;
+                            color: #f0b132;
+                        }
+
+                        FormRow {
+                            title: "Base Health: " + Math.round(root.char_health);
+                            Slider {
+                                minimum: 1.0;
+                                maximum: 500.0;
+                                value <=> root.char_health;
+                            }
+                        }
+
+                        FormRow {
+                            title: "Move Speed: " + Math.round(root.char_speed * 10.0) / 10.0 + "x";
+                            Slider {
+                                minimum: 0.1;
+                                maximum: 3.0;
+                                value <=> root.char_speed;
+                            }
+                        }
+
+                        FormRow {
+                            title: "Aggro Range: " + Math.round(root.char_aggro_range) + "m";
+                            Slider {
+                                minimum: 2.0;
+                                maximum: 50.0;
+                                value <=> root.char_aggro_range;
+                            }
+                        }
+
+                        FormRow {
+                            title: "Perception: " + Math.round(root.char_perception) + "m";
+                            Slider {
+                                minimum: 5.0;
+                                maximum: 60.0;
+                                value <=> root.char_perception;
+                            }
+                        }
+
+                        FormRow {
+                            title: "Damage Mult: " + Math.round(root.char_damage_mult * 10.0) / 10.0 + "x";
+                            Slider {
+                                minimum: 0.1;
+                                maximum: 5.0;
+                                value <=> root.char_damage_mult;
+                            }
+                        }
+
+                        Rectangle {
+                            height: 1px;
+                            background: #2c323b;
+                        }
+
+                        Text {
+                            text: "🛡️ Flags & Physics Behaviors";
+                            font-size: 12px;
+                            font-weight: 700;
+                            color: #f0b132;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 12px;
+                            CheckBox {
+                                text: "Cast Shadows";
+                                checked <=> root.char_casts_shadows;
+                            }
+
+                            CheckBox {
+                                text: "Can Be Targeted";
+                                checked <=> root.char_targetable;
+                            }
+
+                            CheckBox {
+                                text: "Ragdoll on Death";
+                                checked <=> root.char_ragdoll;
+                            }
+
+                            CheckBox {
+                                text: "Can Swim";
+                                checked <=> root.char_can_swim;
+                            }
+                        }
+                    }
+
+                    // ITEM & ATTACHMENT FIELDS
+                    if !root.is_character: VerticalLayout {
+                        spacing: 8px;
+
+                        Text {
+                            text: "🗡️ Item & Attachment Identifiers";
+                            font-size: 12px;
+                            font-weight: 700;
+                            color: #58a6ff;
+                        }
+
+                        FormRow {
+                            title: "Item Name:";
+                            LineEdit {
+                                text <=> root.item_name;
+                            }
+                        }
+
+                        FormRow {
+                            title: "Mesh Package:";
+                            LineEdit {
+                                text <=> root.item_mesh_pkg;
+                            }
+                        }
+
+                        FormRow {
+                            title: "Submesh Name:";
+                            LineEdit {
+                                text <=> root.item_submesh;
+                            }
+                        }
+
+                        FormRow {
+                            title: "Sound Bank:";
+                            LineEdit {
+                                text <=> root.item_sound_bank;
+                            }
+                        }
+
+                        FormRow {
+                            title: "Mount Socket:";
+                            LineEdit {
+                                text <=> root.item_mount_point;
+                            }
+                        }
+
+                        Rectangle {
+                            height: 1px;
+                            background: #2c323b;
+                        }
+
+                        Text {
+                            text: "💥 Combat & Multipliers";
+                            font-size: 12px;
+                            font-weight: 700;
+                            color: #58a6ff;
+                        }
+
+                        FormRow {
+                            title: "Damage Mult: " + Math.round(root.item_damage_mult * 10.0) / 10.0 + "x";
+                            Slider {
+                                minimum: 0.1;
+                                maximum: 5.0;
+                                value <=> root.item_damage_mult;
+                            }
+                        }
+
+                        FormRow {
+                            title: "Attack Range: " + Math.round(root.item_attack_range * 10.0) / 10.0 + "m";
+                            Slider {
+                                minimum: 0.5;
+                                maximum: 10.0;
+                                value <=> root.item_attack_range;
+                            }
+                        }
+
+                        FormRow {
+                            title: "Speed Mod: " + Math.round(root.item_speed_mod * 10.0) / 10.0 + "x";
+                            Slider {
+                                minimum: 0.2;
+                                maximum: 3.0;
+                                value <=> root.item_speed_mod;
+                            }
+                        }
+
+                        Rectangle {
+                            height: 1px;
+                            background: #2c323b;
+                        }
+
+                        Text {
+                            text: "📦 Physics & Interaction Flags";
+                            font-size: 12px;
+                            font-weight: 700;
+                            color: #58a6ff;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 12px;
+                            CheckBox {
+                                text: "Is Pickable";
+                                checked <=> root.item_pickable;
+                            }
+
+                            CheckBox {
+                                text: "Cast Shadows";
+                                checked <=> root.item_shadows;
+                            }
+
+                            CheckBox {
+                                text: "Drop Physics";
+                                checked <=> root.item_drop_physics;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // MODE 1: RAW JSON EDITOR
+    if root.active_mode == 1: VerticalLayout {
+        spacing: 8px;
+        vertical-stretch: 1;
+
+        HorizontalLayout {
+            spacing: 8px;
+            CustomButton {
+                icon: "💾";
+                text: "Save JSON Directly";
+                primary-color: #23a55a;
+                min-w: 160px;
+                clicked => { root.save_json_clicked(); }
+            }
+        }
+
+        Rectangle {
+            background: #111214;
+            border-radius: 4px;
+            border-width: 1px;
+            border-color: #353535;
+            vertical-stretch: 1;
+
+            TextEdit {
+                text <=> root.raw_json_text;
+                font-family: "Consolas";
+                font-size: 11px;
+            }
+        }
+    }
+}

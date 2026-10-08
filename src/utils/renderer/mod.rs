@@ -36,10 +36,12 @@ pub struct SubmeshDrawData<'a> {
     pub positions: &'a [Vector3],
     pub indices: &'a [u32],
     pub normals: &'a [Vector3],
+    pub tangents: &'a [Vector4],
     pub uvs: &'a [Vector2],
     pub joints: &'a [[u16; 4]],
     pub weights: &'a [Vector4],
     pub texture: Option<TextureData<'a>>,
+    pub normal_texture: Option<TextureData<'a>>,
 }
 
 struct CachedSubmeshBuffers {
@@ -54,6 +56,8 @@ struct CachedSubmeshBuffers {
 struct CachedTextureResource {
     _texture: wgpu::Texture,
     _view: wgpu::TextureView,
+    _normal_texture: Option<wgpu::Texture>,
+    _normal_view: Option<wgpu::TextureView>,
     bind_group: wgpu::BindGroup,
 }
 
@@ -97,7 +101,7 @@ pub struct WgpuRenderer {
     grid_buffer: Option<(wgpu::Buffer, usize)>,
     gizmo_buffer: Option<(wgpu::Buffer, usize)>,
     submesh_buffers: Vec<CachedSubmeshBuffers>,
-    texture_cache: HashMap<(usize, u32, u32), CachedTextureResource>,
+    texture_cache: HashMap<(usize, u32, u32, usize, u32, u32), CachedTextureResource>,
     last_render_key: Option<RenderStateKey>,
 }
 
@@ -361,12 +365,13 @@ impl WgpuRenderer {
         let mut draw_calls = Vec::with_capacity(submeshes.len());
 
         let transform_pos_bounds = |p: Vector3| -> [f32; 3] {
-            // Unify with WGSL mapping (X, -Z, Y)
             let aligned = [p.x, -p.z, p.y];
             match cam.up_axis {
                 1 => [aligned[0], -aligned[2], aligned[1]],
                 2 => [aligned[0], aligned[2], -aligned[1]],
                 3 => [aligned[0], -aligned[1], -aligned[2]],
+                4 => [-aligned[1], aligned[0], aligned[2]],
+                5 => [aligned[1], -aligned[0], aligned[2]],
                 _ => aligned,
             }
         };
@@ -386,6 +391,12 @@ impl WgpuRenderer {
                         y: 1.0,
                         z: 0.0,
                     });
+                    let tan = sm.tangents.get(i).copied().unwrap_or(Vector4 {
+                        x: 1.0,
+                        y: 0.0,
+                        z: 0.0,
+                        w: 1.0,
+                    });
                     let uv = sm.uvs.get(i).copied().unwrap_or(Vector2 { x: 0.0, y: 0.0 });
                     let j_raw = sm.joints.get(i).copied().unwrap_or([0, 0, 0, 0]);
                     let w_raw = sm.weights.get(i).copied().unwrap_or(Vector4 {
@@ -398,6 +409,7 @@ impl WgpuRenderer {
                     Vertex {
                         position: [p.x, p.y, p.z],
                         normal: [n.x, n.y, n.z],
+                        tangent: [tan.x, tan.y, tan.z, tan.w],
                         tex_coords: [uv.x, uv.y],
                         joints: [
                             (j_raw[0] as usize).min(127) as u32,
@@ -453,26 +465,23 @@ impl WgpuRenderer {
                                 z: 0.0,
                                 w: 0.0,
                             });
-                            let w_sum = w.x + w.y + w.z + w.w;
-                            if w_sum > 0.001 {
-                                let get_m = |joint_id: u16| -> Mat4 {
-                                    let j_idx = (joint_id as usize).min(127);
-                                    skin_matrices.get(j_idx).copied().unwrap_or(Mat4::IDENTITY)
-                                };
-                                let m0 = get_m(j[0]);
-                                let m1 = get_m(j[1]);
-                                let m2 = get_m(j[2]);
-                                let m3 = get_m(j[3]);
+                            let get_m = |joint_id: u16| -> Mat4 {
+                                let j_idx = (joint_id as usize).min(127);
+                                skin_matrices.get(j_idx).copied().unwrap_or(Mat4::IDENTITY)
+                            };
+                            let m0 = get_m(j[0]);
+                            let m1 = get_m(j[1]);
+                            let m2 = get_m(j[2]);
+                            let m3 = get_m(j[3]);
 
-                                let blended_m = m0 * w.x + m1 * w.y + m2 * w.z + m3 * w.w;
-                                let p4 = blended_m
-                                    .transform_point3(Vec3::new(raw_p.x, raw_p.y, raw_p.z));
-                                return Vector3 {
-                                    x: p4.x,
-                                    y: p4.y,
-                                    z: p4.z,
-                                };
-                            }
+                            let blended_m = m0 * w.x + m1 * w.y + m2 * w.z + m3 * w.w;
+                            let p4 =
+                                blended_m.transform_point3(Vec3::new(raw_p.x, raw_p.y, raw_p.z));
+                            return Vector3 {
+                                x: p4.x,
+                                y: p4.y,
+                                z: p4.z,
+                            };
                         }
                         raw_p
                     };
@@ -531,7 +540,22 @@ impl WgpuRenderer {
             };
 
             let bind_group = if let Some(ref t) = sm.texture {
-                let tex_key = (t.rgba.as_ptr() as usize, t.width, t.height);
+                let norm_ptr = sm
+                    .normal_texture
+                    .as_ref()
+                    .map(|n| n.rgba.as_ptr() as usize)
+                    .unwrap_or(0);
+                let norm_w = sm.normal_texture.as_ref().map(|n| n.width).unwrap_or(0);
+                let norm_h = sm.normal_texture.as_ref().map(|n| n.height).unwrap_or(0);
+
+                let tex_key = (
+                    t.rgba.as_ptr() as usize,
+                    t.width,
+                    t.height,
+                    norm_ptr,
+                    norm_w,
+                    norm_h,
+                );
 
                 if !self.texture_cache.contains_key(&tex_key) {
                     let extent = wgpu::Extent3d {
@@ -540,7 +564,7 @@ impl WgpuRenderer {
                         depth_or_array_layers: 1,
                     };
                     let wgpu_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                        label: Some("Cached Texture"),
+                        label: Some("Cached Diffuse Texture"),
                         size: extent,
                         mip_level_count: 1,
                         sample_count: 1,
@@ -567,6 +591,52 @@ impl WgpuRenderer {
                     );
 
                     let view = wgpu_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+                    let (norm_tex, norm_view) = if let Some(ref n) = sm.normal_texture {
+                        let n_extent = wgpu::Extent3d {
+                            width: n.width,
+                            height: n.height,
+                            depth_or_array_layers: 1,
+                        };
+                        let n_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+                            label: Some("Cached Normal Texture"),
+                            size: n_extent,
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                                | wgpu::TextureUsages::COPY_DST,
+                            view_formats: &[],
+                        });
+
+                        self.queue.write_texture(
+                            wgpu::TexelCopyTextureInfo {
+                                texture: &n_tex,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d::ZERO,
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            n.rgba,
+                            wgpu::TexelCopyBufferLayout {
+                                offset: 0,
+                                bytes_per_row: Some(n.width * 4),
+                                rows_per_image: Some(n.height),
+                            },
+                            n_extent,
+                        );
+
+                        let nv = n_tex.create_view(&wgpu::TextureViewDescriptor::default());
+                        (Some(n_tex), Some(nv))
+                    } else {
+                        (None, None)
+                    };
+
+                    let final_norm_view_ref = match norm_view.as_ref() {
+                        Some(nv) => nv,
+                        None => &self.pipelines.fallback_normal_view,
+                    };
+
                     let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("Cached Texture Bind Group"),
                         layout: &self.pipelines.texture_bind_group_layout,
@@ -581,6 +651,16 @@ impl WgpuRenderer {
                                     &self.pipelines.default_sampler,
                                 ),
                             },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::TextureView(final_norm_view_ref),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: wgpu::BindingResource::Sampler(
+                                    &self.pipelines.default_sampler,
+                                ),
+                            },
                         ],
                     });
 
@@ -589,6 +669,8 @@ impl WgpuRenderer {
                         CachedTextureResource {
                             _texture: wgpu_texture,
                             _view: view,
+                            _normal_texture: norm_tex,
+                            _normal_view: norm_view,
                             bind_group: bg,
                         },
                     );
@@ -649,7 +731,6 @@ impl WgpuRenderer {
                 multiview_mask: None,
             });
 
-            // 1. Draw Mesh (if visible)
             if !show_wire {
                 render_pass.set_pipeline(&self.pipelines.mesh_pipeline);
                 render_pass.set_bind_group(0, &self.pipelines.scene_bind_group, &[]);
@@ -663,7 +744,6 @@ impl WgpuRenderer {
                     render_pass.draw_indexed(0..dc.index_count, 0, 0..1);
                 }
             } else {
-                // If showing wireframe, render the mesh wireframe using grid pipeline
                 render_pass.set_pipeline(&self.pipelines.grid_pipeline);
                 render_pass.set_bind_group(0, &self.pipelines.scene_bind_group, &[]);
 
@@ -676,20 +756,17 @@ impl WgpuRenderer {
                 }
             }
 
-            // 2. Draw Floor Grid & Skeleton Lines
             if total_line_count > 0
                 && let Some((ref g_buf, _)) = self.grid_buffer
             {
                 render_pass.set_bind_group(0, &self.pipelines.scene_bind_group, &[]);
                 render_pass.set_vertex_buffer(0, g_buf.slice(..));
 
-                // Draw Grid (Depth Tested)
                 if grid_count > 0 {
                     render_pass.set_pipeline(&self.pipelines.grid_pipeline);
                     render_pass.draw(0..grid_count, 0..1);
                 }
 
-                // Draw Skeleton
                 if skeleton_count > 0 {
                     if options.show_xray {
                         render_pass.set_pipeline(&self.pipelines.skeleton_xray_pipeline);
@@ -700,7 +777,6 @@ impl WgpuRenderer {
                 }
             }
 
-            // 3. Draw UI Axis Gizmo on top
             if !gizmo_vertices.is_empty()
                 && let Some((ref gz_buf, _)) = self.gizmo_buffer
             {

@@ -137,3 +137,36 @@ impl AssetProcessor for VoicePackageProcessor {
         )))
     }
 }
+
+pub struct EnvironmentProcessor;
+impl AssetProcessor for EnvironmentProcessor {
+    fn process(
+        &self,
+        data: &[u8],
+        stem: &str,
+        sniffed: &SniffedAsset,
+        workspace: &ProjectWorkspace,
+    ) -> Result<Option<(String, AssetSyncEntry)>> {
+        if sniffed.kind != AssetKind::Environment && !data.starts_with(b"\x83\x00\x00\x04") {
+            return Ok(None);
+        }
+
+        let env_dir = workspace.assets_dir.join("environments");
+        fs::create_dir_all(&env_dir)?;
+
+        let json_str = crate::engine::assets::environment::export_environment_to_json(data)?;
+        let out_name = build_asset_filename(&sniffed.display_name, stem, "json");
+
+        fs::write(env_dir.join(&out_name), json_str.as_bytes())?;
+
+        Ok(Some((
+            format!("assets/environments/{}", out_name),
+            AssetSyncEntry {
+                chunk_rel_path: format!("chunks/{}.bin", stem),
+                asset_kind: AssetKind::Environment,
+                vanilla_crc32: calculate_crc32(json_str.as_bytes()),
+                is_modified: false,
+            },
+        )))
+    }
+}

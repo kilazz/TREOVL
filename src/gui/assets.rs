@@ -36,6 +36,51 @@ pub fn register(
         }
     });
 
+    // Interactive asset link navigation callback
+    let tx_nav = tx.clone();
+    let state_nav = state.clone();
+    ui.on_navigate_to_asset(move |target_name| {
+        let target_str = target_name.trim().to_lowercase();
+        if target_str.is_empty() {
+            return;
+        }
+
+        let st = state_nav.lock();
+        let found = st.all_ui_items.iter().enumerate().find(|(_, item)| {
+            let name = item.display_name.to_lowercase();
+            let path = item.file_path.to_lowercase();
+            name.contains(&target_str) || path.contains(&target_str) || target_str.contains(&name)
+        });
+
+        if let Some((idx, _)) = found {
+            let path = st.all_cached_assets[idx].path.clone();
+            let kind = st.all_cached_assets[idx].kind;
+            let _ = tx_nav.send(WorkerCommand::SelectAsset {
+                filtered_index: idx as i32,
+                path,
+                kind,
+            });
+        }
+    });
+
+    // Rig selector callback
+    let tx_rig_sel = tx.clone();
+    ui.on_select_active_rig(move |rig_idx| {
+        let _ = tx_rig_sel.send(WorkerCommand::SelectRig { rig_index: rig_idx });
+    });
+
+    // Character property grid form save callback
+    let tx_char_form = tx.clone();
+    ui.on_save_character_form(move || {
+        let _ = tx_char_form.send(WorkerCommand::SaveCharacterFromForm);
+    });
+
+    // Attachment property grid form save callback
+    let tx_att_form = tx.clone();
+    ui.on_save_attachment_form(move || {
+        let _ = tx_att_form.send(WorkerCommand::SaveAttachmentFromForm);
+    });
+
     // 3D Viewport Navigation & Orbit Callbacks
     let tx_rotate = tx.clone();
     ui.on_rotate_mesh_viewport(move |delta_yaw, delta_pitch| {
@@ -357,6 +402,22 @@ pub fn register(
     let tx_obj = tx.clone();
     ui.on_save_object(move |chunk_str, json_str| {
         let _ = tx_obj.send(WorkerCommand::SaveObject {
+            chunk_path: PathBuf::from(chunk_str.as_str()),
+            json_data: json_str.to_string(),
+        });
+    });
+
+    let tx_char = tx.clone();
+    ui.on_save_character(move |chunk_str, json_str| {
+        let _ = tx_char.send(WorkerCommand::SaveCharacter {
+            chunk_path: PathBuf::from(chunk_str.as_str()),
+            json_data: json_str.to_string(),
+        });
+    });
+
+    let tx_attach = tx.clone();
+    ui.on_save_attachment(move |chunk_str, json_str| {
+        let _ = tx_attach.send(WorkerCommand::SaveAttachment {
             chunk_path: PathBuf::from(chunk_str.as_str()),
             json_data: json_str.to_string(),
         });

@@ -55,6 +55,7 @@ pub fn get_standard_processors() -> Vec<Box<dyn AssetProcessor>> {
         Box::new(environment::CollisionProcessor),
         Box::new(environment::DtaProcessor),
         Box::new(environment::VoicePackageProcessor),
+        Box::new(environment::EnvironmentProcessor),
         Box::new(logic::VfxProcessor),
         Box::new(logic::EventProcessor),
         Box::new(logic::FaceFxProcessor),
