@@ -455,10 +455,111 @@ pub fn parse_f32_safe(chunk: &[u8]) -> Option<f32> {
     None
 }
 
+/// A safe, robust abstraction for sequential binary chunk decoding
+/// Replaces manual slicing and bounds checks for repetitive chunk parsing.
+pub struct ChunkReader<'a> {
+    pub data: &'a [u8],
+    pub pos: usize,
+    pub endian: Endian,
+}
+
+impl<'a> ChunkReader<'a> {
+    pub fn new(data: &'a [u8], endian: Endian) -> Self {
+        Self {
+            data,
+            pos: 0,
+            endian,
+        }
+    }
+
+    pub fn is_eof(&self) -> bool {
+        self.pos >= self.data.len()
+    }
+
+    pub fn skip(&mut self, len: usize) {
+        self.pos += len;
+    }
+
+    pub fn read_u8(&mut self) -> Result<u8> {
+        if self.pos >= self.data.len() {
+            bail!("EOF reached");
+        }
+        let v = self.data[self.pos];
+        self.pos += 1;
+        Ok(v)
+    }
+
+    pub fn read_u16(&mut self) -> Result<u16> {
+        if self.pos + 2 > self.data.len() {
+            bail!("EOF reached");
+        }
+        let v = self
+            .endian
+            .u16_from_bytes(self.data[self.pos..self.pos + 2].try_into().unwrap());
+        self.pos += 2;
+        Ok(v)
+    }
+
+    pub fn read_u32(&mut self) -> Result<u32> {
+        if self.pos + 4 > self.data.len() {
+            bail!("EOF reached");
+        }
+        let v = self
+            .endian
+            .u32_from_bytes(self.data[self.pos..self.pos + 4].try_into().unwrap());
+        self.pos += 4;
+        Ok(v)
+    }
+
+    pub fn read_f32(&mut self) -> Result<f32> {
+        if self.pos + 4 > self.data.len() {
+            bail!("EOF reached");
+        }
+        let v = self
+            .endian
+            .f32_from_bytes(self.data[self.pos..self.pos + 4].try_into().unwrap());
+        self.pos += 4;
+        Ok(v)
+    }
+
+    pub fn read_f32_safe(&mut self) -> Option<f32> {
+        if self.pos + 4 > self.data.len() {
+            return None;
+        }
+        let val = self
+            .endian
+            .f32_from_bytes(self.data[self.pos..self.pos + 4].try_into().unwrap());
+        self.pos += 4;
+        if val.is_finite() && !val.is_subnormal() && (1e-4..=500_000.0).contains(&val.abs()) {
+            Some(val)
+        } else {
+            None
+        }
+    }
+
+    pub fn read_string(&mut self) -> Option<String> {
+        let len = self.read_u32().ok()? as usize;
+        if len == 0 || len > 2048 || self.pos + len > self.data.len() {
+            return None;
+        }
+        let slice = &self.data[self.pos..self.pos + len];
+        self.pos += len;
+
+        let clean = slice.strip_suffix(&[0]).unwrap_or(slice);
+        if clean
+            .iter()
+            .all(|&b| (0x20..=0x7E).contains(&b) || b == b'\t' || b == b'\r' || b == b'\n')
+        {
+            std::str::from_utf8(clean)
+                .ok()
+                .map(|s| s.trim().to_string())
+        } else {
+            None
+        }
+    }
+}
+
 /// Represents a Triumph Engine Map Entity UID / Scene Graph Instance Handle.
-/// In Triumph Engine packages, Chunk 22 frequently stores a packed 32-bit handle where:
-/// - Bits 0..23 (or lower 16 bits): The sequential instance UID within the level map.
-/// - Bits 24..31: ASCII domain namespace tag ('M' = 0x4D for Map/Model instance, 'I' = 0x49, etc.)
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct EntityHandleJson {
     pub uid: u32,
@@ -470,7 +571,6 @@ pub fn parse_entity_handle(raw_u32: u32) -> Option<EntityHandleJson> {
     let high_byte = ((raw_u32 >> 24) & 0xFF) as u8;
     let low_24 = raw_u32 & 0x00FF_FFFF;
 
-    // Pattern 1: High byte is ASCII tag (e.g. 0x4D000008 -> 'M' with UID 8)
     if high_byte.is_ascii_alphanumeric() && low_24 <= 0x000F_FFFF {
         return Some(EntityHandleJson {
             uid: low_24,
@@ -479,7 +579,6 @@ pub fn parse_entity_handle(raw_u32: u32) -> Option<EntityHandleJson> {
         });
     }
 
-    // Pattern 2: Low byte is ASCII tag (e.g. 0x03000049 -> 'I' with UID 3)
     let low_byte = (raw_u32 & 0xFF) as u8;
     let high_24 = raw_u32 >> 8;
     if low_byte.is_ascii_alphanumeric() && high_24 <= 0x000F_FFFF {
@@ -600,6 +699,7 @@ pub enum ObjectChunkId {
     ClosedCollision = 101,
     Attachments128 = 128,
     PlacementOffset = 300,
+    Padding301 = 301,
     Terminator = 19,
     AttachmentSlots = 1,
     Unknown(u32),
@@ -642,6 +742,7 @@ impl From<u32> for ObjectChunkId {
             101 => Self::ClosedCollision,
             128 => Self::Attachments128,
             300 => Self::PlacementOffset,
+            301 => Self::Padding301,
             19 => Self::Terminator,
             1 => Self::AttachmentSlots,
             _ => Self::Unknown(val),

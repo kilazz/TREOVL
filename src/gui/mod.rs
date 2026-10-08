@@ -21,7 +21,7 @@ use crate::engine::math::{Vector2, Vector3, Vector4};
 use crate::utils::logger::UiLogger;
 use crate::utils::renderer::ViewportCamera;
 use crate::{AppWindow, AssetItem};
-use commands::WorkerCommand;
+use commands::{SystemCmd, WorkerCommand};
 use worker::BackgroundWorker;
 
 #[derive(Clone, Debug)]
@@ -244,10 +244,10 @@ pub fn run_gui() -> Result<(), slint::PlatformError> {
 
     ui.on_filter_changed(move |query| {
         let generation_id = FILTER_GEN.fetch_add(1, Ordering::Relaxed) + 1;
-        let _ = filter_tx.send(WorkerCommand::FilterAssets {
+        let _ = filter_tx.send(WorkerCommand::System(SystemCmd::FilterAssets {
             query: query.to_string(),
             generation: generation_id,
-        });
+        }));
     });
 
     ui.on_browse_file(|| {

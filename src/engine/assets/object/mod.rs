@@ -11,7 +11,9 @@ use anyhow::{Context, Result, bail};
 use crate::engine::assets::{
     build_typed_container_with_endian, parse_chunk_elements, parse_typed_container,
 };
-use crate::engine::common::{Endian, ObjectChunkId, ObjectTypeId, parse_entity_handle};
+use crate::engine::common::{
+    Endian, EntityHandleJson, ObjectChunkId, ObjectTypeId, parse_entity_handle,
+};
 
 pub struct ExtractedObject {
     pub entity: ObjectEntityJson,
@@ -26,6 +28,7 @@ struct ObjectEntityBuilder {
     pl_is_enabled: bool,
     pl_casts_shadows: bool,
     pl_can_be_carried: bool,
+    pl_entity_handle: Option<EntityHandleJson>,
     pl_state_count: Option<u32>,
     pl_default_state: Option<u32>,
     pl_trigger_active: Option<bool>,
@@ -76,7 +79,8 @@ impl ComponentParser for ObjectEntityBuilder {
                     let mask = u32::from_le_bytes(chunk[0..4].try_into().unwrap_or_default());
                     let handle = parse_entity_handle(mask);
                     if handle.is_some() {
-                        self.entity.entity_handle = handle;
+                        self.entity.entity_handle = handle.clone();
+                        self.pl_entity_handle = handle;
                     }
                     if is_placement_object {
                         self.pl_casts_shadows = (mask & 0x2000_0000) != 0;
@@ -254,6 +258,7 @@ impl ComponentParser for ObjectEntityBuilder {
                     self.entity.placement_offset = Some(model::parse_placement_offset(chunk)?);
                 }
             }
+            ObjectChunkId::Padding301 => {}
             ObjectChunkId::Terminator => {
                 self.entity.has_sentinel_terminator = true;
             }
@@ -424,6 +429,7 @@ pub fn export_object(data: &[u8]) -> Result<ExtractedObject> {
         pl_is_enabled: true,
         pl_casts_shadows: false,
         pl_can_be_carried: true,
+        pl_entity_handle: None,
         pl_state_count: None,
         pl_default_state: None,
         pl_trigger_active: None,
@@ -809,7 +815,6 @@ pub fn import_object_from_json_with_endian(json_str: &str, endian: Endian) -> Re
         } else {
             elements.push((300, model::build_placement_offset([0.0, 0.5, 0.0], endian)));
         }
-        elements.push((301, vec![0u8]));
     } else {
         if !parsed.mesh_bindings.is_empty() {
             let chunk_30 = rebuild_mesh_material_bindings(&parsed.mesh_bindings, endian)?;

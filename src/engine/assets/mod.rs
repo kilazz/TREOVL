@@ -5,35 +5,66 @@ use crate::engine::common::{
     serialize_container_payload_with_endian,
 };
 
+// 1. Core / Foundation
 pub mod animation;
 pub mod attachment;
-pub mod audio;
 pub mod character;
-pub mod codec;
 pub mod collision;
-pub mod cptx;
-pub mod dta;
-pub mod environment;
-pub mod event;
-pub mod facefx;
-pub mod font;
-pub mod lua;
-pub mod m8ld;
-pub mod map;
-pub mod material;
 pub mod mesh;
 pub mod object;
-pub mod parameter;
 pub mod projectile;
 pub mod shader;
-pub mod sniffer;
-pub mod terrain;
-pub mod terrain_palette;
-pub mod texture;
-pub mod ui;
-pub mod ui_sprite;
+
+// 2. Logic & Scripting
+#[path = "logic/event.rs"]
+pub mod event;
+#[path = "logic/lua.rs"]
+pub mod lua;
+#[path = "logic/m8ld.rs"]
+pub mod m8ld;
+#[path = "logic/parameter.rs"]
+pub mod parameter;
+#[path = "logic/vfx.rs"]
 pub mod vfx;
+
+// 3. Media & Resources
+#[path = "media/audio.rs"]
+pub mod audio;
+#[path = "media/facefx.rs"]
+pub mod facefx;
+#[path = "media/material.rs"]
+pub mod material;
+#[path = "media/texture.rs"]
+pub mod texture;
+#[path = "media/vpk.rs"]
 pub mod vpk;
+
+// 4. UI Layouts & Graphics
+#[path = "ui/cptx.rs"]
+pub mod cptx;
+#[path = "ui/font.rs"]
+pub mod font;
+#[path = "ui/ui.rs"]
+pub mod ui;
+#[path = "ui/ui_sprite.rs"]
+pub mod ui_sprite;
+
+// 5. World & Environment
+#[path = "world/dta.rs"]
+pub mod dta;
+#[path = "world/environment.rs"]
+pub mod environment;
+#[path = "world/map.rs"]
+pub mod map;
+#[path = "world/terrain.rs"]
+pub mod terrain;
+#[path = "world/terrain_palette.rs"]
+pub mod terrain_palette;
+
+// 6. System & Handlers
+pub mod codec;
+pub mod handler;
+pub mod sniffer;
 pub mod xml;
 
 pub type ChunkElement = (u32, Vec<u8>);

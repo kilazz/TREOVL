@@ -7,7 +7,6 @@ pub mod viewport;
 pub use preview::ResolvedTexture;
 
 use parking_lot::Mutex;
-use std::path::PathBuf;
 use std::sync::{Arc, mpsc::Receiver};
 
 use slint::{ModelRc, VecModel};
@@ -15,7 +14,9 @@ use slint::{ModelRc, VecModel};
 use crate::AppWindow;
 use crate::engine::service;
 use crate::gui::AppState;
-use crate::gui::commands::WorkerCommand;
+use crate::gui::commands::{
+    ArchiveCmd, AssetCmd, DirectToolCmd, SystemCmd, ViewportCmd, WorkerCommand,
+};
 use crate::utils::logger::UiLogger;
 use crate::utils::renderer::WgpuRenderer;
 
@@ -57,17 +58,18 @@ impl BackgroundWorker {
     pub fn run(mut self, rx: Receiver<WorkerCommand>) {
         while let Ok(cmd) = rx.recv() {
             match cmd {
-                WorkerCommand::RotateMeshViewport {
+                // High-frequency deduplication logic for smooth Viewport rendering
+                WorkerCommand::Viewport(ViewportCmd::RotateMesh {
                     mut delta_yaw,
                     mut delta_pitch,
-                } => {
+                }) => {
                     let mut extra_commands = Vec::new();
                     while let Ok(next_cmd) = rx.try_recv() {
                         match next_cmd {
-                            WorkerCommand::RotateMeshViewport {
+                            WorkerCommand::Viewport(ViewportCmd::RotateMesh {
                                 delta_yaw: dy,
                                 delta_pitch: dp,
-                            } => {
+                            }) => {
                                 delta_yaw += dy;
                                 delta_pitch += dp;
                             }
@@ -77,22 +79,20 @@ impl BackgroundWorker {
                             }
                         }
                     }
-
-                    self.handle_command(WorkerCommand::RotateMeshViewport {
+                    self.handle_viewport_command(ViewportCmd::RotateMesh {
                         delta_yaw,
                         delta_pitch,
                     });
-
                     for other_cmd in extra_commands {
                         self.handle_command(other_cmd);
                     }
                 }
 
-                WorkerCommand::ZoomMeshViewport { mut delta_zoom } => {
+                WorkerCommand::Viewport(ViewportCmd::ZoomMesh { mut delta_zoom }) => {
                     let mut extra_commands = Vec::new();
                     while let Ok(next_cmd) = rx.try_recv() {
                         match next_cmd {
-                            WorkerCommand::ZoomMeshViewport { delta_zoom: dz } => {
+                            WorkerCommand::Viewport(ViewportCmd::ZoomMesh { delta_zoom: dz }) => {
                                 delta_zoom += dz;
                             }
                             other => {
@@ -101,19 +101,19 @@ impl BackgroundWorker {
                             }
                         }
                     }
-
-                    self.handle_command(WorkerCommand::ZoomMeshViewport { delta_zoom });
-
+                    self.handle_viewport_command(ViewportCmd::ZoomMesh { delta_zoom });
                     for other_cmd in extra_commands {
                         self.handle_command(other_cmd);
                     }
                 }
 
-                WorkerCommand::SetAnimationTime { mut time_seconds } => {
+                WorkerCommand::Viewport(ViewportCmd::SetAnimationTime { mut time_seconds }) => {
                     let mut extra_commands = Vec::new();
                     while let Ok(next_cmd) = rx.try_recv() {
                         match next_cmd {
-                            WorkerCommand::SetAnimationTime { time_seconds: t } => {
+                            WorkerCommand::Viewport(ViewportCmd::SetAnimationTime {
+                                time_seconds: t,
+                            }) => {
                                 time_seconds = t;
                             }
                             other => {
@@ -122,19 +122,21 @@ impl BackgroundWorker {
                             }
                         }
                     }
-
-                    self.handle_command(WorkerCommand::SetAnimationTime { time_seconds });
-
+                    self.handle_viewport_command(ViewportCmd::SetAnimationTime { time_seconds });
                     for other_cmd in extra_commands {
                         self.handle_command(other_cmd);
                     }
                 }
 
-                WorkerCommand::TickAnimationPlayback { mut delta_seconds } => {
+                WorkerCommand::Viewport(ViewportCmd::TickAnimationPlayback {
+                    mut delta_seconds,
+                }) => {
                     let mut extra_commands = Vec::new();
                     while let Ok(next_cmd) = rx.try_recv() {
                         match next_cmd {
-                            WorkerCommand::TickAnimationPlayback { delta_seconds: dt } => {
+                            WorkerCommand::Viewport(ViewportCmd::TickAnimationPlayback {
+                                delta_seconds: dt,
+                            }) => {
                                 delta_seconds += dt;
                             }
                             other => {
@@ -143,9 +145,9 @@ impl BackgroundWorker {
                             }
                         }
                     }
-
-                    self.handle_command(WorkerCommand::TickAnimationPlayback { delta_seconds });
-
+                    self.handle_viewport_command(ViewportCmd::TickAnimationPlayback {
+                        delta_seconds,
+                    });
                     for other_cmd in extra_commands {
                         self.handle_command(other_cmd);
                     }
@@ -160,7 +162,17 @@ impl BackgroundWorker {
 
     pub fn handle_command(&mut self, cmd: WorkerCommand) {
         match cmd {
-            WorkerCommand::FilterAssets { query, generation } => {
+            WorkerCommand::System(sys_cmd) => self.handle_system_command(sys_cmd),
+            WorkerCommand::Archive(arch_cmd) => self.handle_archive_command(arch_cmd),
+            WorkerCommand::Viewport(vp_cmd) => self.handle_viewport_command(vp_cmd),
+            WorkerCommand::Asset(ast_cmd) => self.handle_asset_command(ast_cmd),
+            WorkerCommand::DirectTool(tool_cmd) => self.handle_direct_tool_command(tool_cmd),
+        }
+    }
+
+    fn handle_system_command(&mut self, cmd: SystemCmd) {
+        match cmd {
+            SystemCmd::FilterAssets { query, generation } => {
                 let q = query.trim().to_lowercase();
                 let filtered_ui = {
                     let mut st = self.state.lock();
@@ -194,24 +206,454 @@ impl BackgroundWorker {
                     }
                 });
             }
+        }
+    }
 
-            WorkerCommand::SelectAsset {
-                filtered_index,
-                path,
-                kind,
-            } => {
-                inspectors::handle_select_asset(
+    fn handle_archive_command(&mut self, cmd: ArchiveCmd) {
+        match cmd {
+            ArchiveCmd::Unpack { src, dst } => {
+                project_ops::handle_unpack_archive(
                     &self.ui_handle,
-                    &self.state,
                     &self.logger,
-                    &mut self.gpu_renderer,
-                    filtered_index,
-                    &path,
-                    kind,
+                    &self.state,
+                    src,
+                    dst,
                 );
             }
+            ArchiveCmd::Pack { proj_dir } => {
+                project_ops::handle_pack_archive(&self.ui_handle, &self.logger, proj_dir);
+            }
+            ArchiveCmd::Load { proj_dir } => {
+                project_ops::handle_load_project(
+                    &self.ui_handle,
+                    &self.logger,
+                    &self.state,
+                    proj_dir,
+                );
+            }
+            ArchiveCmd::CleanRebuild { proj_dir } => {
+                project_ops::handle_clean_rebuild(
+                    &self.ui_handle,
+                    &self.logger,
+                    &self.state,
+                    proj_dir,
+                );
+            }
+            ArchiveCmd::RevertAsset {
+                proj_dir,
+                chunk_path,
+            } => {
+                project_ops::handle_revert_asset(
+                    &self.ui_handle,
+                    &self.logger,
+                    &self.state,
+                    proj_dir,
+                    chunk_path,
+                );
+            }
+            ArchiveCmd::CreatePatch {
+                base_dir,
+                mod_dir,
+                out_file,
+            } => {
+                project_ops::handle_create_patch(&self.logger, base_dir, mod_dir, out_file);
+            }
+            ArchiveCmd::ApplyPatch {
+                target_dir,
+                patch_file,
+            } => {
+                project_ops::handle_apply_patch(&self.logger, target_dir, patch_file);
+            }
+        }
+    }
 
-            WorkerCommand::SelectRig { rig_index } => {
+    fn handle_viewport_command(&mut self, cmd: ViewportCmd) {
+        match cmd {
+            ViewportCmd::RotateMesh {
+                delta_yaw,
+                delta_pitch,
+            } => {
+                let mut re_render_opt = None;
+                {
+                    let mut st = self.state.lock();
+                    st.camera.yaw += delta_yaw;
+                    st.camera.pitch = (st.camera.pitch + delta_pitch).clamp(-1.45, 1.45);
+                    if let Some(ref mut preview) = st.active_mesh {
+                        re_render_opt = Some((preview.clone(), st.camera));
+                    }
+                }
+                if let Some((mut preview, cam)) = re_render_opt {
+                    viewport::evaluate_and_render_animated_frame(
+                        &self.ui_handle,
+                        &self.state,
+                        &mut self.gpu_renderer,
+                        &mut preview,
+                        &cam,
+                    );
+                }
+            }
+            ViewportCmd::ZoomMesh { delta_zoom } => {
+                let factor = if delta_zoom > 0.0 { 0.88 } else { 1.14 };
+                let mut re_render_opt = None;
+                {
+                    let mut st = self.state.lock();
+                    st.camera.zoom(factor);
+                    if let Some(ref mut preview) = st.active_mesh {
+                        re_render_opt = Some((preview.clone(), st.camera));
+                    }
+                }
+                if let Some((mut preview, cam)) = re_render_opt {
+                    viewport::evaluate_and_render_animated_frame(
+                        &self.ui_handle,
+                        &self.state,
+                        &mut self.gpu_renderer,
+                        &mut preview,
+                        &cam,
+                    );
+                }
+            }
+            ViewportCmd::SetFov { fov_degrees } => {
+                let mut re_render_opt = None;
+                {
+                    let mut st = self.state.lock();
+                    st.camera.fov_degrees = fov_degrees.clamp(20.0, 90.0);
+                    if let Some(ref mut preview) = st.active_mesh {
+                        re_render_opt = Some((preview.clone(), st.camera));
+                    }
+                }
+                if let Some((mut preview, cam)) = re_render_opt {
+                    viewport::evaluate_and_render_animated_frame(
+                        &self.ui_handle,
+                        &self.state,
+                        &mut self.gpu_renderer,
+                        &mut preview,
+                        &cam,
+                    );
+                }
+            }
+            ViewportCmd::SetLighting { mode } => {
+                let mut re_render_opt = None;
+                {
+                    let mut st = self.state.lock();
+                    st.camera.lighting_mode = mode;
+                    if let Some(ref mut preview) = st.active_mesh {
+                        re_render_opt = Some((preview.clone(), st.camera));
+                    }
+                }
+                if let Some((mut preview, cam)) = re_render_opt {
+                    viewport::evaluate_and_render_animated_frame(
+                        &self.ui_handle,
+                        &self.state,
+                        &mut self.gpu_renderer,
+                        &mut preview,
+                        &cam,
+                    );
+                }
+            }
+            ViewportCmd::SetUpAxis { mode } => {
+                let mut re_render_opt = None;
+                {
+                    let mut st = self.state.lock();
+                    st.camera.up_axis = mode;
+                    if let Some(ref mut preview) = st.active_mesh {
+                        re_render_opt = Some((preview.clone(), st.camera));
+                    }
+                }
+                if let Some((mut preview, cam)) = re_render_opt {
+                    viewport::evaluate_and_render_animated_frame(
+                        &self.ui_handle,
+                        &self.state,
+                        &mut self.gpu_renderer,
+                        &mut preview,
+                        &cam,
+                    );
+                }
+            }
+            ViewportCmd::SetInteracting { is_active } => {
+                let mut re_render_opt = None;
+                {
+                    let mut st = self.state.lock();
+                    if st.is_interacting != is_active {
+                        st.is_interacting = is_active;
+                        if let Some(ref mut preview) = st.active_mesh {
+                            re_render_opt = Some((preview.clone(), st.camera));
+                        }
+                    }
+                }
+                if let Some((mut preview, cam)) = re_render_opt {
+                    viewport::evaluate_and_render_animated_frame(
+                        &self.ui_handle,
+                        &self.state,
+                        &mut self.gpu_renderer,
+                        &mut preview,
+                        &cam,
+                    );
+                }
+            }
+            ViewportCmd::ResetCamera => {
+                let mut re_render_opt = None;
+                {
+                    let mut st = self.state.lock();
+                    st.camera.yaw = 0.785;
+                    st.camera.pitch = 0.35;
+                    st.camera.fov_degrees = 45.0;
+                    if let Some(ref mut preview) = st.active_mesh {
+                        re_render_opt = Some((preview.clone(), st.camera));
+                    }
+                }
+                if let Some((mut preview, cam)) = re_render_opt {
+                    viewport::evaluate_and_render_animated_frame(
+                        &self.ui_handle,
+                        &self.state,
+                        &mut self.gpu_renderer,
+                        &mut preview,
+                        &cam,
+                    );
+                }
+            }
+            ViewportCmd::ToggleCompositeView => {
+                let (proj_dir, active_preview_opt) = {
+                    let st = self.state.lock();
+                    (st.current_proj_dir.clone(), st.active_mesh.clone())
+                };
+
+                if let Some(mut preview) = active_preview_opt {
+                    let stem = preview.composite_name.clone();
+                    let (composite_submeshes, has_composite) =
+                        preview::build_composite_mesh_assembly(&stem, proj_dir.as_deref());
+
+                    if has_composite && !composite_submeshes.is_empty() {
+                        preview.is_composite = !preview.is_composite;
+                        if preview.is_composite {
+                            preview.submeshes = composite_submeshes;
+                        } else {
+                            preview.submeshes.truncate(1);
+                        }
+
+                        let cam = viewport::center_camera_for_preview(&self.state, &preview);
+                        let is_comp_active = preview.is_composite;
+                        let stats_lines = preview::build_stats_lines(&preview.submeshes);
+
+                        {
+                            let mut st = self.state.lock();
+                            st.active_mesh = Some(preview.clone());
+                        }
+
+                        viewport::evaluate_and_render_animated_frame(
+                            &self.ui_handle,
+                            &self.state,
+                            &mut self.gpu_renderer,
+                            &mut preview,
+                            &cam,
+                        );
+
+                        let ui_h = self.ui_handle.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_h.upgrade() {
+                                ui.set_is_composite_active(is_comp_active);
+                                ui.set_mesh_stats_lines(ModelRc::from(std::rc::Rc::new(
+                                    VecModel::from(stats_lines),
+                                )));
+                            }
+                        });
+                    }
+                }
+            }
+            ViewportCmd::ToggleSkinning => {
+                let mut re_render_opt = None;
+                let is_enabled = {
+                    let mut st = self.state.lock();
+                    st.is_skinning_enabled = !st.is_skinning_enabled;
+                    if let Some(ref mut preview) = st.active_mesh {
+                        re_render_opt = Some((preview.clone(), st.camera));
+                    }
+                    st.is_skinning_enabled
+                };
+
+                let ui_h = self.ui_handle.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_h.upgrade() {
+                        ui.set_is_skinning_enabled(is_enabled);
+                    }
+                });
+
+                if let Some((mut preview, cam)) = re_render_opt {
+                    viewport::evaluate_and_render_animated_frame(
+                        &self.ui_handle,
+                        &self.state,
+                        &mut self.gpu_renderer,
+                        &mut preview,
+                        &cam,
+                    );
+                }
+            }
+            ViewportCmd::ToggleRootMotion => {
+                let mut re_render_opt = None;
+                let is_enabled = {
+                    let mut st = self.state.lock();
+                    st.is_root_motion_enabled = !st.is_root_motion_enabled;
+                    if let Some(ref mut preview) = st.active_mesh {
+                        re_render_opt = Some((preview.clone(), st.camera));
+                    }
+                    st.is_root_motion_enabled
+                };
+
+                let ui_h = self.ui_handle.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_h.upgrade() {
+                        ui.set_is_root_motion_enabled(is_enabled);
+                    }
+                });
+
+                if let Some((mut preview, cam)) = re_render_opt {
+                    viewport::evaluate_and_render_animated_frame(
+                        &self.ui_handle,
+                        &self.state,
+                        &mut self.gpu_renderer,
+                        &mut preview,
+                        &cam,
+                    );
+                }
+            }
+            ViewportCmd::ToggleMeshVis => {
+                let (preview_opt, val) = {
+                    let mut st = self.state.lock();
+                    st.show_mesh = !st.show_mesh;
+                    (st.active_mesh.clone(), st.show_mesh)
+                };
+                let ui_h = self.ui_handle.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_h.upgrade() {
+                        ui.set_show_mesh(val);
+                    }
+                });
+                if let Some(mut p) = preview_opt {
+                    let cam = self.state.lock().camera;
+                    viewport::evaluate_and_render_animated_frame(
+                        &self.ui_handle,
+                        &self.state,
+                        &mut self.gpu_renderer,
+                        &mut p,
+                        &cam,
+                    );
+                }
+            }
+            ViewportCmd::ToggleSkeletonVis => {
+                let (preview_opt, val) = {
+                    let mut st = self.state.lock();
+                    st.show_skeleton = !st.show_skeleton;
+                    (st.active_mesh.clone(), st.show_skeleton)
+                };
+                let ui_h = self.ui_handle.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_h.upgrade() {
+                        ui.set_show_skeleton(val);
+                    }
+                });
+                if let Some(mut p) = preview_opt {
+                    let cam = self.state.lock().camera;
+                    viewport::evaluate_and_render_animated_frame(
+                        &self.ui_handle,
+                        &self.state,
+                        &mut self.gpu_renderer,
+                        &mut p,
+                        &cam,
+                    );
+                }
+            }
+            ViewportCmd::ToggleXRay => {
+                let (preview_opt, val) = {
+                    let mut st = self.state.lock();
+                    st.show_xray = !st.show_xray;
+                    (st.active_mesh.clone(), st.show_xray)
+                };
+                let ui_h = self.ui_handle.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_h.upgrade() {
+                        ui.set_show_xray(val);
+                    }
+                });
+                if let Some(mut p) = preview_opt {
+                    let cam = self.state.lock().camera;
+                    viewport::evaluate_and_render_animated_frame(
+                        &self.ui_handle,
+                        &self.state,
+                        &mut self.gpu_renderer,
+                        &mut p,
+                        &cam,
+                    );
+                }
+            }
+            ViewportCmd::ToggleBoneNames => {
+                let (preview_opt, val) = {
+                    let mut st = self.state.lock();
+                    st.show_bone_names = !st.show_bone_names;
+                    (st.active_mesh.clone(), st.show_bone_names)
+                };
+                let ui_h = self.ui_handle.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_h.upgrade() {
+                        ui.set_show_bone_names(val);
+                    }
+                });
+                if let Some(mut p) = preview_opt {
+                    let cam = self.state.lock().camera;
+                    viewport::evaluate_and_render_animated_frame(
+                        &self.ui_handle,
+                        &self.state,
+                        &mut self.gpu_renderer,
+                        &mut p,
+                        &cam,
+                    );
+                }
+            }
+            ViewportCmd::ToggleWireframe => {
+                let (preview_opt, val) = {
+                    let mut st = self.state.lock();
+                    st.show_wireframe = !st.show_wireframe;
+                    (st.active_mesh.clone(), st.show_wireframe)
+                };
+                let ui_h = self.ui_handle.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_h.upgrade() {
+                        ui.set_show_wireframe(val);
+                    }
+                });
+                if let Some(mut p) = preview_opt {
+                    let cam = self.state.lock().camera;
+                    viewport::evaluate_and_render_animated_frame(
+                        &self.ui_handle,
+                        &self.state,
+                        &mut self.gpu_renderer,
+                        &mut p,
+                        &cam,
+                    );
+                }
+            }
+            ViewportCmd::ToggleGrid => {
+                let (preview_opt, val) = {
+                    let mut st = self.state.lock();
+                    st.show_grid = !st.show_grid;
+                    (st.active_mesh.clone(), st.show_grid)
+                };
+                let ui_h = self.ui_handle.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_h.upgrade() {
+                        ui.set_show_grid(val);
+                    }
+                });
+                if let Some(mut p) = preview_opt {
+                    let cam = self.state.lock().camera;
+                    viewport::evaluate_and_render_animated_frame(
+                        &self.ui_handle,
+                        &self.state,
+                        &mut self.gpu_renderer,
+                        &mut p,
+                        &cam,
+                    );
+                }
+            }
+            ViewportCmd::SelectRig { rig_index } => {
                 let mut re_render_opt = None;
                 let mut new_anim_names = Vec::new();
 
@@ -227,12 +669,10 @@ impl BackgroundWorker {
                     preview.current_rig_index = Some(actual_idx);
                     let selected_rig = &preview.available_rigs[actual_idx];
 
-                    // 1. Assign new bones across all submeshes
                     for sm in &mut preview.submeshes {
                         sm.bones = selected_rig.bones.clone();
                     }
 
-                    // 2. Discover companion animations for this specific rig
                     let clips = preview::discover_companion_animations(
                         &selected_rig.name,
                         &selected_rig.source_file,
@@ -282,8 +722,7 @@ impl BackgroundWorker {
                     });
                 }
             }
-
-            WorkerCommand::SelectAnimation { clip_index } => {
+            ViewportCmd::SelectAnimation { clip_index } => {
                 let mut re_render_opt = None;
                 {
                     let mut st = self.state.lock();
@@ -323,7 +762,6 @@ impl BackgroundWorker {
                         }
                     }
                 }
-
                 if let Some((mut preview, cam)) = re_render_opt {
                     viewport::evaluate_and_render_animated_frame(
                         &self.ui_handle,
@@ -334,8 +772,7 @@ impl BackgroundWorker {
                     );
                 }
             }
-
-            WorkerCommand::SetAnimationTime { time_seconds } => {
+            ViewportCmd::SetAnimationTime { time_seconds } => {
                 let mut re_render_opt = None;
                 {
                     let mut st = self.state.lock();
@@ -354,8 +791,7 @@ impl BackgroundWorker {
                     );
                 }
             }
-
-            WorkerCommand::TickAnimationPlayback { delta_seconds } => {
+            ViewportCmd::TickAnimationPlayback { delta_seconds } => {
                 let mut re_render_opt = None;
                 let mut time_ui = 0.0f32;
                 {
@@ -389,641 +825,27 @@ impl BackgroundWorker {
                     );
                 }
             }
+        }
+    }
 
-            WorkerCommand::SetViewportInteracting { is_active } => {
-                let mut re_render_opt = None;
-                {
-                    let mut st = self.state.lock();
-                    if st.is_interacting != is_active {
-                        st.is_interacting = is_active;
-                        if let Some(ref mut preview) = st.active_mesh {
-                            re_render_opt = Some((preview.clone(), st.camera));
-                        }
-                    }
-                }
-                if let Some((mut preview, cam)) = re_render_opt {
-                    viewport::evaluate_and_render_animated_frame(
-                        &self.ui_handle,
-                        &self.state,
-                        &mut self.gpu_renderer,
-                        &mut preview,
-                        &cam,
-                    );
-                }
-            }
-
-            WorkerCommand::ToggleCompositeView => {
-                let (proj_dir, active_preview_opt) = {
-                    let st = self.state.lock();
-                    (st.current_proj_dir.clone(), st.active_mesh.clone())
-                };
-
-                if let Some(mut preview) = active_preview_opt {
-                    let stem = preview.composite_name.clone();
-                    let (composite_submeshes, has_composite) =
-                        preview::build_composite_mesh_assembly(&stem, proj_dir.as_deref());
-
-                    if has_composite && !composite_submeshes.is_empty() {
-                        preview.is_composite = !preview.is_composite;
-                        if preview.is_composite {
-                            preview.submeshes = composite_submeshes;
-                        } else {
-                            preview.submeshes.truncate(1);
-                        }
-
-                        let cam = viewport::center_camera_for_preview(&self.state, &preview);
-                        let is_comp_active = preview.is_composite;
-                        let stats_lines = preview::build_stats_lines(&preview.submeshes);
-
-                        {
-                            let mut st = self.state.lock();
-                            st.active_mesh = Some(preview.clone());
-                        }
-
-                        viewport::evaluate_and_render_animated_frame(
-                            &self.ui_handle,
-                            &self.state,
-                            &mut self.gpu_renderer,
-                            &mut preview,
-                            &cam,
-                        );
-
-                        let ui_h = self.ui_handle.clone();
-                        let _ = slint::invoke_from_event_loop(move || {
-                            if let Some(ui) = ui_h.upgrade() {
-                                ui.set_is_composite_active(is_comp_active);
-                                ui.set_mesh_stats_lines(ModelRc::from(std::rc::Rc::new(
-                                    VecModel::from(stats_lines),
-                                )));
-                            }
-                        });
-                    }
-                }
-            }
-
-            WorkerCommand::ToggleSkinning => {
-                let mut re_render_opt = None;
-                let is_enabled = {
-                    let mut st = self.state.lock();
-                    st.is_skinning_enabled = !st.is_skinning_enabled;
-                    if let Some(ref mut preview) = st.active_mesh {
-                        re_render_opt = Some((preview.clone(), st.camera));
-                    }
-                    st.is_skinning_enabled
-                };
-
-                let ui_h = self.ui_handle.clone();
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(ui) = ui_h.upgrade() {
-                        ui.set_is_skinning_enabled(is_enabled);
-                    }
-                });
-
-                if let Some((mut preview, cam)) = re_render_opt {
-                    viewport::evaluate_and_render_animated_frame(
-                        &self.ui_handle,
-                        &self.state,
-                        &mut self.gpu_renderer,
-                        &mut preview,
-                        &cam,
-                    );
-                }
-            }
-
-            WorkerCommand::ToggleRootMotion => {
-                let mut re_render_opt = None;
-                let is_enabled = {
-                    let mut st = self.state.lock();
-                    st.is_root_motion_enabled = !st.is_root_motion_enabled;
-                    if let Some(ref mut preview) = st.active_mesh {
-                        re_render_opt = Some((preview.clone(), st.camera));
-                    }
-                    st.is_root_motion_enabled
-                };
-
-                let ui_h = self.ui_handle.clone();
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(ui) = ui_h.upgrade() {
-                        ui.set_is_root_motion_enabled(is_enabled);
-                    }
-                });
-
-                if let Some((mut preview, cam)) = re_render_opt {
-                    viewport::evaluate_and_render_animated_frame(
-                        &self.ui_handle,
-                        &self.state,
-                        &mut self.gpu_renderer,
-                        &mut preview,
-                        &cam,
-                    );
-                }
-            }
-
-            WorkerCommand::ToggleMeshVis => {
-                let (preview_opt, val) = {
-                    let mut st = self.state.lock();
-                    st.show_mesh = !st.show_mesh;
-                    (st.active_mesh.clone(), st.show_mesh)
-                };
-                let ui_h = self.ui_handle.clone();
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(ui) = ui_h.upgrade() {
-                        ui.set_show_mesh(val);
-                    }
-                });
-                if let Some(mut p) = preview_opt {
-                    let cam = self.state.lock().camera;
-                    viewport::evaluate_and_render_animated_frame(
-                        &self.ui_handle,
-                        &self.state,
-                        &mut self.gpu_renderer,
-                        &mut p,
-                        &cam,
-                    );
-                }
-            }
-
-            WorkerCommand::ToggleSkeletonVis => {
-                let (preview_opt, val) = {
-                    let mut st = self.state.lock();
-                    st.show_skeleton = !st.show_skeleton;
-                    (st.active_mesh.clone(), st.show_skeleton)
-                };
-                let ui_h = self.ui_handle.clone();
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(ui) = ui_h.upgrade() {
-                        ui.set_show_skeleton(val);
-                    }
-                });
-                if let Some(mut p) = preview_opt {
-                    let cam = self.state.lock().camera;
-                    viewport::evaluate_and_render_animated_frame(
-                        &self.ui_handle,
-                        &self.state,
-                        &mut self.gpu_renderer,
-                        &mut p,
-                        &cam,
-                    );
-                }
-            }
-
-            WorkerCommand::ToggleXRay => {
-                let (preview_opt, val) = {
-                    let mut st = self.state.lock();
-                    st.show_xray = !st.show_xray;
-                    (st.active_mesh.clone(), st.show_xray)
-                };
-                let ui_h = self.ui_handle.clone();
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(ui) = ui_h.upgrade() {
-                        ui.set_show_xray(val);
-                    }
-                });
-                if let Some(mut p) = preview_opt {
-                    let cam = self.state.lock().camera;
-                    viewport::evaluate_and_render_animated_frame(
-                        &self.ui_handle,
-                        &self.state,
-                        &mut self.gpu_renderer,
-                        &mut p,
-                        &cam,
-                    );
-                }
-            }
-
-            WorkerCommand::ToggleBoneNames => {
-                let (preview_opt, val) = {
-                    let mut st = self.state.lock();
-                    st.show_bone_names = !st.show_bone_names;
-                    (st.active_mesh.clone(), st.show_bone_names)
-                };
-                let ui_h = self.ui_handle.clone();
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(ui) = ui_h.upgrade() {
-                        ui.set_show_bone_names(val);
-                    }
-                });
-                if let Some(mut p) = preview_opt {
-                    let cam = self.state.lock().camera;
-                    viewport::evaluate_and_render_animated_frame(
-                        &self.ui_handle,
-                        &self.state,
-                        &mut self.gpu_renderer,
-                        &mut p,
-                        &cam,
-                    );
-                }
-            }
-
-            WorkerCommand::ToggleWireframe => {
-                let (preview_opt, val) = {
-                    let mut st = self.state.lock();
-                    st.show_wireframe = !st.show_wireframe;
-                    (st.active_mesh.clone(), st.show_wireframe)
-                };
-                let ui_h = self.ui_handle.clone();
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(ui) = ui_h.upgrade() {
-                        ui.set_show_wireframe(val);
-                    }
-                });
-                if let Some(mut p) = preview_opt {
-                    let cam = self.state.lock().camera;
-                    viewport::evaluate_and_render_animated_frame(
-                        &self.ui_handle,
-                        &self.state,
-                        &mut self.gpu_renderer,
-                        &mut p,
-                        &cam,
-                    );
-                }
-            }
-
-            WorkerCommand::ToggleGrid => {
-                let (preview_opt, val) = {
-                    let mut st = self.state.lock();
-                    st.show_grid = !st.show_grid;
-                    (st.active_mesh.clone(), st.show_grid)
-                };
-                let ui_h = self.ui_handle.clone();
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(ui) = ui_h.upgrade() {
-                        ui.set_show_grid(val);
-                    }
-                });
-                if let Some(mut p) = preview_opt {
-                    let cam = self.state.lock().camera;
-                    viewport::evaluate_and_render_animated_frame(
-                        &self.ui_handle,
-                        &self.state,
-                        &mut self.gpu_renderer,
-                        &mut p,
-                        &cam,
-                    );
-                }
-            }
-
-            WorkerCommand::RotateMeshViewport {
-                delta_yaw,
-                delta_pitch,
+    fn handle_asset_command(&mut self, cmd: AssetCmd) {
+        match cmd {
+            AssetCmd::SelectAsset {
+                filtered_index,
+                path,
+                kind,
             } => {
-                let mut re_render_opt = None;
-                {
-                    let mut st = self.state.lock();
-                    st.camera.yaw += delta_yaw;
-                    st.camera.pitch = (st.camera.pitch + delta_pitch).clamp(-1.45, 1.45);
-                    if let Some(ref mut preview) = st.active_mesh {
-                        re_render_opt = Some((preview.clone(), st.camera));
-                    }
-                }
-
-                if let Some((mut preview, cam)) = re_render_opt {
-                    viewport::evaluate_and_render_animated_frame(
-                        &self.ui_handle,
-                        &self.state,
-                        &mut self.gpu_renderer,
-                        &mut preview,
-                        &cam,
-                    );
-                }
-            }
-
-            WorkerCommand::ZoomMeshViewport { delta_zoom } => {
-                let factor = if delta_zoom > 0.0 { 0.88 } else { 1.14 };
-                let mut re_render_opt = None;
-                {
-                    let mut st = self.state.lock();
-                    st.camera.zoom(factor);
-                    if let Some(ref mut preview) = st.active_mesh {
-                        re_render_opt = Some((preview.clone(), st.camera));
-                    }
-                }
-
-                if let Some((mut preview, cam)) = re_render_opt {
-                    viewport::evaluate_and_render_animated_frame(
-                        &self.ui_handle,
-                        &self.state,
-                        &mut self.gpu_renderer,
-                        &mut preview,
-                        &cam,
-                    );
-                }
-            }
-
-            WorkerCommand::SetViewportFov { fov_degrees } => {
-                let mut re_render_opt = None;
-                {
-                    let mut st = self.state.lock();
-                    st.camera.fov_degrees = fov_degrees.clamp(20.0, 90.0);
-                    if let Some(ref mut preview) = st.active_mesh {
-                        re_render_opt = Some((preview.clone(), st.camera));
-                    }
-                }
-
-                if let Some((mut preview, cam)) = re_render_opt {
-                    viewport::evaluate_and_render_animated_frame(
-                        &self.ui_handle,
-                        &self.state,
-                        &mut self.gpu_renderer,
-                        &mut preview,
-                        &cam,
-                    );
-                }
-            }
-
-            WorkerCommand::SetViewportLighting { mode } => {
-                let mut re_render_opt = None;
-                {
-                    let mut st = self.state.lock();
-                    st.camera.lighting_mode = mode;
-                    if let Some(ref mut preview) = st.active_mesh {
-                        re_render_opt = Some((preview.clone(), st.camera));
-                    }
-                }
-
-                if let Some((mut preview, cam)) = re_render_opt {
-                    viewport::evaluate_and_render_animated_frame(
-                        &self.ui_handle,
-                        &self.state,
-                        &mut self.gpu_renderer,
-                        &mut preview,
-                        &cam,
-                    );
-                }
-            }
-
-            WorkerCommand::SetViewportUpAxis { mode } => {
-                let mut re_render_opt = None;
-                {
-                    let mut st = self.state.lock();
-                    st.camera.up_axis = mode;
-                    if let Some(ref mut preview) = st.active_mesh {
-                        re_render_opt = Some((preview.clone(), st.camera));
-                    }
-                }
-
-                if let Some((mut preview, cam)) = re_render_opt {
-                    viewport::evaluate_and_render_animated_frame(
-                        &self.ui_handle,
-                        &self.state,
-                        &mut self.gpu_renderer,
-                        &mut preview,
-                        &cam,
-                    );
-                }
-            }
-
-            WorkerCommand::ResetViewportCamera => {
-                let mut re_render_opt = None;
-                {
-                    let mut st = self.state.lock();
-                    st.camera.yaw = 0.785;
-                    st.camera.pitch = 0.35;
-                    st.camera.fov_degrees = 45.0;
-                    if let Some(ref mut preview) = st.active_mesh {
-                        re_render_opt = Some((preview.clone(), st.camera));
-                    }
-                }
-
-                if let Some((mut preview, cam)) = re_render_opt {
-                    viewport::evaluate_and_render_animated_frame(
-                        &self.ui_handle,
-                        &self.state,
-                        &mut self.gpu_renderer,
-                        &mut preview,
-                        &cam,
-                    );
-                }
-            }
-
-            WorkerCommand::Decompile8ldDirect { src, dst } => {
-                direct_tools::handle_decompile_8ld_direct(&self.ui_handle, &self.logger, src, dst);
-            }
-            WorkerCommand::Compile8ldDirect { src, dst } => {
-                direct_tools::handle_compile_8ld_direct(&self.ui_handle, &self.logger, src, dst);
-            }
-            WorkerCommand::Decompile8ldBatch { src_dir, dst_dir } => {
-                direct_tools::handle_decompile_8ld_batch(
+                inspectors::handle_select_asset(
                     &self.ui_handle,
-                    &self.logger,
-                    src_dir,
-                    dst_dir,
-                );
-            }
-            WorkerCommand::Compile8ldBatch { src_dir, dst_dir } => {
-                direct_tools::handle_compile_8ld_batch(
-                    &self.ui_handle,
-                    &self.logger,
-                    src_dir,
-                    dst_dir,
-                );
-            }
-            WorkerCommand::DirectVpkToJson { src, dst } => {
-                direct_tools::handle_direct_vpk_to_json(&self.ui_handle, &self.logger, src, dst);
-            }
-            WorkerCommand::DirectJsonToVpk {
-                src_json,
-                baseline_vpk,
-                dst,
-            } => {
-                direct_tools::handle_direct_json_to_vpk(
-                    &self.ui_handle,
-                    &self.logger,
-                    src_json,
-                    baseline_vpk,
-                    dst,
-                );
-            }
-            WorkerCommand::DirectDtaToJson { src, dst } => {
-                direct_tools::handle_direct_dta_to_json(&self.ui_handle, &self.logger, src, dst);
-            }
-            WorkerCommand::DirectJsonToDta {
-                src_json,
-                baseline_dta,
-                dst,
-            } => {
-                direct_tools::handle_direct_json_to_dta(
-                    &self.ui_handle,
-                    &self.logger,
-                    src_json,
-                    baseline_dta,
-                    dst,
-                );
-            }
-            WorkerCommand::DirectEnvToJson { src, dst } => {
-                direct_tools::handle_direct_env_to_json(&self.ui_handle, &self.logger, src, dst);
-            }
-            WorkerCommand::DirectJsonToEnv {
-                src_json,
-                baseline_env,
-                dst,
-            } => {
-                direct_tools::handle_direct_json_to_env(
-                    &self.ui_handle,
-                    &self.logger,
-                    src_json,
-                    baseline_env,
-                    dst,
-                );
-            }
-            WorkerCommand::DirectMeshExport { src, dst, is_glb } => {
-                direct_tools::handle_direct_mesh_export(
-                    &self.ui_handle,
-                    &self.logger,
-                    src,
-                    dst,
-                    is_glb,
-                );
-            }
-            WorkerCommand::DirectMeshImport {
-                chunk_target,
-                model_src,
-                is_glb,
-            } => {
-                direct_tools::handle_direct_mesh_import(
-                    &self.ui_handle,
-                    &self.logger,
-                    chunk_target,
-                    model_src,
-                    is_glb,
-                );
-            }
-            WorkerCommand::DirectAssembleLevel {
-                omp_path,
-                assets_dir,
-                dst,
-            } => {
-                direct_tools::handle_direct_assemble_level(
-                    &self.ui_handle,
-                    &self.logger,
-                    omp_path,
-                    assets_dir,
-                    dst,
-                );
-            }
-            WorkerCommand::DirectTerrainExport { src, dst, is_glb } => {
-                direct_tools::handle_direct_terrain_export(
-                    &self.ui_handle,
-                    &self.logger,
-                    src,
-                    dst,
-                    is_glb,
-                );
-            }
-            WorkerCommand::DirectCollisionExport { src, dst } => {
-                direct_tools::handle_direct_collision_export(
-                    &self.ui_handle,
-                    &self.logger,
-                    src,
-                    dst,
-                );
-            }
-            WorkerCommand::DirectCollisionImport {
-                chunk_target,
-                glb_src,
-            } => {
-                direct_tools::handle_direct_collision_import(
-                    &self.ui_handle,
-                    &self.logger,
-                    chunk_target,
-                    glb_src,
-                );
-            }
-            WorkerCommand::DirectFontToJson { src, dst } => {
-                direct_tools::handle_direct_font_to_json(&self.ui_handle, &self.logger, src, dst);
-            }
-            WorkerCommand::DirectJsonToFont { src_json, dst } => {
-                direct_tools::handle_direct_json_to_font(
-                    &self.ui_handle,
-                    &self.logger,
-                    src_json,
-                    dst,
-                );
-            }
-            WorkerCommand::DirectTextureExport { src, dst } => {
-                direct_tools::handle_direct_texture_export(&self.ui_handle, &self.logger, src, dst);
-            }
-            WorkerCommand::DirectTextureImport {
-                chunk_target,
-                img_src,
-            } => {
-                direct_tools::handle_direct_texture_import(
-                    &self.ui_handle,
-                    &self.logger,
-                    chunk_target,
-                    img_src,
-                );
-            }
-            WorkerCommand::DirectAudioExport { src, dst } => {
-                direct_tools::handle_direct_audio_export(&self.ui_handle, &self.logger, src, dst);
-            }
-            WorkerCommand::DirectAudioImport {
-                chunk_target,
-                wav_src,
-            } => {
-                direct_tools::handle_direct_audio_import(
-                    &self.ui_handle,
-                    &self.logger,
-                    chunk_target,
-                    wav_src,
-                );
-            }
-
-            WorkerCommand::UnpackArchive { src, dst } => {
-                project_ops::handle_unpack_archive(
-                    &self.ui_handle,
-                    &self.logger,
                     &self.state,
-                    src,
-                    dst,
-                );
-            }
-            WorkerCommand::LoadProject { proj_dir } => {
-                project_ops::handle_load_project(
-                    &self.ui_handle,
                     &self.logger,
-                    &self.state,
-                    proj_dir,
+                    &mut self.gpu_renderer,
+                    filtered_index,
+                    &path,
+                    kind,
                 );
             }
-            WorkerCommand::CleanRebuild { proj_dir } => {
-                project_ops::handle_clean_rebuild(
-                    &self.ui_handle,
-                    &self.logger,
-                    &self.state,
-                    proj_dir,
-                );
-            }
-            WorkerCommand::RevertAsset {
-                proj_dir,
-                chunk_path,
-            } => {
-                project_ops::handle_revert_asset(
-                    &self.ui_handle,
-                    &self.logger,
-                    &self.state,
-                    proj_dir,
-                    chunk_path,
-                );
-            }
-            WorkerCommand::PackArchive { proj_dir } => {
-                project_ops::handle_pack_archive(&self.ui_handle, &self.logger, proj_dir);
-            }
-            WorkerCommand::CreatePatch {
-                base_dir,
-                mod_dir,
-                out_file,
-            } => {
-                project_ops::handle_create_patch(&self.logger, base_dir, mod_dir, out_file);
-            }
-            WorkerCommand::ApplyPatch {
-                target_dir,
-                patch_file,
-            } => {
-                project_ops::handle_apply_patch(&self.logger, target_dir, patch_file);
-            }
-
-            WorkerCommand::ExportDds {
+            AssetCmd::ExportDds {
                 chunk_path,
                 out_path,
             } => match service::export_texture(&chunk_path, &out_path) {
@@ -1032,7 +854,7 @@ impl BackgroundWorker {
                     .log(&format!("[+] Texture exported to: {:?}", out_path)),
                 Err(e) => self.logger.log(&format!("[!] DDS export error: {}", e)),
             },
-            WorkerCommand::ImportDds {
+            AssetCmd::ImportDds {
                 chunk_path,
                 in_path,
             } => match service::import_texture(&chunk_path, &in_path) {
@@ -1043,7 +865,7 @@ impl BackgroundWorker {
                     .logger
                     .log(&format!("[!] DDS replacement error: {}", e)),
             },
-            WorkerCommand::ExportWav {
+            AssetCmd::ExportWav {
                 chunk_path,
                 out_path,
             } => match service::export_audio(&chunk_path, &out_path) {
@@ -1052,7 +874,7 @@ impl BackgroundWorker {
                     .log(&format!("[+] Audio exported to: {:?}", out_path)),
                 Err(e) => self.logger.log(&format!("[!] Audio export error: {}", e)),
             },
-            WorkerCommand::ImportWav {
+            AssetCmd::ImportWav {
                 chunk_path,
                 in_path,
             } => match service::import_audio(&chunk_path, &in_path) {
@@ -1061,7 +883,7 @@ impl BackgroundWorker {
                     .log(&format!("[+] Audio chunk {:?} updated.", chunk_path)),
                 Err(e) => self.logger.log(&format!("[!] Audio import error: {}", e)),
             },
-            WorkerCommand::ExportMesh {
+            AssetCmd::ExportMesh {
                 chunk_path,
                 out_path,
                 is_glb,
@@ -1075,7 +897,7 @@ impl BackgroundWorker {
                 }
                 Err(e) => self.logger.log(&format!("[!] Mesh export error: {}", e)),
             },
-            WorkerCommand::ImportMesh {
+            AssetCmd::ImportMesh {
                 chunk_path,
                 in_path,
                 is_glb,
@@ -1089,7 +911,7 @@ impl BackgroundWorker {
                 }
                 Err(e) => self.logger.log(&format!("[!] Mesh import error: {}", e)),
             },
-            WorkerCommand::ExportTerrain {
+            AssetCmd::ExportTerrain {
                 chunk_path,
                 out_path,
                 is_glb,
@@ -1103,7 +925,7 @@ impl BackgroundWorker {
                 }
                 Err(e) => self.logger.log(&format!("[!] Terrain export error: {}", e)),
             },
-            WorkerCommand::ExportCollisionGlb {
+            AssetCmd::ExportCollisionGlb {
                 chunk_path,
                 out_path,
             } => match service::export_collision_glb(&chunk_path, &out_path) {
@@ -1115,7 +937,7 @@ impl BackgroundWorker {
                     .logger
                     .log(&format!("[!] 3D Collision GLB export error: {}", e)),
             },
-            WorkerCommand::ImportCollisionGlb {
+            AssetCmd::ImportCollisionGlb {
                 chunk_path,
                 in_path,
             } => match service::import_collision_glb(&chunk_path, &in_path) {
@@ -1127,7 +949,7 @@ impl BackgroundWorker {
                     .logger
                     .log(&format!("[!] 3D Collision GLB import error: {}", e)),
             },
-            WorkerCommand::ExportLua {
+            AssetCmd::ExportLua {
                 chunk_path,
                 out_path,
             } => match service::export_lua(&chunk_path, &out_path) {
@@ -1136,7 +958,7 @@ impl BackgroundWorker {
                     .log(&format!("[+] Lua bytecode exported: {:?}", out_path)),
                 Err(e) => self.logger.log(&format!("[!] Lua export error: {}", e)),
             },
-            WorkerCommand::ImportLua {
+            AssetCmd::ImportLua {
                 chunk_path,
                 in_path,
             } => match service::import_lua(&chunk_path, &in_path) {
@@ -1145,7 +967,7 @@ impl BackgroundWorker {
                     .log(&format!("[+] Lua chunk {:?} updated.", chunk_path)),
                 Err(e) => self.logger.log(&format!("[!] Lua import error: {}", e)),
             },
-            WorkerCommand::ExportAnimGlb {
+            AssetCmd::ExportAnimGlb {
                 chunk_path,
                 out_path,
             } => match service::export_anim_glb(&chunk_path, &out_path) {
@@ -1157,7 +979,7 @@ impl BackgroundWorker {
                     .logger
                     .log(&format!("[!] Animation GLB export error: {}", e)),
             },
-            WorkerCommand::ExportAnimJson {
+            AssetCmd::ExportAnimJson {
                 chunk_path,
                 out_path,
             } => match service::export_anim_json(&chunk_path, &out_path) {
@@ -1169,7 +991,7 @@ impl BackgroundWorker {
                     .logger
                     .log(&format!("[!] Animation JSON export error: {}", e)),
             },
-            WorkerCommand::SaveMaterial {
+            AssetCmd::SaveMaterial {
                 chunk_path,
                 json_data,
             } => match service::save_material(&chunk_path, &json_data) {
@@ -1178,7 +1000,7 @@ impl BackgroundWorker {
                     .log(&format!("[+] Material chunk {:?} updated.", chunk_path)),
                 Err(e) => self.logger.log(&format!("[!] Material save error: {}", e)),
             },
-            WorkerCommand::SaveUI {
+            AssetCmd::SaveUI {
                 chunk_path,
                 json_data,
             } => match service::save_ui(&chunk_path, &json_data) {
@@ -1187,7 +1009,7 @@ impl BackgroundWorker {
                     .log(&format!("[+] UI layout chunk {:?} updated.", chunk_path)),
                 Err(e) => self.logger.log(&format!("[!] UI save error: {}", e)),
             },
-            WorkerCommand::SaveObject {
+            AssetCmd::SaveObject {
                 chunk_path,
                 json_data,
             } => match service::save_object(&chunk_path, &json_data) {
@@ -1197,7 +1019,7 @@ impl BackgroundWorker {
                 )),
                 Err(e) => self.logger.log(&format!("[!] Object save error: {}", e)),
             },
-            WorkerCommand::SaveCharacter {
+            AssetCmd::SaveCharacter {
                 chunk_path,
                 json_data,
             } => match service::save_character(&chunk_path, &json_data) {
@@ -1206,7 +1028,7 @@ impl BackgroundWorker {
                     .log(&format!("[+] Character chunk {:?} updated.", chunk_path)),
                 Err(e) => self.logger.log(&format!("[!] Character save error: {}", e)),
             },
-            WorkerCommand::SaveAttachment {
+            AssetCmd::SaveAttachment {
                 chunk_path,
                 json_data,
             } => match service::save_attachment(&chunk_path, &json_data) {
@@ -1217,7 +1039,76 @@ impl BackgroundWorker {
                     .logger
                     .log(&format!("[!] Attachment save error: {}", e)),
             },
-            WorkerCommand::SaveCharacterFromForm => {
+            AssetCmd::SaveTerrainPalette {
+                chunk_path,
+                json_data,
+            } => match service::save_terrain_palette(&chunk_path, &json_data) {
+                Ok(_) => self.logger.log(&format!(
+                    "[+] Terrain Palette chunk {:?} updated.",
+                    chunk_path
+                )),
+                Err(e) => self
+                    .logger
+                    .log(&format!("[!] Terrain Palette save error: {}", e)),
+            },
+            AssetCmd::SaveEnvironment {
+                chunk_path,
+                json_data,
+            } => match service::save_environment(&chunk_path, &json_data) {
+                Ok(_) => self
+                    .logger
+                    .log(&format!("[+] Environment chunk {:?} updated.", chunk_path)),
+                Err(e) => self
+                    .logger
+                    .log(&format!("[!] Environment save error: {}", e)),
+            },
+            AssetCmd::SaveM8ld {
+                chunk_path,
+                json_data,
+            } => match service::save_m8ld(&chunk_path, &json_data) {
+                Ok(_) => self.logger.log(&format!(
+                    "[+] Level Map Logic (.8ld) {:?} updated.",
+                    chunk_path
+                )),
+                Err(e) => self
+                    .logger
+                    .log(&format!("[!] Level Map Logic save error: {}", e)),
+            },
+            AssetCmd::SaveUiSprite {
+                chunk_path,
+                json_data,
+            } => match service::save_ui_sprite(&chunk_path, &json_data) {
+                Ok(_) => self.logger.log(&format!(
+                    "[+] UI Sprite Collection {:?} updated.",
+                    chunk_path
+                )),
+                Err(e) => self.logger.log(&format!("[!] UI Sprite save error: {}", e)),
+            },
+            AssetCmd::SaveDta {
+                chunk_path,
+                json_data,
+            } => match service::save_dta(&chunk_path, &json_data) {
+                Ok(_) => self.logger.log(&format!(
+                    "[+] Lighting Set (.dta) {:?} updated.",
+                    chunk_path
+                )),
+                Err(e) => self
+                    .logger
+                    .log(&format!("[!] Lighting Set save error: {}", e)),
+            },
+            AssetCmd::SaveVpk {
+                chunk_path,
+                json_data,
+            } => match service::save_vpk(&chunk_path, &json_data) {
+                Ok(_) => self.logger.log(&format!(
+                    "[+] Voice Package (.debug-vpk) {:?} updated.",
+                    chunk_path
+                )),
+                Err(e) => self
+                    .logger
+                    .log(&format!("[!] Voice Package save error: {}", e)),
+            },
+            AssetCmd::SaveCharacterFromForm => {
                 let ui_h = self.ui_handle.clone();
                 let logger = self.logger.clone();
                 let _ = slint::invoke_from_event_loop(move || {
@@ -1226,7 +1117,7 @@ impl BackgroundWorker {
                         if path_str.is_empty() {
                             return;
                         }
-                        let path = PathBuf::from(&path_str);
+                        let path = std::path::PathBuf::from(&path_str);
                         let json_str = ui.get_mat_json_text().to_string();
                         let mut char_actor: crate::engine::assets::character::CharacterActorJson =
                             match serde_json::from_str(&json_str) {
@@ -1270,7 +1161,7 @@ impl BackgroundWorker {
                     }
                 });
             }
-            WorkerCommand::SaveAttachmentFromForm => {
+            AssetCmd::SaveAttachmentFromForm => {
                 let ui_h = self.ui_handle.clone();
                 let logger = self.logger.clone();
                 let _ = slint::invoke_from_event_loop(move || {
@@ -1279,7 +1170,7 @@ impl BackgroundWorker {
                         if path_str.is_empty() {
                             return;
                         }
-                        let path = PathBuf::from(&path_str);
+                        let path = std::path::PathBuf::from(&path_str);
                         let json_str = ui.get_mat_json_text().to_string();
                         let mut item_att: crate::engine::assets::attachment::ItemAttachmentJson =
                             match serde_json::from_str(&json_str) {
@@ -1320,75 +1211,167 @@ impl BackgroundWorker {
                     }
                 });
             }
-            WorkerCommand::SaveTerrainPalette {
-                chunk_path,
-                json_data,
-            } => match service::save_terrain_palette(&chunk_path, &json_data) {
-                Ok(_) => self.logger.log(&format!(
-                    "[+] Terrain Palette chunk {:?} updated.",
-                    chunk_path
-                )),
-                Err(e) => self
-                    .logger
-                    .log(&format!("[!] Terrain Palette save error: {}", e)),
-            },
-            WorkerCommand::SaveEnvironment {
-                chunk_path,
-                json_data,
-            } => match service::save_environment(&chunk_path, &json_data) {
-                Ok(_) => self
-                    .logger
-                    .log(&format!("[+] Environment chunk {:?} updated.", chunk_path)),
-                Err(e) => self
-                    .logger
-                    .log(&format!("[!] Environment save error: {}", e)),
-            },
-            WorkerCommand::SaveM8ld {
-                chunk_path,
-                json_data,
-            } => match service::save_m8ld(&chunk_path, &json_data) {
-                Ok(_) => self.logger.log(&format!(
-                    "[+] Level Map Logic (.8ld) {:?} updated.",
-                    chunk_path
-                )),
-                Err(e) => self
-                    .logger
-                    .log(&format!("[!] Level Map Logic save error: {}", e)),
-            },
-            WorkerCommand::SaveUiSprite {
-                chunk_path,
-                json_data,
-            } => match service::save_ui_sprite(&chunk_path, &json_data) {
-                Ok(_) => self.logger.log(&format!(
-                    "[+] UI Sprite Collection {:?} updated.",
-                    chunk_path
-                )),
-                Err(e) => self.logger.log(&format!("[!] UI Sprite save error: {}", e)),
-            },
-            WorkerCommand::SaveDta {
-                chunk_path,
-                json_data,
-            } => match service::save_dta(&chunk_path, &json_data) {
-                Ok(_) => self.logger.log(&format!(
-                    "[+] Lighting Set (.dta) {:?} updated.",
-                    chunk_path
-                )),
-                Err(e) => self
-                    .logger
-                    .log(&format!("[!] Lighting Set save error: {}", e)),
-            },
-            WorkerCommand::SaveVpk {
-                chunk_path,
-                json_data,
-            } => match service::save_vpk(&chunk_path, &json_data) {
-                Ok(_) => self.logger.log(&format!(
-                    "[+] Voice Package (.debug-vpk) {:?} updated.",
-                    chunk_path
-                )),
-                Err(e) => self
-                    .logger
-                    .log(&format!("[!] Voice Package save error: {}", e)),
-            },
+        }
+    }
+
+    fn handle_direct_tool_command(&self, cmd: DirectToolCmd) {
+        match cmd {
+            DirectToolCmd::Decompile8ldDirect { src, dst } => {
+                direct_tools::handle_decompile_8ld_direct(&self.ui_handle, &self.logger, src, dst)
+            }
+            DirectToolCmd::Compile8ldDirect { src, dst } => {
+                direct_tools::handle_compile_8ld_direct(&self.ui_handle, &self.logger, src, dst)
+            }
+            DirectToolCmd::Decompile8ldBatch { src_dir, dst_dir } => {
+                direct_tools::handle_decompile_8ld_batch(
+                    &self.ui_handle,
+                    &self.logger,
+                    src_dir,
+                    dst_dir,
+                )
+            }
+            DirectToolCmd::Compile8ldBatch { src_dir, dst_dir } => {
+                direct_tools::handle_compile_8ld_batch(
+                    &self.ui_handle,
+                    &self.logger,
+                    src_dir,
+                    dst_dir,
+                )
+            }
+            DirectToolCmd::DirectVpkToJson { src, dst } => {
+                direct_tools::handle_direct_vpk_to_json(&self.ui_handle, &self.logger, src, dst)
+            }
+            DirectToolCmd::DirectJsonToVpk {
+                src_json,
+                baseline_vpk,
+                dst,
+            } => direct_tools::handle_direct_json_to_vpk(
+                &self.ui_handle,
+                &self.logger,
+                src_json,
+                baseline_vpk,
+                dst,
+            ),
+            DirectToolCmd::DirectDtaToJson { src, dst } => {
+                direct_tools::handle_direct_dta_to_json(&self.ui_handle, &self.logger, src, dst)
+            }
+            DirectToolCmd::DirectJsonToDta {
+                src_json,
+                baseline_dta,
+                dst,
+            } => direct_tools::handle_direct_json_to_dta(
+                &self.ui_handle,
+                &self.logger,
+                src_json,
+                baseline_dta,
+                dst,
+            ),
+            DirectToolCmd::DirectEnvToJson { src, dst } => {
+                direct_tools::handle_direct_env_to_json(&self.ui_handle, &self.logger, src, dst)
+            }
+            DirectToolCmd::DirectJsonToEnv {
+                src_json,
+                baseline_env,
+                dst,
+            } => direct_tools::handle_direct_json_to_env(
+                &self.ui_handle,
+                &self.logger,
+                src_json,
+                baseline_env,
+                dst,
+            ),
+            DirectToolCmd::DirectMeshExport { src, dst, is_glb } => {
+                direct_tools::handle_direct_mesh_export(
+                    &self.ui_handle,
+                    &self.logger,
+                    src,
+                    dst,
+                    is_glb,
+                )
+            }
+            DirectToolCmd::DirectMeshImport {
+                chunk_target,
+                model_src,
+                is_glb,
+            } => direct_tools::handle_direct_mesh_import(
+                &self.ui_handle,
+                &self.logger,
+                chunk_target,
+                model_src,
+                is_glb,
+            ),
+            DirectToolCmd::DirectAssembleLevel {
+                omp_path,
+                assets_dir,
+                dst,
+            } => direct_tools::handle_direct_assemble_level(
+                &self.ui_handle,
+                &self.logger,
+                omp_path,
+                assets_dir,
+                dst,
+            ),
+            DirectToolCmd::DirectTerrainExport { src, dst, is_glb } => {
+                direct_tools::handle_direct_terrain_export(
+                    &self.ui_handle,
+                    &self.logger,
+                    src,
+                    dst,
+                    is_glb,
+                )
+            }
+            DirectToolCmd::DirectCollisionExport { src, dst } => {
+                direct_tools::handle_direct_collision_export(
+                    &self.ui_handle,
+                    &self.logger,
+                    src,
+                    dst,
+                )
+            }
+            DirectToolCmd::DirectCollisionImport {
+                chunk_target,
+                glb_src,
+            } => direct_tools::handle_direct_collision_import(
+                &self.ui_handle,
+                &self.logger,
+                chunk_target,
+                glb_src,
+            ),
+            DirectToolCmd::DirectFontToJson { src, dst } => {
+                direct_tools::handle_direct_font_to_json(&self.ui_handle, &self.logger, src, dst)
+            }
+            DirectToolCmd::DirectJsonToFont { src_json, dst } => {
+                direct_tools::handle_direct_json_to_font(
+                    &self.ui_handle,
+                    &self.logger,
+                    src_json,
+                    dst,
+                )
+            }
+            DirectToolCmd::DirectTextureExport { src, dst } => {
+                direct_tools::handle_direct_texture_export(&self.ui_handle, &self.logger, src, dst)
+            }
+            DirectToolCmd::DirectTextureImport {
+                chunk_target,
+                img_src,
+            } => direct_tools::handle_direct_texture_import(
+                &self.ui_handle,
+                &self.logger,
+                chunk_target,
+                img_src,
+            ),
+            DirectToolCmd::DirectAudioExport { src, dst } => {
+                direct_tools::handle_direct_audio_export(&self.ui_handle, &self.logger, src, dst)
+            }
+            DirectToolCmd::DirectAudioImport {
+                chunk_target,
+                wav_src,
+            } => direct_tools::handle_direct_audio_import(
+                &self.ui_handle,
+                &self.logger,
+                chunk_target,
+                wav_src,
+            ),
         }
     }
 }
