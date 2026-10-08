@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use super::model::DoorStateJson;
 use crate::engine::assets::attachment::{ItemTriggerActionJson, parse_item_trigger_actions};
 use crate::engine::assets::{build_chunk_from_elements_with_endian, parse_chunk_elements};
-use crate::engine::common::{Endian, read_length_prefixed_string};
+use crate::engine::common::{Endian, EntityHandleJson, read_length_prefixed_string};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ObjectModelBindingJson {
@@ -18,6 +18,10 @@ pub struct PlacementConfigJson {
     pub casts_shadows: bool,
     pub can_be_carried: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub entity_handle: Option<EntityHandleJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub state_count: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_state: Option<u32>,
@@ -31,6 +35,10 @@ pub struct PlacementConfigJson {
     pub secondary_flags: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_flags_hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unknown_44: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub padding_301: Option<u8>,
 }
 
 pub fn parse_simple_model_binding(data: &[u8]) -> Option<ObjectModelBindingJson> {

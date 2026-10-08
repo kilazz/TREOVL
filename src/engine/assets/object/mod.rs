@@ -29,6 +29,7 @@ struct ObjectEntityBuilder {
     pl_casts_shadows: bool,
     pl_can_be_carried: bool,
     pl_entity_handle: Option<EntityHandleJson>,
+    pl_group_count: Option<u32>,
     pl_state_count: Option<u32>,
     pl_default_state: Option<u32>,
     pl_trigger_active: Option<bool>,
@@ -36,6 +37,8 @@ struct ObjectEntityBuilder {
     pl_interaction_flags: Option<String>,
     pl_secondary_flags: Option<String>,
     pl_flags_hex: Option<String>,
+    pl_unknown_44: Option<u8>,
+    pl_padding_301: Option<u8>,
 }
 
 impl ComponentParser for ObjectEntityBuilder {
@@ -93,6 +96,13 @@ impl ComponentParser for ObjectEntityBuilder {
                     self.pl_is_enabled = chunk[0] != 0;
                 }
             }
+            ObjectChunkId::GroupCount26 => {
+                if is_placement_object && chunk.len() >= 4 {
+                    self.pl_group_count = Some(u32::from_le_bytes(
+                        chunk[0..4].try_into().unwrap_or_default(),
+                    ));
+                }
+            }
             ObjectChunkId::StanceId => {
                 if is_placement_object && !chunk.is_empty() {
                     self.pl_stance_id = Some(chunk[0]);
@@ -141,6 +151,11 @@ impl ComponentParser for ObjectEntityBuilder {
             ObjectChunkId::TriggerActive => {
                 if self.type_id == ObjectTypeId::LogicMarker && !chunk.is_empty() {
                     self.pl_trigger_active = Some(chunk[0] != 0);
+                }
+            }
+            ObjectChunkId::Unknown44 => {
+                if is_placement_object && !chunk.is_empty() {
+                    self.pl_unknown_44 = Some(chunk[0]);
                 }
             }
             ObjectChunkId::SecondaryFlags => {
@@ -258,7 +273,11 @@ impl ComponentParser for ObjectEntityBuilder {
                     self.entity.placement_offset = Some(model::parse_placement_offset(chunk)?);
                 }
             }
-            ObjectChunkId::Padding301 => {}
+            ObjectChunkId::Padding301 => {
+                if is_placement_object && !chunk.is_empty() {
+                    self.pl_padding_301 = Some(chunk[0]);
+                }
+            }
             ObjectChunkId::Terminator => {
                 self.entity.has_sentinel_terminator = true;
             }
@@ -430,6 +449,7 @@ pub fn export_object(data: &[u8]) -> Result<ExtractedObject> {
         pl_casts_shadows: false,
         pl_can_be_carried: true,
         pl_entity_handle: None,
+        pl_group_count: None,
         pl_state_count: None,
         pl_default_state: None,
         pl_trigger_active: None,
@@ -437,6 +457,8 @@ pub fn export_object(data: &[u8]) -> Result<ExtractedObject> {
         pl_interaction_flags: None,
         pl_secondary_flags: None,
         pl_flags_hex: None,
+        pl_unknown_44: None,
+        pl_padding_301: None,
     };
 
     for (id, chunk) in elements {
@@ -451,6 +473,8 @@ pub fn export_object(data: &[u8]) -> Result<ExtractedObject> {
             is_enabled: builder.pl_is_enabled,
             casts_shadows: builder.pl_casts_shadows,
             can_be_carried: builder.pl_can_be_carried,
+            entity_handle: builder.pl_entity_handle,
+            group_count: builder.pl_group_count,
             state_count: builder.pl_state_count,
             default_state: builder.pl_default_state,
             trigger_active: builder.pl_trigger_active,
@@ -458,6 +482,8 @@ pub fn export_object(data: &[u8]) -> Result<ExtractedObject> {
             interaction_flags: builder.pl_interaction_flags,
             secondary_flags: builder.pl_secondary_flags,
             raw_flags_hex: builder.pl_flags_hex,
+            unknown_44: builder.pl_unknown_44,
+            padding_301: builder.pl_padding_301,
         });
     }
 
@@ -722,6 +748,10 @@ pub fn import_object_from_json_with_endian(json_str: &str, endian: Endian) -> Re
 
         elements.push((23, vec![if enabled { 1 } else { 0 }]));
 
+        if let Some(count) = pl.and_then(|p| p.group_count) {
+            elements.push((26, endian.u32_to_bytes(count).to_vec()));
+        }
+
         let stance = pl.and_then(|p| p.stance_id).unwrap_or(0);
         elements.push((28, vec![stance]));
 
@@ -805,7 +835,14 @@ pub fn import_object_from_json_with_endian(json_str: &str, endian: Endian) -> Re
             elements.push((42, raw));
         }
 
-        elements.push((44, vec![0u8]));
+        if let Some(val) = pl.and_then(|p| p.unknown_44) {
+            elements.push((44, vec![val]));
+        } else if let Some(raw) = get_fallback(44) {
+            elements.push((44, raw));
+        } else {
+            elements.push((44, vec![0u8]));
+        }
+
         elements.push((46, endian.u32_to_bytes(mat_id).to_vec()));
 
         if let Some(offset) = parsed.placement_offset {
@@ -814,6 +851,14 @@ pub fn import_object_from_json_with_endian(json_str: &str, endian: Endian) -> Re
             elements.push((300, raw));
         } else {
             elements.push((300, model::build_placement_offset([0.0, 0.5, 0.0], endian)));
+        }
+
+        if let Some(val) = pl.and_then(|p| p.padding_301) {
+            elements.push((301, vec![val]));
+        } else if let Some(raw) = get_fallback(301) {
+            elements.push((301, raw));
+        } else {
+            elements.push((301, vec![0u8]));
         }
     } else {
         if !parsed.mesh_bindings.is_empty() {

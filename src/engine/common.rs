@@ -456,7 +456,7 @@ pub fn parse_f32_safe(chunk: &[u8]) -> Option<f32> {
 }
 
 /// A safe, robust abstraction for sequential binary chunk decoding
-/// Replaces manual slicing and bounds checks for repetitive chunk parsing.
+/// Replaces repetitive cursor setup, manual slicing, and bounds checking.
 pub struct ChunkReader<'a> {
     pub data: &'a [u8],
     pub pos: usize,
@@ -560,6 +560,9 @@ impl<'a> ChunkReader<'a> {
 }
 
 /// Represents a Triumph Engine Map Entity UID / Scene Graph Instance Handle.
+/// In Triumph Engine packages, Chunk 22 stores a packed 32-bit handle where:
+/// - Bits 0..23: The sequential instance UID within the level map.
+/// - Bits 24..31: The Domain / Layer prefix ('M' = 0x4D for Main Map, 0x01..0x3F for sub-layers/groups).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct EntityHandleJson {
     pub uid: u32,
@@ -569,22 +572,20 @@ pub struct EntityHandleJson {
 
 pub fn parse_entity_handle(raw_u32: u32) -> Option<EntityHandleJson> {
     let high_byte = ((raw_u32 >> 24) & 0xFF) as u8;
-    let low_24 = raw_u32 & 0x00FF_FFFF;
+    let uid = raw_u32 & 0x00FF_FFFF;
 
-    if high_byte.is_ascii_alphanumeric() && low_24 <= 0x000F_FFFF {
-        return Some(EntityHandleJson {
-            uid: low_24,
-            domain_tag: (high_byte as char).to_string(),
-            raw_hex: format!("0x{:08X}", raw_u32),
-        });
-    }
+    // Entity handles have a realistic map UID count (< 65,536) and a non-zero domain/layer prefix.
+    // This avoids false positives for raw boolean masks like 0x00C00001 or 0x21400000.
+    if uid > 0 && uid <= 0x0000_FFFF && high_byte > 0 {
+        let domain_tag = if high_byte.is_ascii_alphanumeric() {
+            (high_byte as char).to_string()
+        } else {
+            format!("L{:02X}", high_byte)
+        };
 
-    let low_byte = (raw_u32 & 0xFF) as u8;
-    let high_24 = raw_u32 >> 8;
-    if low_byte.is_ascii_alphanumeric() && high_24 <= 0x000F_FFFF {
         return Some(EntityHandleJson {
-            uid: high_24,
-            domain_tag: (low_byte as char).to_string(),
+            uid,
+            domain_tag,
             raw_hex: format!("0x{:08X}", raw_u32),
         });
     }
@@ -670,6 +671,7 @@ pub enum ObjectChunkId {
     Flags = 22,
     Enabled = 23,
     DisplayName = 25,
+    GroupCount26 = 26,
     StanceId = 28,
     CanBeCarried = 29,
     MeshBindings = 30,
@@ -683,6 +685,7 @@ pub enum ObjectChunkId {
     InteractionActions41 = 41,
     PlacedObject = 42,
     TriggerActive = 43,
+    Unknown44 = 44,
     SecondaryFlags = 45,
     MaterialId = 46,
     LogicEventLink = 50,
@@ -713,6 +716,7 @@ impl From<u32> for ObjectChunkId {
             22 => Self::Flags,
             23 => Self::Enabled,
             25 => Self::DisplayName,
+            26 => Self::GroupCount26,
             28 => Self::StanceId,
             29 => Self::CanBeCarried,
             30 => Self::MeshBindings,
@@ -726,6 +730,7 @@ impl From<u32> for ObjectChunkId {
             41 => Self::InteractionActions41,
             42 => Self::PlacedObject,
             43 => Self::TriggerActive,
+            44 => Self::Unknown44,
             45 => Self::SecondaryFlags,
             46 => Self::MaterialId,
             50 => Self::LogicEventLink,

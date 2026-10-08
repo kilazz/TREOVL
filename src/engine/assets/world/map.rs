@@ -1,12 +1,4 @@
-use super::parse_chunk_elements;
-use super::terrain::{add_terrain_to_builder, parse_terrain_geometry};
-use super::texture::parse_texture_chunk;
-use crate::engine::common::read_length_prefixed_string;
-use crate::engine::math::Vector3;
-use crate::utils::dds_decoder::decode_to_rgba;
-use crate::utils::gltf_builder::GltfBuilder;
-use crate::utils::png::encode_rgba_to_png;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -15,19 +7,65 @@ use std::fs;
 use std::io::Cursor;
 use std::path::Path;
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MapEntity {
-    pub name: String,
-    pub index: u32,
+use crate::engine::assets::terrain::{add_terrain_to_builder, parse_terrain_geometry};
+use crate::engine::assets::texture::parse_texture_chunk;
+use crate::engine::assets::{parse_chunk_elements, parse_typed_container};
+use crate::engine::common::{Endian, read_length_prefixed_string};
+use crate::engine::container::builder::build_node;
+use crate::engine::container::header::PrpHeader;
+use crate::engine::container::node::parse_node;
+use crate::engine::container::project::{ProgressCallback, ProjectManifest};
+use crate::engine::math::Vector3;
+use crate::utils::dds_decoder::decode_to_rgba;
+use crate::utils::gltf_builder::GltfBuilder;
+use crate::utils::png::encode_rgba_to_png;
+
+pub const OMP_MAGIC: &[u8; 4] = b"OMP\0";
+pub const OMP_HEADER_SIZE: usize = 40;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct OmpHeaderJson {
+    pub magic: String,
+    pub header_size: u32,
+    pub root_chunk_id: u32,
+    pub type_id_hex: String,
+    pub raw_header_hex: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct OmpDependency {
+    pub index: u32,
+    pub display_name: String,
+    pub rpk_filename: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct OmpSpawner {
+    pub id: u32,
+    pub name: String,
+    pub category: String,
+    pub position: [f32; 3],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rotation_raw: Option<[f32; 4]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub radius: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MapWaypoint {
     pub name: String,
     pub position: Vector3,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct MapEntity {
+    pub name: String,
+    pub index: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MapInfo {
     pub map_name: String,
     pub entity_count: usize,
@@ -36,76 +74,92 @@ pub struct MapInfo {
     pub waypoints: Vec<MapWaypoint>,
 }
 
-pub fn parse_omp_map(chunk_data: &[u8]) -> Result<MapInfo> {
-    let payload = if chunk_data.starts_with(b"OMP") && chunk_data.len() > 43 {
-        &chunk_data[43..]
-    } else {
-        chunk_data
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct OmpLevelManifest {
+    pub map_name: String,
+    pub player_spawn: Option<[f32; 3]>,
+    pub spawner_count: usize,
+    pub waypoint_count: usize,
+    pub dependency_count: usize,
+}
+
+pub struct ParsedOmpPackage {
+    pub header: OmpHeaderJson,
+    pub manifest: OmpLevelManifest,
+    pub dependencies: Vec<OmpDependency>,
+    pub spawners: Vec<OmpSpawner>,
+    pub waypoints: Vec<MapWaypoint>,
+    pub raw_payload: Vec<u8>,
+}
+
+pub fn parse_omp_package(data: &[u8]) -> Result<ParsedOmpPackage> {
+    if data.len() < OMP_HEADER_SIZE || !data.starts_with(OMP_MAGIC) {
+        bail!("Data is not a valid Overlord Map Package (.omp)");
+    }
+
+    let mut cur = Cursor::new(&data[..OMP_HEADER_SIZE]);
+    cur.set_position(4);
+    let header_size = cur.read_u32::<LittleEndian>()?;
+    let _ = cur.read_u32::<LittleEndian>()?;
+    let root_chunk_id = cur.read_u32::<LittleEndian>()?;
+    let type_id = cur.read_u32::<LittleEndian>()?;
+
+    let header = OmpHeaderJson {
+        magic: "OMP".into(),
+        header_size,
+        root_chunk_id,
+        type_id_hex: format!("{:08X}", type_id),
+        raw_header_hex: hex::encode_upper(&data[..OMP_HEADER_SIZE]),
     };
 
-    let (_, elements) = parse_chunk_elements(payload)?;
+    let payload = &data[OMP_HEADER_SIZE..];
 
-    let mut map_name = String::from("Unknown Map");
-    let mut entity_count = 0;
+    // 1. Extract mounted .rpk archives dependencies manifest
+    let dependencies = parse_omp_dependencies(payload);
+
+    // 2. Parse root container table
+    let (_, elements) = parse_chunk_elements(payload)
+        .context("Failed to parse root container table in OMP payload")?;
+
+    let mut map_name = String::from("Unnamed Map");
     let mut player_spawn = None;
-    let mut entities = Vec::new();
+    let mut spawners = Vec::new();
     let mut waypoints = Vec::new();
 
-    for (id, chunk) in elements {
-        match id {
+    for (id, chunk) in &elements {
+        match *id {
             21 => {
-                if let Ok((_, sub_elements)) = parse_chunk_elements(&chunk) {
-                    for (sub_id, sub_chunk) in sub_elements {
-                        if sub_id == 20
-                            && let Ok((_, entity_table)) = parse_chunk_elements(&sub_chunk)
-                        {
-                            entity_count = entity_table.len();
-                            for (e_idx, e_chunk) in &entity_table {
-                                if let Ok((_, e_props)) = parse_chunk_elements(e_chunk) {
-                                    for (pid, pval) in e_props {
-                                        if pid == 31
-                                            && let Some(ename) = read_length_prefixed_string(&pval)
-                                        {
-                                            entities.push(MapEntity {
-                                                name: ename,
-                                                index: *e_idx,
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                spawners = parse_omp_spawners(chunk);
             }
             22 if chunk.len() >= 12 => {
-                let mut cur = Cursor::new(&chunk[0..12]);
-                player_spawn = Some(Vector3 {
-                    x: cur.read_f32::<LittleEndian>().unwrap_or(0.0),
-                    y: cur.read_f32::<LittleEndian>().unwrap_or(0.0),
-                    z: cur.read_f32::<LittleEndian>().unwrap_or(0.0),
-                });
+                let mut p_cur = Cursor::new(&chunk[0..12]);
+                if let (Ok(x), Ok(y), Ok(z)) = (
+                    p_cur.read_f32::<LittleEndian>(),
+                    p_cur.read_f32::<LittleEndian>(),
+                    p_cur.read_f32::<LittleEndian>(),
+                ) {
+                    player_spawn = Some([x, y, z]);
+                }
             }
             24 => {
-                if let Ok((_, wp_table)) = parse_chunk_elements(&chunk) {
+                if let Ok((_, wp_table)) = parse_chunk_elements(chunk) {
                     for (wid, wchunk) in wp_table {
                         if wchunk.len() >= 12 {
-                            let mut cur = Cursor::new(&wchunk[0..12]);
-                            let pos = Vector3 {
-                                x: cur.read_f32::<LittleEndian>().unwrap_or(0.0),
-                                y: cur.read_f32::<LittleEndian>().unwrap_or(0.0),
-                                z: cur.read_f32::<LittleEndian>().unwrap_or(0.0),
-                            };
+                            let mut w_cur = Cursor::new(&wchunk[0..12]);
                             waypoints.push(MapWaypoint {
                                 name: format!("Waypoint_{}", wid),
-                                position: pos,
+                                position: Vector3 {
+                                    x: w_cur.read_f32::<LittleEndian>().unwrap_or(0.0),
+                                    y: w_cur.read_f32::<LittleEndian>().unwrap_or(0.0),
+                                    z: w_cur.read_f32::<LittleEndian>().unwrap_or(0.0),
+                                },
                             });
                         }
                     }
                 }
             }
             34 => {
-                if let Some(s) = read_length_prefixed_string(&chunk) {
+                if let Some(s) = read_length_prefixed_string(chunk) {
                     map_name = s;
                 }
             }
@@ -113,114 +167,403 @@ pub fn parse_omp_map(chunk_data: &[u8]) -> Result<MapInfo> {
         }
     }
 
-    Ok(MapInfo {
+    let manifest = OmpLevelManifest {
         map_name,
-        entity_count,
         player_spawn,
-        entities,
+        spawner_count: spawners.len(),
+        waypoint_count: waypoints.len(),
+        dependency_count: dependencies.len(),
+    };
+
+    Ok(ParsedOmpPackage {
+        header,
+        manifest,
+        dependencies,
+        spawners,
         waypoints,
+        raw_payload: payload.to_vec(),
     })
 }
 
-pub fn export_level_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>> {
-    let payload = if chunk_data.starts_with(b"OMP") && chunk_data.len() > 43 {
-        &chunk_data[43..]
-    } else {
-        chunk_data
+/// Backward-compatible map inspector used by CLI and quick viewer
+pub fn parse_omp_map(chunk_data: &[u8]) -> Result<MapInfo> {
+    let pkg = parse_omp_package(chunk_data)?;
+    let player_spawn = pkg
+        .manifest
+        .player_spawn
+        .map(|[x, y, z]| Vector3 { x, y, z });
+    let entities = pkg
+        .spawners
+        .iter()
+        .map(|s| MapEntity {
+            name: s.name.clone(),
+            index: s.id,
+        })
+        .collect();
+
+    Ok(MapInfo {
+        map_name: pkg.manifest.map_name,
+        entity_count: pkg.manifest.spawner_count,
+        player_spawn,
+        entities,
+        waypoints: pkg.waypoints,
+    })
+}
+
+/// Discovers mounted RPK package dependencies (Type ID: 0x0400001E)
+pub fn parse_omp_dependencies(data: &[u8]) -> Vec<OmpDependency> {
+    let mut deps = Vec::new();
+    let marker = b"\x1E\x00\x00\x04";
+    let mut pos = 0;
+
+    while let Some(rel) = data[pos..].windows(4).position(|w| w == marker) {
+        let start = pos + rel;
+        if let Ok((type_id, fields)) = parse_typed_container(&data[start..])
+            && type_id == 0x0400001E
+        {
+            let mut index = 0;
+            let mut display_name = String::new();
+            let mut rpk_filename = String::new();
+
+            for (fid, fdata) in fields {
+                match fid {
+                    30 if fdata.len() >= 4 => {
+                        index = u32::from_le_bytes(fdata[0..4].try_into().unwrap_or_default());
+                    }
+                    31 => {
+                        if let Some(s) = read_length_prefixed_string(&fdata) {
+                            display_name = s;
+                        }
+                    }
+                    32 => {
+                        if let Some(s) = read_length_prefixed_string(&fdata) {
+                            rpk_filename = s;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if !rpk_filename.is_empty() {
+                deps.push(OmpDependency {
+                    index,
+                    display_name,
+                    rpk_filename,
+                });
+            }
+        }
+        pos = start + 4;
+    }
+
+    deps.sort_by_key(|d| d.index);
+    deps.dedup_by(|a, b| a.rpk_filename == b.rpk_filename);
+    deps
+}
+
+/// Parses all placed spawners, enemies, and interactive objects from Chunk 21
+pub fn parse_omp_spawners(chunk_data: &[u8]) -> Vec<OmpSpawner> {
+    let mut spawners = Vec::new();
+
+    let (_, entity_table) = match parse_chunk_elements(chunk_data) {
+        Ok(t) => t,
+        Err(_) => return spawners,
     };
 
-    let (_, elements) = parse_chunk_elements(payload)?;
+    for (e_idx, e_chunk) in entity_table {
+        if let Ok((_, props)) = parse_chunk_elements(&e_chunk) {
+            let mut name = String::new();
+            let mut category = String::from("GenericSpawner");
+            let mut position = [0.0f32; 3];
+            let mut rotation_raw = None;
+            let mut radius = None;
+            let mut group_id = None;
 
-    let terrain_chunk = elements
-        .iter()
-        .find(|(id, _)| *id == 20)
-        .map(|(_, d)| d.as_slice())
-        .context("Map does not contain Terrain chunk (ID 20)")?;
+            for (pid, pval) in props {
+                match pid {
+                    20 if pval.len() >= 12 => {
+                        let mut cur = Cursor::new(&pval[0..12]);
+                        let x = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+                        let y = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+                        let z = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+                        if x.is_finite() && y.is_finite() && z.is_finite() {
+                            position = [x, y, z];
+                        }
+                    }
+                    21 if pval.len() >= 16 => {
+                        let mut cur = Cursor::new(&pval[0..16]);
+                        let qx = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+                        let qy = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+                        let qz = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+                        let qw = cur.read_f32::<LittleEndian>().unwrap_or(1.0);
+                        rotation_raw = Some([qx, qy, qz, qw]);
+                    }
+                    31 => {
+                        if let Some(s) = read_length_prefixed_string(&pval) {
+                            name = s;
+                        }
+                    }
+                    32 => {
+                        if let Some(s) = read_length_prefixed_string(&pval) {
+                            category = s;
+                        }
+                    }
+                    60 if pval.len() >= 4 => {
+                        radius = Cursor::new(&pval).read_f32::<LittleEndian>().ok();
+                    }
+                    61 if pval.len() >= 4 => {
+                        group_id = Cursor::new(&pval).read_u32::<LittleEndian>().ok();
+                    }
+                    _ => {}
+                }
+            }
 
-    let map_info = parse_omp_map(chunk_data)?;
-    let terrain_geom = parse_terrain_geometry(terrain_chunk)?;
+            if !name.is_empty() || position != [0.0, 0.0, 0.0] {
+                spawners.push(OmpSpawner {
+                    id: e_idx,
+                    name: if name.is_empty() {
+                        format!("Entity_{}", e_idx)
+                    } else {
+                        name
+                    },
+                    category,
+                    position,
+                    rotation_raw,
+                    radius,
+                    group_id,
+                });
+            }
+        }
+    }
 
+    spawners
+}
+
+/// Unpacks a full .omp map package into a structured modding workspace identical to PRP archives
+pub fn unpack_omp_to_project_with_progress(
+    omp_path: &Path,
+    output_dir: &Path,
+    progress: Option<ProgressCallback>,
+) -> Result<(usize, String)> {
+    if let Some(cb) = progress {
+        cb(0.10, "Reading Overlord Map Package (.omp)...");
+    }
+
+    let data = fs::read(omp_path).with_context(|| format!("Failed to read {:?}", omp_path))?;
+    let parsed = parse_omp_package(&data)?;
+
+    let chunks_dir = output_dir.join("chunks");
+    let vanilla_dir = output_dir.join("chunks_vanilla");
+    let assets_dir = output_dir.join("assets");
+
+    fs::create_dir_all(&chunks_dir)?;
+    fs::create_dir_all(&vanilla_dir)?;
+    fs::create_dir_all(&assets_dir)?;
+
+    if let Some(cb) = progress {
+        cb(0.35, "Extracting map chunks hierarchy...");
+    }
+
+    let mut chunk_counter = 0;
+    let root_node = parse_node(
+        &parsed.raw_payload,
+        0,
+        true,
+        true,
+        &mut chunk_counter,
+        output_dir,
+    );
+
+    // Export terrain GLB from Chunk 20 if present
+    if let Ok((_, elements)) = parse_chunk_elements(&parsed.raw_payload)
+        && let Some((_, terr_data)) = elements.iter().find(|(id, _)| *id == 20)
+        && let Ok(geom) = parse_terrain_geometry(terr_data)
+    {
+        let mut builder = GltfBuilder::new();
+        if let Ok(node_idx) = add_terrain_to_builder(
+            &mut builder,
+            &geom,
+            &format!("Terrain_{}", parsed.manifest.map_name),
+        ) {
+            builder.add_scene(vec![node_idx]);
+            if let Ok(glb) = builder.build("Overlord OMP Terrain") {
+                let _ = fs::write(assets_dir.join("terrain.glb"), glb);
+            }
+        }
+    }
+
+    if let Some(cb) = progress {
+        cb(0.65, "Writing level manifests and dependencies...");
+    }
+
+    // Export readable JSON manifests
+    fs::write(
+        assets_dir.join("map_manifest.json"),
+        serde_json::to_string_pretty(&parsed.manifest)?,
+    )?;
+
+    fs::write(
+        assets_dir.join("dependencies.json"),
+        serde_json::to_string_pretty(&parsed.dependencies)?,
+    )?;
+
+    fs::write(
+        assets_dir.join("spawners.json"),
+        serde_json::to_string_pretty(&parsed.spawners)?,
+    )?;
+
+    let prp_header = PrpHeader {
+        magic: "OMP".into(),
+        major_version: 3,
+        minor_version: 0,
+        file_id: parsed.header.root_chunk_id,
+        data_size: parsed.raw_payload.len() as u32,
+        pack_name: parsed.manifest.map_name.clone(),
+        endian: Endian::Little,
+    };
+
+    let project_manifest = ProjectManifest {
+        header: prp_header,
+        has_footer: false,
+        footer_hash2: 0,
+        endian: Endian::Little,
+        root: root_node,
+        omp_header: Some(parsed.header.clone()),
+    };
+
+    fs::write(
+        output_dir.join("project.json"),
+        serde_json::to_string_pretty(&project_manifest)?,
+    )?;
+
+    let log = format!(
+        "Magic: 'OMP' | Level: '{}' | Header: {} bytes\n\
+         • Player Start Location: {:?}\n\
+         • Placed Entities & Spawners: {}\n\
+         • Mounted Dependencies: {} .rpk archives\n\
+         • Terrain 3D geometry exported to 'assets/terrain.glb'\n",
+        parsed.manifest.map_name,
+        parsed.header.header_size,
+        parsed.manifest.player_spawn,
+        parsed.manifest.spawner_count,
+        parsed.manifest.dependency_count
+    );
+
+    if let Some(cb) = progress {
+        cb(1.0, "Map project ready.");
+    }
+
+    Ok((chunk_counter as usize, log))
+}
+
+/// Recompiles an unpacked map project workspace back into an exact .omp binary
+pub fn pack_omp_from_project_with_progress(
+    project_dir: &Path,
+    output_archive: &Path,
+    compression_level: u32,
+    progress: Option<ProgressCallback>,
+) -> Result<usize> {
+    let manifest_path = project_dir.join("project.json");
+    let manifest_str = fs::read_to_string(&manifest_path)?;
+    let manifest: ProjectManifest = serde_json::from_str(&manifest_str)?;
+
+    let omp_hdr = manifest
+        .omp_header
+        .as_ref()
+        .context("Missing omp_header metadata in project.json")?;
+
+    if let Some(cb) = progress {
+        cb(0.30, "Rebuilding map container chunks...");
+    }
+
+    let payload = build_node(
+        &manifest.root,
+        project_dir,
+        compression_level,
+        manifest.endian,
+    )?;
+
+    let header_bytes = if let Ok(h_raw) = hex::decode(&omp_hdr.raw_header_hex) {
+        if h_raw.len() == OMP_HEADER_SIZE {
+            h_raw
+        } else {
+            rebuild_omp_header_bytes(omp_hdr)?
+        }
+    } else {
+        rebuild_omp_header_bytes(omp_hdr)?
+    };
+
+    if let Some(cb) = progress {
+        cb(0.80, "Writing binary map package (.omp)...");
+    }
+
+    let mut final_file = Vec::with_capacity(OMP_HEADER_SIZE + payload.len());
+    final_file.extend_from_slice(&header_bytes);
+    final_file.extend_from_slice(&payload);
+
+    fs::write(output_archive, &final_file)?;
+
+    if let Some(cb) = progress {
+        cb(1.0, "Map package built successfully.");
+    }
+
+    Ok(final_file.len())
+}
+
+fn rebuild_omp_header_bytes(hdr: &OmpHeaderJson) -> Result<Vec<u8>> {
+    let mut out = vec![0u8; OMP_HEADER_SIZE];
+    out[0..4].copy_from_slice(OMP_MAGIC);
+    out[4..8].copy_from_slice(&hdr.header_size.to_le_bytes());
+    out[12..16].copy_from_slice(&hdr.root_chunk_id.to_le_bytes());
+    let type_id =
+        u32::from_str_radix(hdr.type_id_hex.trim_start_matches("0x"), 16).unwrap_or(0x00460003);
+    out[16..20].copy_from_slice(&type_id.to_le_bytes());
+    Ok(out)
+}
+
+/// Exports map terrain and entity locators directly to glTF 2.0 Binary (.glb)
+pub fn export_level_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>> {
+    let parsed = parse_omp_package(chunk_data)?;
     let mut builder = GltfBuilder::new();
     let mut scene_nodes = Vec::new();
 
-    let terrain_node = add_terrain_to_builder(
-        &mut builder,
-        &terrain_geom,
-        &format!("Terrain_{}", map_info.map_name),
-    )?;
-    scene_nodes.push(terrain_node);
-
-    let marker_verts: [[f32; 3]; 5] = [
-        [0.0, 3.0, 0.0],
-        [-1.0, 0.0, -1.0],
-        [1.0, 0.0, -1.0],
-        [1.0, 0.0, 1.0],
-        [-1.0, 0.0, 1.0],
-    ];
-    let marker_indices: [u16; 18] = [0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 1, 1, 3, 2, 1, 4, 3];
-
-    let mut marker_idx_bytes = Vec::with_capacity(marker_indices.len() * 2);
-    for idx in marker_indices {
-        marker_idx_bytes.write_u16::<LittleEndian>(idx)?;
+    // 1. Terrain Mesh
+    if let Ok((_, elements)) = parse_chunk_elements(&parsed.raw_payload)
+        && let Some((_, terr_data)) = elements.iter().find(|(id, _)| *id == 20)
+        && let Ok(geom) = parse_terrain_geometry(terr_data)
+    {
+        let t_node = add_terrain_to_builder(
+            &mut builder,
+            &geom,
+            &format!("Terrain_{}", parsed.manifest.map_name),
+        )?;
+        scene_nodes.push(t_node);
     }
-    let m_idx_view = builder.add_buffer_view(&marker_idx_bytes, Some(34963));
-    let m_idx_acc =
-        builder.add_accessor(m_idx_view, marker_indices.len(), 5123, "SCALAR", None, None);
 
-    let mut marker_pos_bytes = Vec::with_capacity(marker_verts.len() * 12);
-    for v in marker_verts {
-        marker_pos_bytes.write_f32::<LittleEndian>(v[0])?;
-        marker_pos_bytes.write_f32::<LittleEndian>(v[1])?;
-        marker_pos_bytes.write_f32::<LittleEndian>(v[2])?;
-    }
-    let m_pos_view = builder.add_buffer_view(&marker_pos_bytes, Some(34962));
-    let m_pos_acc = builder.add_accessor(
-        m_pos_view,
-        marker_verts.len(),
-        5126,
-        "VEC3",
-        Some(vec![-1.0, 0.0, -1.0]),
-        Some(vec![1.0, 3.0, 1.0]),
-    );
-
-    let marker_mesh = builder.add_mesh(json!({
-        "name": "EntityMarker",
-        "primitives": [{
-            "attributes": { "POSITION": m_pos_acc },
-            "indices": m_idx_acc,
-            "mode": 4
-        }]
-    }));
-
-    if let Some(spawn) = map_info.player_spawn {
+    // 2. Player Start Location Marker
+    if let Some(spawn) = parsed.manifest.player_spawn {
         let spawn_node = builder.add_node(json!({
             "name": "Player_Start_Location",
-            "mesh": marker_mesh,
-            "translation": [spawn.x, spawn.y, spawn.z]
+            "translation": spawn
         }));
         scene_nodes.push(spawn_node);
     }
 
-    for (i, ent) in map_info.entities.iter().enumerate() {
-        let ent_node = builder.add_node(json!({
-            "name": format!("{}_{}", ent.name, i + 1),
-            "mesh": marker_mesh,
-            "translation": [0.0, 5.0 + (i as f32 * 2.0), 0.0]
+    // 3. Spawners & Placed Entities Markers
+    for spawner in parsed.spawners {
+        let s_node = builder.add_node(json!({
+            "name": format!("{}_[{}]", spawner.name, spawner.category),
+            "translation": spawner.position
         }));
-        scene_nodes.push(ent_node);
+        scene_nodes.push(s_node);
     }
 
-    for wp in &map_info.waypoints {
-        let wp_node = builder.add_node(json!({
-            "name": format!("AI_Path_{}", wp.name),
-            "mesh": marker_mesh,
-            "translation": [wp.position.x, wp.position.y, wp.position.z]
-        }));
-        scene_nodes.push(wp_node);
+    if scene_nodes.is_empty() {
+        let empty = builder.add_node(json!({ "name": "EmptyMap" }));
+        scene_nodes.push(empty);
     }
 
     builder.add_scene(scene_nodes);
-    builder.build("Overlord Modding Studio Level Exporter")
+    builder.build("Overlord Level Exporter")
 }
 
 /// Assembles complete level scene instancing 3D models with real PBR materials & PNG textures
@@ -229,7 +572,6 @@ pub fn assemble_level_scene_glb(omp_data: &[u8], assets_dir: &Path) -> Result<Ve
     let mut builder = GltfBuilder::new();
     let mut scene_nodes = Vec::new();
 
-    // Cache of converted PNG textures: filename -> gltf texture index
     let mut texture_cache: HashMap<String, usize> = HashMap::new();
     let textures_dir = assets_dir.join("textures");
 
@@ -245,7 +587,6 @@ pub fn assemble_level_scene_glb(omp_data: &[u8], assets_dir: &Path) -> Result<Ve
                 return Some(idx);
             }
 
-            // Try reading DDS or TGA
             let dds_candidate = textures_dir.join(format!("{}.dds", clean));
             let tga_candidate = textures_dir.join(format!("{}.tga", clean));
 
@@ -273,9 +614,8 @@ pub fn assemble_level_scene_glb(omp_data: &[u8], assets_dir: &Path) -> Result<Ve
             Some(tex_idx)
         };
 
-    // 1. Terrain Mesh
-    let payload = if omp_data.starts_with(b"OMP") && omp_data.len() > 43 {
-        &omp_data[43..]
+    let payload = if omp_data.starts_with(b"OMP") && omp_data.len() > OMP_HEADER_SIZE {
+        &omp_data[OMP_HEADER_SIZE..]
     } else {
         omp_data
     };
@@ -292,7 +632,6 @@ pub fn assemble_level_scene_glb(omp_data: &[u8], assets_dir: &Path) -> Result<Ve
         scene_nodes.push(terr_node);
     }
 
-    // 2. Discover available meshes
     let meshes_dir = assets_dir.join("meshes");
     let mut mesh_files = Vec::new();
     if meshes_dir.exists()
@@ -306,7 +645,6 @@ pub fn assemble_level_scene_glb(omp_data: &[u8], assets_dir: &Path) -> Result<Ve
         }
     }
 
-    // 3. Scan Materials to map textures to models
     let materials_dir = assets_dir.join("materials");
     let mut model_to_texture: HashMap<String, String> = HashMap::new();
 
@@ -338,11 +676,9 @@ pub fn assemble_level_scene_glb(omp_data: &[u8], assets_dir: &Path) -> Result<Ve
         }
     }
 
-    // 4. Place Entity Locators and link Texture Materials
     for (i, ent) in map_info.entities.iter().enumerate() {
         let mut model_name = format!("{}_{}", ent.name, i + 1);
         let lower_ent = ent.name.to_lowercase();
-
         let mut node_mesh_idx = None;
 
         if let Some(matched) = mesh_files
@@ -351,7 +687,6 @@ pub fn assemble_level_scene_glb(omp_data: &[u8], assets_dir: &Path) -> Result<Ve
         {
             model_name = format!("{}_[Model: {}]", ent.name, matched);
 
-            // Try to assign a diffuse texture material
             if let Some(tex_ptr) = model_to_texture.get(&lower_ent)
                 && let Some(tex_idx) = load_or_convert_texture(tex_ptr, &mut builder)
             {
@@ -364,7 +699,6 @@ pub fn assemble_level_scene_glb(omp_data: &[u8], assets_dir: &Path) -> Result<Ve
                     }
                 }));
 
-                // Simple placeholder quad/box for the placed actor linking the real texture
                 let mut p_bytes = Vec::new();
                 p_bytes.write_f32::<LittleEndian>(-1.0)?;
                 p_bytes.write_f32::<LittleEndian>(0.0)?;

@@ -10,6 +10,7 @@ use super::footer::{
 use super::header::{HEADER_SIZE, PrpHeader};
 use super::node::{PrpNode, parse_node};
 use super::sync::{export_smart_assets_with_progress, sync_assets_to_chunks_with_progress};
+use crate::engine::assets::map::OmpHeaderJson;
 use crate::engine::common::Endian;
 
 pub type ProgressCallback<'a> = &'a (dyn Fn(f32, &str) + Send + Sync);
@@ -22,6 +23,8 @@ pub struct ProjectManifest {
     #[serde(default)]
     pub endian: Endian,
     pub root: PrpNode,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub omp_header: Option<OmpHeaderJson>,
 }
 
 pub fn unpack_archive(archive_path: &Path, output_dir: &Path) -> Result<(usize, String)> {
@@ -39,6 +42,18 @@ pub fn unpack_archive_with_progress(
 
     let data = fs::read(archive_path)
         .with_context(|| format!("Failed to read archive into memory: {:?}", archive_path))?;
+
+    // Seamless routing: Overlord Map Packages (.omp) are unpacked into a dedicated Level Project
+    if data.starts_with(b"OMP") {
+        if let Some(cb) = progress {
+            cb(0.20, "Unpacking Overlord Map Package (.omp)...");
+        }
+        return crate::engine::assets::map::unpack_omp_to_project_with_progress(
+            archive_path,
+            output_dir,
+            progress,
+        );
+    }
 
     if let Some(cb) = progress {
         cb(0.15, "Parsing PRP/RPK headers and footers...");
@@ -90,6 +105,7 @@ pub fn unpack_archive_with_progress(
         footer_hash2,
         endian,
         root: root_node,
+        omp_header: None,
     };
 
     let manifest_path = output_dir.join("project.json");
@@ -147,6 +163,19 @@ pub fn pack_archive_with_progress(
         );
     }
 
+    let manifest_str = fs::read_to_string(&manifest_path)?;
+    let manifest: ProjectManifest = serde_json::from_str(&manifest_str)?;
+
+    // Seamless routing: Recompile OMP maps with prepended OMP header
+    if manifest.header.magic == "OMP" || manifest.omp_header.is_some() {
+        return crate::engine::assets::map::pack_omp_from_project_with_progress(
+            project_dir,
+            output_archive,
+            compression_level,
+            progress,
+        );
+    }
+
     if let Some(cb) = progress {
         cb(0.10, "Syncing modified assets into binary chunks...");
     }
@@ -163,9 +192,6 @@ pub fn pack_archive_with_progress(
     if let Some(cb) = progress {
         cb(0.50, "Serializing container node tree...");
     }
-
-    let manifest_str = fs::read_to_string(&manifest_path)?;
-    let manifest: ProjectManifest = serde_json::from_str(&manifest_str)?;
 
     let payload = build_node(
         &manifest.root,
