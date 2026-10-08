@@ -1,2 +1,5 @@
 ## TREOVL
-Utility for **Overlord (2007)** modding, written in Rust and powered by the Slint GUI framework.
+**Overlord (2007)/Raising Hell/Overlord 2(2009)** modding, written in Rust and powered by the Slint GUI framework.
+
+TREOVL is an experimental reverse-engineering toolkit for the Triumph Engine. Asset extraction and container tools are fully functional.
+3D viewport skinning and shader rigging are currently under active development (WIP) ~

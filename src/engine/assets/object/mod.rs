@@ -8,7 +8,9 @@ pub use placement::*;
 
 use anyhow::{Context, Result, bail};
 
-use crate::engine::assets::{build_typed_container_with_endian, parse_typed_container};
+use crate::engine::assets::{
+    build_typed_container_with_endian, parse_chunk_elements, parse_typed_container,
+};
 use crate::engine::common::Endian;
 
 pub struct ExtractedObject {
@@ -21,13 +23,56 @@ pub fn export_object(data: &[u8]) -> Result<ExtractedObject> {
         bail!("Chunk data too short to be an Object Entity container.");
     }
 
-    let (type_id, elements) = parse_typed_container(data)
-        .context("Failed to parse Object Entity root typed container")?;
+    let direct_type = u32::from_le_bytes(data[0..4].try_into()?);
+    let (type_id, elements) = if matches!(
+        direct_type,
+        0x0041004B | 0x00464621 | 0x00464661 | 0x00464669
+    ) {
+        parse_typed_container(data)?
+    } else {
+        let (_, root_elements) = parse_chunk_elements(data)?;
+        let mut found_payload: Option<Vec<u8>> = None;
+        let mut found_type = 0x00464621;
 
-    let is_placement_object = type_id == 0x00464621;
+        for (_, chunk_bytes) in &root_elements {
+            if chunk_bytes.len() >= 4 {
+                let t = u32::from_le_bytes(chunk_bytes[0..4].try_into().unwrap_or_default());
+                if matches!(t, 0x0041004B | 0x00464621 | 0x00464661 | 0x00464669) {
+                    found_type = t;
+                    found_payload = Some(chunk_bytes.clone());
+                    break;
+                }
+            }
+            if let Ok((_, inner_elems)) = parse_chunk_elements(chunk_bytes) {
+                for (_, ic) in inner_elems {
+                    if ic.len() >= 4 {
+                        let t = u32::from_le_bytes(ic[0..4].try_into().unwrap_or_default());
+                        if matches!(t, 0x0041004B | 0x00464621 | 0x00464661 | 0x00464669) {
+                            found_type = t;
+                            found_payload = Some(ic.clone());
+                            break;
+                        }
+                    }
+                }
+            }
+            if found_payload.is_some() {
+                break;
+            }
+        }
+
+        let payload =
+            found_payload.context("Failed to locate inner Object typed container payload")?;
+        let (_, elems) = parse_typed_container(&payload)?;
+        (found_type, elems)
+    };
+
+    let is_placement_object =
+        type_id == 0x00464621 || type_id == 0x00464661 || type_id == 0x00464669;
     let class_name = match type_id {
         0x0041004B => Some("TREModelResource".to_string()),
         0x00464621 => Some("TREPlacementObject".to_string()),
+        0x00464661 => Some("TRESoundMarker".to_string()),
+        0x00464669 => Some("TREPushableWheel".to_string()),
         _ => None,
     };
 
@@ -276,7 +321,8 @@ pub fn import_object_from_json_with_endian(json_str: &str, endian: Endian) -> Re
     let type_id = u32::from_str_radix(&parsed._engine_metadata.type_id_hex, 16)
         .context("Invalid TypeID hex in Object JSON metadata")?;
 
-    let is_placement_object = type_id == 0x00464621;
+    let is_placement_object =
+        type_id == 0x00464621 || type_id == 0x00464661 || type_id == 0x00464669;
     let mut elements = Vec::new();
 
     let get_fallback = |id: u32| -> Option<Vec<u8>> {

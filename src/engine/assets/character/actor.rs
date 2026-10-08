@@ -30,6 +30,10 @@ pub struct CharacterActorJson {
     pub state_and_rewards: Option<CharacterStateAndRewardsJson>,
     pub morph_parameters: Option<CharacterMorphParamsJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub hold_offset: Option<[f32; 3]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drop_sound: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ragdoll_config: Option<ActorRagdollConfigJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collision_filter: Option<ActorCollisionFilterJson>,
@@ -87,6 +91,8 @@ pub struct CharacterAttributesJson {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub archetype_id: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub physics_material_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub threat_level: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_elite_or_boss: Option<bool>,
@@ -114,6 +120,8 @@ pub struct CharacterAttributesJson {
     pub engagement_distance: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alert_distance: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interaction_distance: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mass: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -171,6 +179,8 @@ pub struct CharacterCombatTimingsJson {
     pub invulnerability_time_sec: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hit_recovery_cooldown_sec: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub physics_damping: Option<f32>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -207,6 +217,10 @@ pub struct CharacterStateAndRewardsJson {
     pub experience_reward: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub loot_drop_multiplier: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rotation_angle_limit_deg: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rotation_direction: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_stunned: Option<bool>,
 }
@@ -709,7 +723,6 @@ pub fn parse_actor_attachments(data: &[u8]) -> Vec<ActorSocketOffsetJson> {
 
             for (fid, fdata) in fields {
                 match fid {
-                    // ID 30 (0x1E): Local position translation vector
                     30 if fdata.len() >= 12 => {
                         let mut cur = Cursor::new(&fdata);
                         let tx = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
@@ -719,7 +732,6 @@ pub fn parse_actor_attachments(data: &[u8]) -> Vec<ActorSocketOffsetJson> {
                             translation = [tx, ty, tz];
                         }
                     }
-                    // ID 34 (0x22): Local rotation orientation quaternion
                     34 if fdata.len() >= 16 => {
                         let mut cur = Cursor::new(&fdata);
                         let qx = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
@@ -730,7 +742,6 @@ pub fn parse_actor_attachments(data: &[u8]) -> Vec<ActorSocketOffsetJson> {
                             rotation_quat = [qx, qy, qz, qw];
                         }
                     }
-                    // ID 35 (0x23): Socket descriptor name
                     35 => {
                         if let Some(s) = read_length_prefixed_string(&fdata) {
                             name = s.trim().to_string();

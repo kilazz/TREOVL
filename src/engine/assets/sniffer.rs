@@ -101,12 +101,42 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
 
     let magic_bytes = &data[0..4];
 
-    // Priority 1: Scene Graph Objects, 3D Models & Entities (magic 0x0041004B)
-    let (kind, kind_name, icon) = if magic_bytes == magic::OBJECT
+    // Priority 1: Scene Graph Objects, Entities, Markers & Mechanisms (Direct or Wrapped)
+    let is_object_direct = magic_bytes == magic::OBJECT
         || magic_bytes == b"\x21\x46\x46\x00"
         || magic_bytes == b"\x67\x00\x41\x00"
-    {
-        (AssetKind::Object, "TREModelResource (Entity/Prop)", "🧊")
+        || magic_bytes == b"\x69\x46\x46\x00";
+
+    let is_object_wrapped = data[..data.len().min(512)].windows(4).any(|w| {
+        w == b"\x4B\x00\x41\x00"
+            || w == b"\x21\x46\x46\x00"
+            || w == b"\x61\x46\x46\x00"
+            || w == b"\x69\x46\x46\x00"
+    });
+
+    let (kind, kind_name, icon) = if is_object_direct || is_object_wrapped {
+        let actual_magic: &[u8] = if is_object_direct {
+            magic_bytes
+        } else {
+            let pos = data[..data.len().min(512)]
+                .windows(4)
+                .position(|w| {
+                    w == b"\x4B\x00\x41\x00"
+                        || w == b"\x21\x46\x46\x00"
+                        || w == b"\x61\x46\x46\x00"
+                        || w == b"\x69\x46\x46\x00"
+                })
+                .unwrap_or(0);
+            &data[pos..pos + 4]
+        };
+
+        let label = match actual_magic {
+            b"\x69\x46\x46\x00" => "Pushable Wheel Mechanism (TREPushableWheel)",
+            b"\x61\x46\x46\x00" => "Sound Marker Object (TRESoundMarker)",
+            b"\x21\x46\x46\x00" => "Placement Object (TREPlacementObject)",
+            _ => "TREModelResource (Entity/Prop)",
+        };
+        (AssetKind::Object, label, "🧊")
 
     // Priority 2: Character / Actor / Breakable / Captive Controllers (0x00464003, 0x00463018, 0x0046305B)
     } else if data.len() >= 4
@@ -124,12 +154,13 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
                     || *id == 31
                     || *id == 33
                     || *id == 29
+                    || *id == 86
             });
         }
         if is_valid {
             let (label, icon) = match data[0] {
                 0x18 => ("Breakable Prop / Destructible Object", "💥"),
-                0x5B => ("Tower Captive / Interactive Maiden", "👸"),
+                0x5B => ("Interactive Prop / Tower Captive", "👸"),
                 _ => ("Character / NPC Controller (TREActor)", "🧙‍♂️"),
             };
             (AssetKind::Character, label, icon)
@@ -138,8 +169,27 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
         }
 
     // Priority 3: All Weapons, Items, Attachments, Armor & Pickups (Family 0x004620xx)
-    } else if data.len() >= 4 && data[2] == 0x46 && data[1] == 0x20 {
-        let t_id = data[0];
+    } else if (data.len() >= 4 && data[2] == 0x46 && data[1] == 0x20)
+        || data[..data.len().min(512)].windows(4).any(|w| {
+            w[3] == 0x00
+                && w[2] == 0x46
+                && w[1] == 0x20
+                && matches!(w[0], 0x0B | 0x0D | 0x11 | 0x15 | 0x17 | 0x1B | 0x21 | 0x3F)
+        })
+    {
+        let t_id = if data.len() >= 4 && data[2] == 0x46 && data[1] == 0x20 {
+            data[0]
+        } else if let Some(pos) = data[..data.len().min(512)].windows(4).position(|w| {
+            w[3] == 0x00
+                && w[2] == 0x46
+                && w[1] == 0x20
+                && matches!(w[0], 0x0B | 0x0D | 0x11 | 0x15 | 0x17 | 0x1B | 0x21 | 0x3F)
+        }) {
+            data[pos]
+        } else {
+            0x0D
+        };
+
         let (label, icon) = match t_id {
             0x11 | 0x15 | 0x17 | 0x21 => ("Weapon Resource (TREWeaponResource)", "🗡️"),
             0x0B => ("Armor / Equipment (TREEquipmentResource)", "🛡️"),
@@ -241,7 +291,7 @@ pub fn sniff_asset(data: &[u8], filename_hint: &str) -> SniffedAsset {
         || (data.len() >= 4
             && data[2] == 0x46
             && (data[1] == 0x00
-                || data[1] == 0x46
+                || (data[1] == 0x46 && matches!(data[0], 0x08 | 0x14 | 0x20))
                 || (data[1] == 0x06 && (data[0] == 0x24 || data[0] == 0x32))))
         || (data.len() >= 4 && data[2] == 0x40 && (data[1] == 0x00 || data[1] == 0x59))
     {

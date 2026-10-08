@@ -549,7 +549,12 @@ pub fn export_attachment_to_json(data: &[u8]) -> Result<String> {
             resource_tag = s;
         }
 
-        for (_, chunk_bytes) in &root_elements {
+        for (root_id, chunk_bytes) in &root_elements {
+            // Root element 30 is the sound container (0x04000057), parsed separately below
+            if *root_id == 30 {
+                continue;
+            }
+
             let payload_opt =
                 if chunk_bytes.len() >= 4 && chunk_bytes[2] == 0x46 && chunk_bytes[1] == 0x20 {
                     item_type_id =
@@ -564,7 +569,11 @@ pub fn export_attachment_to_json(data: &[u8]) -> Result<String> {
             if let Some(payload) = payload_opt
                 && let Ok((type_id, elements)) = parse_typed_container(payload)
             {
-                item_type_id = type_id;
+                // Fix: Only update item_type_id if it's from the item/prop family (0x004620xx)
+                if (type_id >> 8) == 0x004620 {
+                    item_type_id = type_id;
+                }
+
                 for (id, chunk) in elements {
                     match id {
                         20 => {
@@ -751,6 +760,11 @@ pub fn export_attachment_to_json(data: &[u8]) -> Result<String> {
                 }
             }
         }
+    }
+
+    // Fallback item name to submesh name if raw name is placeholder
+    if (item_name == "Item" || item_name == "noname") && !submesh_name.is_empty() {
+        item_name = submesh_name.clone();
     }
 
     let metadata = AttachmentEngineMetadataJson {

@@ -10,7 +10,8 @@ use std::io::Cursor;
 use std::path::Path;
 
 use crate::engine::assets::{
-    build_typed_container_with_endian, parse_chunk_elements, parse_typed_container,
+    build_chunk_from_elements_with_endian, build_typed_container_with_endian, parse_chunk_elements,
+    parse_typed_container,
 };
 use crate::engine::common::{Endian, read_length_prefixed_string};
 
@@ -50,6 +51,8 @@ pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> 
     let mut transformations = Vec::new();
     let mut effect_receptors = Vec::new();
     let mut minion_grapple_bones = Vec::new();
+    let mut hold_offset = None;
+    let mut drop_sound = None;
     let mut attributes = CharacterAttributesJson::default();
     let mut flags = CharacterFlagsJson::default();
     let mut raw_flags_hex_val = None;
@@ -124,11 +127,19 @@ pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> 
                     model_binding = Some(mb);
                 }
             }
-            46 if is_breakable && chunk.len() >= 4 => {
-                brk_material_id = u32::from_le_bytes(chunk[0..4].try_into().unwrap_or_default());
+            46 if chunk.len() >= 4 => {
+                let val = u32::from_le_bytes(chunk[0..4].try_into().unwrap_or_default());
+                if is_breakable {
+                    brk_material_id = val;
+                } else {
+                    attributes.physics_material_id = Some(val);
+                }
             }
             70 if is_breakable && !chunk.is_empty() => {
                 brk_debris_count = chunk[0] as usize;
+            }
+            75 if chunk.len() >= 4 => {
+                attributes.interaction_distance = parse_f32_safe(chunk);
             }
             79 if chunk.len() >= 4 => {
                 if let Some(rad) = parse_f32_safe(chunk) {
@@ -140,6 +151,10 @@ pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> 
             }
             85 if chunk.len() >= 4 => {
                 attributes.aggro_decay_rate = parse_f32_safe(chunk);
+            }
+            86 | 128 => {
+                let mut sockets = parse_actor_attachments(chunk);
+                socket_offsets.append(&mut sockets);
             }
             88 => {
                 ai_actions = parse_ai_actions(chunk);
@@ -161,20 +176,52 @@ pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> 
             101 if !chunk.is_empty() => {
                 attributes.is_elite_or_boss = Some(chunk[0] != 0);
             }
+            106 => {
+                if let Some(s) = read_length_prefixed_string(chunk) {
+                    drop_sound = Some(s);
+                } else if let Ok((_, sub)) = parse_chunk_elements(chunk) {
+                    for (_, sdata) in sub {
+                        if let Some(s) = read_length_prefixed_string(&sdata)
+                            && s.starts_with("Drop ")
+                        {
+                            drop_sound = Some(s);
+                            break;
+                        }
+                    }
+                }
+            }
+            110 if chunk.len() >= 4 => {
+                timings.physics_damping = parse_f32_safe(chunk);
+            }
             112 => {
                 ai_behaviors = parse_ai_behaviors(chunk);
             }
             114 => {
                 attributes.alert_distance = parse_alert_distance(chunk);
             }
+            122 if chunk.len() >= 4 => {
+                let u = u32::from_le_bytes(chunk[0..4].try_into().unwrap_or_default());
+                let f = f32::from_bits(u);
+                if f.is_finite() && !f.is_subnormal() && (f == 360.0 || f == 180.0 || f == 90.0) {
+                    state_and_rewards.rotation_angle_limit_deg = Some(f);
+                } else {
+                    state_and_rewards.experience_reward = Some(u);
+                }
+            }
+            123 if chunk.len() >= 4 => {
+                let u = u32::from_le_bytes(chunk[0..4].try_into().unwrap_or_default());
+                let f = f32::from_bits(u);
+                if f.is_finite() && !f.is_subnormal() && (f == -1.0 || f == 1.0) {
+                    state_and_rewards.rotation_direction = Some(f);
+                } else {
+                    state_and_rewards.loot_drop_multiplier = Some(u);
+                }
+            }
             125 if chunk.len() >= 4 => {
                 attributes.melee_attack_range = parse_f32_safe(chunk);
             }
             126 if !chunk.is_empty() => {
                 attributes.can_swim = Some(chunk[0] != 0);
-            }
-            128 => {
-                socket_offsets = parse_actor_attachments(chunk);
             }
             129 => {
                 ragdoll_config = parse_ragdoll_config(chunk);
@@ -219,13 +266,17 @@ pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> 
             203 if is_breakable && !chunk.is_empty() => {
                 brk_spawn_particles = chunk[0] != 0;
             }
-            300 if is_breakable && chunk.len() >= 15 => {
+            300 if chunk.len() >= 15 => {
                 let mut cur = Cursor::new(&chunk[3..15]);
                 let x = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
                 let y = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
                 let z = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
                 if x.is_finite() && y.is_finite() && z.is_finite() {
-                    brk_center_offset = [x, y, z];
+                    if is_breakable {
+                        brk_center_offset = [x, y, z];
+                    } else {
+                        hold_offset = Some([x, y, z]);
+                    }
                 }
             }
             50 => {
@@ -305,16 +356,6 @@ pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> 
             121 if chunk.len() >= 4 => {
                 attributes.hit_reaction_force = parse_f32_safe(chunk);
             }
-            122 if chunk.len() >= 4 => {
-                state_and_rewards.experience_reward = Some(u32::from_le_bytes(
-                    chunk[0..4].try_into().unwrap_or_default(),
-                ));
-            }
-            123 if chunk.len() >= 4 => {
-                state_and_rewards.loot_drop_multiplier = Some(u32::from_le_bytes(
-                    chunk[0..4].try_into().unwrap_or_default(),
-                ));
-            }
             127 if chunk.len() >= 4 => {
                 timings.attack_windup_time_sec = parse_f32_safe(chunk);
             }
@@ -368,8 +409,8 @@ pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> 
                     embedded_facefx_bytes = Some(fxe_bytes);
                 }
             }
-            19 | 1 | 41 | 42 | 45 | 71 | 301 | 92 | 96 | 97 | 98 | 102 | 111 | 147 | 148 | 152
-            | 153 | 161 | 167 => {
+            19 | 1 | 41 | 42 | 45 | 71 | 72 | 90 | 92 | 93 | 94 | 96 | 97 | 98 | 102 | 105
+            | 111 | 118 | 124 | 147 | 148 | 152 | 153 | 161 | 167 | 301 => {
                 // Engine internal control, framing, and automatic state blocks (rebuilt on import)
             }
             _ => {
@@ -431,6 +472,8 @@ pub fn export_character(data: &[u8], _stem: &str) -> Result<ExtractedCharacter> 
         knockback_parameters: knockback,
         state_and_rewards: Some(state_and_rewards),
         morph_parameters: Some(morph_params),
+        hold_offset,
+        drop_sound,
         ragdoll_config,
         collision_filter,
         equipment,
@@ -625,10 +668,14 @@ pub fn import_character_from_json_with_externals(
             if let Some(st) = sr.is_stunned {
                 elements.push((120, vec![if st { 1 } else { 0 }]));
             }
-            if let Some(exp) = sr.experience_reward {
+            if let Some(deg) = sr.rotation_angle_limit_deg {
+                elements.push((122, endian.f32_to_bytes(deg).to_vec()));
+            } else if let Some(exp) = sr.experience_reward {
                 elements.push((122, endian.u32_to_bytes(exp).to_vec()));
             }
-            if let Some(loot) = sr.loot_drop_multiplier {
+            if let Some(dir) = sr.rotation_direction {
+                elements.push((123, endian.f32_to_bytes(dir).to_vec()));
+            } else if let Some(loot) = sr.loot_drop_multiplier {
                 elements.push((123, endian.u32_to_bytes(loot).to_vec()));
             }
         }
@@ -636,6 +683,9 @@ pub fn import_character_from_json_with_externals(
         if let Some(ref attrs) = parsed.combat_attributes {
             if let Some(arch) = attrs.archetype_id {
                 elements.push((26, endian.u32_to_bytes(arch).to_vec()));
+            }
+            if let Some(mat_id) = attrs.physics_material_id {
+                elements.push((46, endian.u32_to_bytes(mat_id).to_vec()));
             }
             if let Some(v) = attrs.move_speed_scale {
                 elements.push((61, endian.f32_to_bytes(v).to_vec()));
@@ -654,6 +704,9 @@ pub fn import_character_from_json_with_externals(
             }
             if let Some(fid) = attrs.faction_id {
                 elements.push((74, endian.u32_to_bytes(fid).to_vec()));
+            }
+            if let Some(dist) = attrs.interaction_distance {
+                elements.push((75, endian.f32_to_bytes(dist).to_vec()));
             }
             if let Some(active) = attrs.is_active_on_spawn {
                 elements.push((77, vec![if active { 1 } else { 0 }]));
@@ -758,6 +811,9 @@ pub fn import_character_from_json_with_externals(
             if let Some(v) = timings.hit_recovery_cooldown_sec {
                 elements.push((144, endian.f32_to_bytes(v).to_vec()));
             }
+            if let Some(d) = timings.physics_damping {
+                elements.push((110, endian.f32_to_bytes(d).to_vec()));
+            }
         }
 
         if let Some(ref cfg) = parsed.ragdoll_config {
@@ -771,16 +827,47 @@ pub fn import_character_from_json_with_externals(
         if !parsed.socket_offsets.is_empty() {
             elements.push((128, build_actor_attachments(&parsed.socket_offsets, endian)));
         }
+        if let Some(ho) = parsed.hold_offset {
+            let mut b = vec![1u8, 20, 0];
+            let _ = endian.write_f32(&mut b, ho[0]);
+            let _ = endian.write_f32(&mut b, ho[1]);
+            let _ = endian.write_f32(&mut b, ho[2]);
+            elements.push((300, b));
+        }
+
+        // Automatic engine control & state blocks
+        elements.push((72, vec![1, 0x16, 0, 1, 0x14, 0, 0x7E, 0, 0, 0]));
         elements.push((88, vec![1, 1, 0, 0]));
+        elements.push((90, endian.u32_to_bytes(3).to_vec()));
         elements.push((92, vec![0, 0, 0, 0]));
+        elements.push((93, vec![0]));
+        elements.push((94, vec![0]));
         elements.push((96, vec![0]));
         elements.push((97, vec![0]));
         elements.push((98, vec![0]));
         elements.push((102, vec![0, 0, 0, 0]));
+        elements.push((105, vec![1, 1, 0, 0]));
+        if let Some(ref ds) = parsed.drop_sound {
+            let s_sub = vec![(20, endian.write_length_prefixed_string(ds))];
+            let s_blob = build_chunk_from_elements_with_endian(false, &s_sub, endian);
+            let wrap = vec![(25, vec![1, 0, 0, 0]), (28, vec![1, 0, 0, 0]), (40, s_blob)];
+            let trigger = build_typed_container_with_endian(0x00460758, &wrap, endian);
+            elements.push((
+                106,
+                build_chunk_from_elements_with_endian(true, &[(0, trigger)], endian),
+            ));
+        }
         elements.push((111, vec![0xFF, 0xFF, 0xFF, 0xFF]));
         if !elements.iter().any(|(id, _)| *id == 114) {
             elements.push((114, vec![1, 0x22, 0, 0, 0, 0, 0x40]));
         }
+        elements.push((
+            118,
+            vec![
+                5, 0x29, 0, 0x2A, 1, 0x2B, 2, 0x2C, 3, 0x2D, 7, 0, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0,
+            ],
+        ));
+        elements.push((124, vec![0, 0, 0, 0]));
         if !elements.iter().any(|(id, _)| *id == 134) {
             elements.push((134, vec![1]));
         }
