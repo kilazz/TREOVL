@@ -190,13 +190,37 @@ pub fn parse_omp_package(data: &[u8]) -> Result<ParsedOmpPackage> {
                     for (wid, wchunk) in wp_table {
                         if wchunk.len() >= 12 {
                             let mut w_cur = Cursor::new(&wchunk[0..12]);
+                            if let (Ok(x), Ok(y), Ok(z)) = (
+                                w_cur.read_f32::<LittleEndian>(),
+                                w_cur.read_f32::<LittleEndian>(),
+                                w_cur.read_f32::<LittleEndian>(),
+                            ) && x.is_finite()
+                                && y.is_finite()
+                                && z.is_finite()
+                            {
+                                waypoints.push(MapWaypoint {
+                                    name: format!("Waypoint_{}", wid),
+                                    position: Vector3 { x, y, z },
+                                });
+                            }
+                        }
+                    }
+                } else if chunk.len() >= 12 {
+                    // Fallback: raw array of [f32; 3] coordinates
+                    let mut w_cur = Cursor::new(chunk);
+                    let count = chunk.len() / 12;
+                    for wid in 0..count {
+                        if let (Ok(x), Ok(y), Ok(z)) = (
+                            w_cur.read_f32::<LittleEndian>(),
+                            w_cur.read_f32::<LittleEndian>(),
+                            w_cur.read_f32::<LittleEndian>(),
+                        ) && x.is_finite()
+                            && y.is_finite()
+                            && z.is_finite()
+                        {
                             waypoints.push(MapWaypoint {
                                 name: format!("Waypoint_{}", wid),
-                                position: Vector3 {
-                                    x: w_cur.read_f32::<LittleEndian>().unwrap_or(0.0),
-                                    y: w_cur.read_f32::<LittleEndian>().unwrap_or(0.0),
-                                    z: w_cur.read_f32::<LittleEndian>().unwrap_or(0.0),
-                                },
+                                position: Vector3 { x, y, z },
                             });
                         }
                     }
@@ -451,13 +475,19 @@ pub fn parse_omp_spawners(chunk_data: &[u8]) -> Vec<OmpSpawner> {
                     }
                 }
                 // Field 21 (0x15): Rotation Quaternion (Qx, Qy, Qz, Qw)
+                // Filter out non-normalized bitmasks / handles
                 21 if fdata.len() >= 16 => {
                     let mut cur = Cursor::new(&fdata[0..16]);
                     let qx = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
                     let qy = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
                     let qz = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
                     let qw = cur.read_f32::<LittleEndian>().unwrap_or(1.0);
-                    rotation_raw = Some([qx, qy, qz, qw]);
+                    if qx.is_finite() && qy.is_finite() && qz.is_finite() && qw.is_finite() {
+                        let norm_sq = qx * qx + qy * qy + qz * qz + qw * qw;
+                        if (norm_sq - 1.0).abs() < 0.15 {
+                            rotation_raw = Some([qx, qy, qz, qw]);
+                        }
+                    }
                 }
                 // Names & Labels
                 31 | 32 | 62 => {
@@ -467,13 +497,20 @@ pub fn parse_omp_spawners(chunk_data: &[u8]) -> Vec<OmpSpawner> {
                         name = s;
                     }
                 }
+                // Field 60: Text label or valid float radius
                 60 => {
                     if let Some(s) = read_length_prefixed_string(fdata)
                         && name.is_empty()
                     {
                         name = s;
-                    } else if fdata.len() >= 4 && radius.is_none() {
-                        radius = Cursor::new(fdata).read_f32::<LittleEndian>().ok();
+                    } else if fdata.len() >= 4
+                        && radius.is_none()
+                        && let Ok(r) = Cursor::new(fdata).read_f32::<LittleEndian>()
+                        && r.is_finite()
+                        && !r.is_subnormal()
+                        && (0.05..=50_000.0).contains(&r)
+                    {
+                        radius = Some(r);
                     }
                 }
                 // Field 42 (0x2A) or 61 (0x3D): Group Link ID
@@ -497,7 +534,11 @@ pub fn parse_omp_spawners(chunk_data: &[u8]) -> Vec<OmpSpawner> {
             if let Some(gid) = group_id
                 && let Some(gname) = spawner_groups.get(&gid)
             {
-                name = format!("{}_{}", gname, e_idx);
+                if category == *gname {
+                    name = format!("{}_{}", gname, e_idx);
+                } else {
+                    name = format!("{}_{}_{}", gname, category, e_idx);
+                }
             } else {
                 name = format!("{}_{}", category, e_idx);
             }
