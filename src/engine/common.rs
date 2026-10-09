@@ -308,8 +308,9 @@ pub fn parse_raw_container_table_with_endian(
 
     entries.sort_by_key(|e| e.offset);
 
-    if entries.is_empty() || entries[0].offset != 0 {
-        bail!("First table offset must be 0");
+    // Some Triumph map entity containers have a 1-byte header byte before element 0 (offset <= 64)
+    if entries.is_empty() || entries[0].offset > 64 {
+        bail!("First table offset out of bounds");
     }
 
     Ok(ParsedContainerTable {
@@ -455,8 +456,6 @@ pub fn parse_f32_safe(chunk: &[u8]) -> Option<f32> {
     None
 }
 
-/// A safe, robust abstraction for sequential binary chunk decoding
-/// Replaces repetitive cursor setup, manual slicing, and bounds checking.
 pub struct ChunkReader<'a> {
     pub data: &'a [u8],
     pub pos: usize,
@@ -559,10 +558,6 @@ impl<'a> ChunkReader<'a> {
     }
 }
 
-/// Represents a Triumph Engine Map Entity UID / Scene Graph Instance Handle.
-/// In Triumph Engine packages, Chunk 22 stores a packed 32-bit handle where:
-/// - Bits 0..23: The sequential instance UID within the level map.
-/// - Bits 24..31: The Domain / Layer prefix ('M' = 0x4D for Main Map, 0x01..0x3F for sub-layers/groups).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct EntityHandleJson {
     pub uid: u32,
@@ -574,8 +569,6 @@ pub fn parse_entity_handle(raw_u32: u32) -> Option<EntityHandleJson> {
     let high_byte = ((raw_u32 >> 24) & 0xFF) as u8;
     let uid = raw_u32 & 0x00FF_FFFF;
 
-    // Entity handles have a realistic map UID count (< 65,536) and a non-zero domain/layer prefix.
-    // This avoids false positives for raw boolean masks like 0x00C00001 or 0x21400000.
     if uid > 0 && uid <= 0x0000_FFFF && high_byte > 0 {
         let domain_tag = if high_byte.is_ascii_alphanumeric() {
             (high_byte as char).to_string()

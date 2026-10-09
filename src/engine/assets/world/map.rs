@@ -10,7 +10,9 @@ use std::path::Path;
 use crate::engine::assets::terrain::{add_terrain_to_builder, parse_terrain_geometry};
 use crate::engine::assets::texture::parse_texture_chunk;
 use crate::engine::assets::{parse_chunk_elements, parse_typed_container};
-use crate::engine::common::{Endian, parse_raw_container_table, read_length_prefixed_string};
+use crate::engine::common::{
+    Endian, extract_elements_from_table, parse_raw_container_table, read_length_prefixed_string,
+};
 use crate::engine::container::builder::build_node;
 use crate::engine::container::header::PrpHeader;
 use crate::engine::container::node::parse_node;
@@ -93,18 +95,27 @@ pub struct ParsedOmpPackage {
     pub raw_payload: Vec<u8>,
 }
 
-/// Dynamically locates the true Master Map Container Table (skipping 512x512 dimension headers)
+/// Dynamically locates the true Master Map Container Table with Large Entries (>1MB data)
 pub fn find_omp_master_table_offset(data: &[u8]) -> usize {
-    // Scan for the master container table containing multiple chunks (>3 entries including Chunk 20)
-    for offset in 36..data.len().min(256) {
-        if let Ok(table) = parse_raw_container_table(data, offset, true)
-            && table.entries.len() > 3
-            && table.entries.iter().any(|e| e.id == 20)
-        {
-            return offset;
+    if data.len() > 56
+        && let Ok(table) = parse_raw_container_table(data, 56, true)
+        && table.entries.iter().any(|e| e.is_large)
+        && table.entries.iter().any(|e| e.id == 20)
+    {
+        return 56;
+    }
+
+    for offset in 40..data.len().min(512) {
+        if let Ok(table) = parse_raw_container_table(data, offset, true) {
+            let has_large = table.entries.iter().any(|e| e.is_large);
+            let has_terrain = table.entries.iter().any(|e| e.id == 20);
+            let has_entities = table.entries.iter().any(|e| e.id == 21);
+            if has_large && has_terrain && has_entities {
+                return offset;
+            }
         }
     }
-    // Fallback: standard retail offset is 56 bytes
+
     56
 }
 
@@ -124,7 +135,6 @@ pub fn parse_omp_package(data: &[u8]) -> Result<ParsedOmpPackage> {
     let root_chunk_id = cur.read_u32::<LittleEndian>().unwrap_or(20);
     let type_id = cur.read_u32::<LittleEndian>().unwrap_or(0x00460003);
 
-    // Read map grid dimensions (width and height) from prefix
     let map_width = if master_offset >= 52 {
         u32::from_le_bytes(data[48..52].try_into().unwrap_or([0, 2, 0, 0]))
     } else {
@@ -298,91 +308,211 @@ pub fn parse_omp_dependencies(data: &[u8]) -> Vec<OmpDependency> {
     deps
 }
 
-fn extract_spawner_entries(slice: &[u8]) -> Vec<(u32, Vec<u8>)> {
+/// Helper function to reliably extract typed container fields from an entity entry
+fn extract_fields_from_entry(chunk: &[u8]) -> (u32, Vec<(u32, Vec<u8>)>) {
+    if let Ok((t, f)) = parse_typed_container(chunk) {
+        return (t, f);
+    }
+    if let Ok((_, f)) = parse_chunk_elements(chunk) {
+        return (0, f);
+    }
+    for offset in 1..chunk.len().min(8) {
+        if let Ok((t, f)) = parse_typed_container(&chunk[offset..]) {
+            return (t, f);
+        }
+    }
+    (0, Vec::new())
+}
+
+/// Robustly locates the master entity table containing 600+ placed objects and actors
+fn find_largest_entry_table(slice: &[u8]) -> Vec<(u32, Vec<u8>)> {
+    // 1. Direct signature search for BASE container marker (0x00460009 -> "BASE" -> 01 01 00)
+    let base_marker = b"BASE\x01\x01\x00";
+    if let Some(pos) = slice
+        .windows(base_marker.len())
+        .position(|w| w == base_marker)
+    {
+        let container_start = pos + 4; // points directly to 01 01 00
+        if let Ok(table) = parse_raw_container_table(slice, container_start, true)
+            && table.entries.len() > 10
+        {
+            return extract_elements_from_table(slice, &table);
+        }
+    }
+
+    // 2. Direct byte scan for any large container with CONTAINER_MAGIC (01 01 00) and > 50 entries
+    let magic = b"\x01\x01\x00";
+    let mut scan_pos = 0;
+    while let Some(rel) = slice[scan_pos..].windows(3).position(|w| w == magic) {
+        let abs_pos = scan_pos + rel;
+        if let Ok(table) = parse_raw_container_table(slice, abs_pos, true)
+            && table.entries.len() > 50
+        {
+            return extract_elements_from_table(slice, &table);
+        }
+        scan_pos = abs_pos + 3;
+    }
+
+    // 3. Recursive container search with minimum entry threshold (> 50 entries)
     if let Ok((_, table)) = parse_chunk_elements(slice) {
-        if table.len() > 5 {
+        if table.len() > 50 {
             return table;
         }
-        for (sub_id, sub_data) in &table {
-            if (*sub_id == 20 || *sub_id == 1)
-                && let Ok((_, inner)) = parse_chunk_elements(sub_data)
-                && inner.len() > 5
-            {
+        for (_, sub_data) in &table {
+            let inner = find_largest_entry_table(sub_data);
+            if inner.len() > 50 {
                 return inner;
             }
         }
-        return table;
     }
+
+    if let Ok((_, fields)) = parse_typed_container(slice) {
+        if fields.len() > 50 {
+            return fields;
+        }
+        for (_, field_data) in &fields {
+            let inner = find_largest_entry_table(field_data);
+            if inner.len() > 50 {
+                return inner;
+            }
+        }
+    }
+
     Vec::new()
 }
 
+/// Extracts all placed spawners, enemies, triggers, and props from Chunk 21 hierarchy
 pub fn parse_omp_spawners(chunk_data: &[u8]) -> Vec<OmpSpawner> {
     let mut spawners = Vec::new();
-    let entity_table = extract_spawner_entries(chunk_data);
+    let entity_table = find_largest_entry_table(chunk_data);
 
-    for (e_idx, e_chunk) in entity_table {
-        if let Ok((_, props)) = parse_chunk_elements(&e_chunk) {
-            let mut name = String::new();
-            let mut category = String::from("GenericSpawner");
-            let mut position = [0.0f32; 3];
-            let mut rotation_raw = None;
-            let mut radius = None;
-            let mut group_id = None;
+    if entity_table.is_empty() {
+        return spawners;
+    }
 
-            for (pid, pval) in props {
-                match pid {
-                    20 if pval.len() >= 12 => {
-                        let mut cur = Cursor::new(&pval[0..12]);
-                        let x = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-                        let y = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-                        let z = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-                        if x.is_finite() && y.is_finite() && z.is_finite() {
-                            position = [x, y, z];
-                        }
-                    }
-                    21 if pval.len() >= 16 => {
-                        let mut cur = Cursor::new(&pval[0..16]);
-                        let qx = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-                        let qy = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-                        let qz = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-                        let qw = cur.read_f32::<LittleEndian>().unwrap_or(1.0);
-                        rotation_raw = Some([qx, qy, qz, qw]);
-                    }
-                    31 => {
-                        if let Some(s) = read_length_prefixed_string(&pval) {
-                            name = s;
-                        }
-                    }
-                    32 => {
-                        if let Some(s) = read_length_prefixed_string(&pval) {
-                            category = s;
-                        }
-                    }
-                    60 if pval.len() >= 4 => {
-                        radius = Cursor::new(&pval).read_f32::<LittleEndian>().ok();
-                    }
-                    61 if pval.len() >= 4 => {
-                        group_id = Cursor::new(&pval).read_u32::<LittleEndian>().ok();
-                    }
-                    _ => {}
+    let mut spawner_groups: HashMap<u32, String> = HashMap::new();
+
+    // Pass 1: Identify named wave groups (Type 0x00460013 / 0x00460015 / 0x0046001F)
+    // Examples: "Melee01", "Melee02", "Sheep", "Slugs", "Rocky", "Ranged01"
+    for (e_idx, e_chunk) in &entity_table {
+        let (type_id, fields) = extract_fields_from_entry(e_chunk);
+
+        if type_id == 0x00460013 || type_id == 0x00460015 || type_id == 0x0046001F {
+            for (fid, fdata) in &fields {
+                if (*fid == 60 || *fid == 62 || *fid == 31 || *fid == 32)
+                    && let Some(name) = read_length_prefixed_string(fdata)
+                    && !name.is_empty()
+                {
+                    spawner_groups.insert(*e_idx, name);
+                    break;
                 }
             }
+        }
+    }
 
-            if !name.is_empty() || position != [0.0, 0.0, 0.0] {
-                spawners.push(OmpSpawner {
-                    id: e_idx,
-                    name: if name.is_empty() {
-                        format!("Entity_{}", e_idx)
-                    } else {
-                        name
-                    },
-                    category,
-                    position,
-                    rotation_raw,
-                    radius,
-                    group_id,
-                });
+    // Pass 2: Extract all placed entities with 3D coordinates and orientations
+    for (e_idx, e_chunk) in &entity_table {
+        let (type_id, fields) = extract_fields_from_entry(e_chunk);
+
+        let mut name = String::new();
+        let mut category = match type_id {
+            0x0046500E => String::from("SpawnerNode"),
+            0x0046501B => String::from("TriggerZone"),
+            0x00464016 => String::from("ActorNode"),
+            0x00464026 => String::from("DwarfActor"),
+            0x0046401A => String::from("EnemyActor"),
+            0x00460013 => String::from("EnemyGroup"),
+            0x00460015 => String::from("ZoneMarker"),
+            0x0046001F => String::from("PlayerSpawnGroup"),
+            0x0046200A | 0x0046200C | 0x00462010 | 0x0046201A | 0x00462036 => {
+                String::from("PropObject")
             }
+            0x00464620 | 0x00464626 => String::from("PlacementObject"),
+            0x00463010 | 0x00463015 | 0x00465004 => String::from("Mechanism"),
+            0x00462104 | 0x00462107 => String::from("LightMarker"),
+            _ => String::from("Entity"),
+        };
+
+        let mut position = [0.0f32; 3];
+        let mut rotation_raw = None;
+        let mut radius = None;
+        let mut group_id = None;
+
+        for (fid, fdata) in &fields {
+            match *fid {
+                // Field 20 (0x14): Position (X, Y, Z)
+                20 if fdata.len() >= 12 => {
+                    let mut cur = Cursor::new(&fdata[0..12]);
+                    let x = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+                    let y = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+                    let z = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+                    if x.is_finite() && y.is_finite() && z.is_finite() {
+                        position = [x, y, z];
+                    }
+                }
+                // Field 21 (0x15): Rotation Quaternion (Qx, Qy, Qz, Qw)
+                21 if fdata.len() >= 16 => {
+                    let mut cur = Cursor::new(&fdata[0..16]);
+                    let qx = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+                    let qy = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+                    let qz = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+                    let qw = cur.read_f32::<LittleEndian>().unwrap_or(1.0);
+                    rotation_raw = Some([qx, qy, qz, qw]);
+                }
+                // Names & Labels
+                31 | 32 | 62 => {
+                    if let Some(s) = read_length_prefixed_string(fdata)
+                        && name.is_empty()
+                    {
+                        name = s;
+                    }
+                }
+                60 => {
+                    if let Some(s) = read_length_prefixed_string(fdata)
+                        && name.is_empty()
+                    {
+                        name = s;
+                    } else if fdata.len() >= 4 && radius.is_none() {
+                        radius = Cursor::new(fdata).read_f32::<LittleEndian>().ok();
+                    }
+                }
+                // Field 42 (0x2A) or 61 (0x3D): Group Link ID
+                42 | 61 if fdata.len() >= 4 => {
+                    let gid = Cursor::new(fdata).read_u32::<LittleEndian>().ok();
+                    if group_id.is_none() && gid.is_some() {
+                        group_id = gid;
+                        if let Some(gid_val) = gid
+                            && let Some(gname) = spawner_groups.get(&gid_val)
+                        {
+                            category = gname.clone();
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Apply meaningful naming fallback
+        if name.is_empty() {
+            if let Some(gid) = group_id
+                && let Some(gname) = spawner_groups.get(&gid)
+            {
+                name = format!("{}_{}", gname, e_idx);
+            } else {
+                name = format!("{}_{}", category, e_idx);
+            }
+        }
+
+        if position != [0.0, 0.0, 0.0] {
+            spawners.push(OmpSpawner {
+                id: *e_idx,
+                name,
+                category,
+                position,
+                rotation_raw,
+                radius,
+                group_id,
+            });
         }
     }
 
@@ -423,7 +553,7 @@ pub fn unpack_omp_to_project_with_progress(
         output_dir,
     );
 
-    // Export true terrain GLB from Master Chunk 20
+    // Export terrain geometry from Master Chunk 20 (if available)
     if let Ok((_, elements)) = parse_chunk_elements(&parsed.raw_payload)
         && let Some((_, terr_data)) = elements.iter().find(|(id, _)| *id == 20)
         && let Ok(geom) = parse_terrain_geometry(terr_data)
@@ -445,9 +575,36 @@ pub fn unpack_omp_to_project_with_progress(
         cb(0.65, "Writing level manifests and dependencies...");
     }
 
+    // Secondary fallback: if parsed.spawners was somehow empty, scan exported chunks
+    let final_spawners = if !parsed.spawners.is_empty() {
+        parsed.spawners
+    } else {
+        let mut sp = Vec::new();
+        if let Ok(entries) = fs::read_dir(&chunks_dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if let Ok(meta) = p.metadata()
+                    && meta.len() > 10_000
+                    && meta.len() < 200_000
+                    && let Ok(bytes) = fs::read(&p)
+                {
+                    let extracted = parse_omp_spawners(&bytes);
+                    if !extracted.is_empty() {
+                        sp = extracted;
+                        break;
+                    }
+                }
+            }
+        }
+        sp
+    };
+
+    let mut final_manifest = parsed.manifest.clone();
+    final_manifest.spawner_count = final_spawners.len();
+
     fs::write(
         assets_dir.join("map_manifest.json"),
-        serde_json::to_string_pretty(&parsed.manifest)?,
+        serde_json::to_string_pretty(&final_manifest)?,
     )?;
 
     fs::write(
@@ -457,7 +614,7 @@ pub fn unpack_omp_to_project_with_progress(
 
     fs::write(
         assets_dir.join("spawners.json"),
-        serde_json::to_string_pretty(&parsed.spawners)?,
+        serde_json::to_string_pretty(&final_spawners)?,
     )?;
 
     let prp_header = PrpHeader {
@@ -492,10 +649,10 @@ pub fn unpack_omp_to_project_with_progress(
          • 3D Terrain geometry exported to 'assets/terrain.glb'\n",
         parsed.header.map_width,
         parsed.header.map_height,
-        parsed.manifest.map_name,
-        parsed.manifest.player_spawn,
-        parsed.manifest.spawner_count,
-        parsed.manifest.dependency_count
+        final_manifest.map_name,
+        final_manifest.player_spawn,
+        final_manifest.spawner_count,
+        final_manifest.dependency_count
     );
 
     if let Some(cb) = progress {
