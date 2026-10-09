@@ -10,7 +10,7 @@ use std::path::Path;
 use crate::engine::assets::terrain::{add_terrain_to_builder, parse_terrain_geometry};
 use crate::engine::assets::texture::parse_texture_chunk;
 use crate::engine::assets::{parse_chunk_elements, parse_typed_container};
-use crate::engine::common::{Endian, read_length_prefixed_string};
+use crate::engine::common::{Endian, parse_raw_container_table, read_length_prefixed_string};
 use crate::engine::container::builder::build_node;
 use crate::engine::container::header::PrpHeader;
 use crate::engine::container::node::parse_node;
@@ -21,12 +21,13 @@ use crate::utils::gltf_builder::GltfBuilder;
 use crate::utils::png::encode_rgba_to_png;
 
 pub const OMP_MAGIC: &[u8; 4] = b"OMP\0";
-pub const OMP_HEADER_SIZE: usize = 40;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct OmpHeaderJson {
     pub magic: String,
     pub header_size: u32,
+    pub map_width: u32,
+    pub map_height: u32,
     pub root_chunk_id: u32,
     pub type_id_hex: String,
     pub raw_header_hex: String,
@@ -92,34 +93,67 @@ pub struct ParsedOmpPackage {
     pub raw_payload: Vec<u8>,
 }
 
+/// Dynamically locates the true Master Map Container Table (skipping 512x512 dimension headers)
+pub fn find_omp_master_table_offset(data: &[u8]) -> usize {
+    // Scan for the master container table containing multiple chunks (>3 entries including Chunk 20)
+    for offset in 36..data.len().min(256) {
+        if let Ok(table) = parse_raw_container_table(data, offset, true)
+            && table.entries.len() > 3
+            && table.entries.iter().any(|e| e.id == 20)
+        {
+            return offset;
+        }
+    }
+    // Fallback: standard retail offset is 56 bytes
+    56
+}
+
 pub fn parse_omp_package(data: &[u8]) -> Result<ParsedOmpPackage> {
-    if data.len() < OMP_HEADER_SIZE || !data.starts_with(OMP_MAGIC) {
+    if data.len() < 56 || !data.starts_with(OMP_MAGIC) {
         bail!("Data is not a valid Overlord Map Package (.omp)");
     }
 
-    let mut cur = Cursor::new(&data[..OMP_HEADER_SIZE]);
+    let master_offset = find_omp_master_table_offset(data);
+
+    let mut cur = Cursor::new(&data[..master_offset]);
     cur.set_position(4);
-    let header_size = cur.read_u32::<LittleEndian>()?;
-    let _ = cur.read_u32::<LittleEndian>()?;
-    let root_chunk_id = cur.read_u32::<LittleEndian>()?;
-    let type_id = cur.read_u32::<LittleEndian>()?;
+    let header_size = cur
+        .read_u32::<LittleEndian>()
+        .unwrap_or(master_offset as u32);
+    let _ = cur.read_u32::<LittleEndian>().unwrap_or(0);
+    let root_chunk_id = cur.read_u32::<LittleEndian>().unwrap_or(20);
+    let type_id = cur.read_u32::<LittleEndian>().unwrap_or(0x00460003);
+
+    // Read map grid dimensions (width and height) from prefix
+    let map_width = if master_offset >= 52 {
+        u32::from_le_bytes(data[48..52].try_into().unwrap_or([0, 2, 0, 0]))
+    } else {
+        512
+    };
+    let map_height = if master_offset >= 56 {
+        u32::from_le_bytes(data[52..56].try_into().unwrap_or([0, 2, 0, 0]))
+    } else {
+        512
+    };
 
     let header = OmpHeaderJson {
         magic: "OMP".into(),
         header_size,
+        map_width,
+        map_height,
         root_chunk_id,
         type_id_hex: format!("{:08X}", type_id),
-        raw_header_hex: hex::encode_upper(&data[..OMP_HEADER_SIZE]),
+        raw_header_hex: hex::encode_upper(&data[..master_offset]),
     };
 
-    let payload = &data[OMP_HEADER_SIZE..];
+    let payload = &data[master_offset..];
 
-    // 1. Extract mounted .rpk archives dependencies manifest
+    // 1. Extract mounted RPK dependencies
     let dependencies = parse_omp_dependencies(payload);
 
-    // 2. Parse root container table
+    // 2. Parse true master container table
     let (_, elements) = parse_chunk_elements(payload)
-        .context("Failed to parse root container table in OMP payload")?;
+        .context("Failed to parse master container table in OMP payload")?;
 
     let mut map_name = String::from("Unnamed Map");
     let mut player_spawn = None;
@@ -167,6 +201,12 @@ pub fn parse_omp_package(data: &[u8]) -> Result<ParsedOmpPackage> {
         }
     }
 
+    if player_spawn.is_none()
+        && let Some(p1) = spawners.iter().find(|s| s.name.contains("Player"))
+    {
+        player_spawn = Some(p1.position);
+    }
+
     let manifest = OmpLevelManifest {
         map_name,
         player_spawn,
@@ -185,7 +225,6 @@ pub fn parse_omp_package(data: &[u8]) -> Result<ParsedOmpPackage> {
     })
 }
 
-/// Backward-compatible map inspector used by CLI and quick viewer
 pub fn parse_omp_map(chunk_data: &[u8]) -> Result<MapInfo> {
     let pkg = parse_omp_package(chunk_data)?;
     let player_spawn = pkg
@@ -210,7 +249,6 @@ pub fn parse_omp_map(chunk_data: &[u8]) -> Result<MapInfo> {
     })
 }
 
-/// Discovers mounted RPK package dependencies (Type ID: 0x0400001E)
 pub fn parse_omp_dependencies(data: &[u8]) -> Vec<OmpDependency> {
     let mut deps = Vec::new();
     let marker = b"\x1E\x00\x00\x04";
@@ -260,14 +298,27 @@ pub fn parse_omp_dependencies(data: &[u8]) -> Vec<OmpDependency> {
     deps
 }
 
-/// Parses all placed spawners, enemies, and interactive objects from Chunk 21
+fn extract_spawner_entries(slice: &[u8]) -> Vec<(u32, Vec<u8>)> {
+    if let Ok((_, table)) = parse_chunk_elements(slice) {
+        if table.len() > 5 {
+            return table;
+        }
+        for (sub_id, sub_data) in &table {
+            if (*sub_id == 20 || *sub_id == 1)
+                && let Ok((_, inner)) = parse_chunk_elements(sub_data)
+                && inner.len() > 5
+            {
+                return inner;
+            }
+        }
+        return table;
+    }
+    Vec::new()
+}
+
 pub fn parse_omp_spawners(chunk_data: &[u8]) -> Vec<OmpSpawner> {
     let mut spawners = Vec::new();
-
-    let (_, entity_table) = match parse_chunk_elements(chunk_data) {
-        Ok(t) => t,
-        Err(_) => return spawners,
-    };
+    let entity_table = extract_spawner_entries(chunk_data);
 
     for (e_idx, e_chunk) in entity_table {
         if let Ok((_, props)) = parse_chunk_elements(&e_chunk) {
@@ -338,7 +389,6 @@ pub fn parse_omp_spawners(chunk_data: &[u8]) -> Vec<OmpSpawner> {
     spawners
 }
 
-/// Unpacks a full .omp map package into a structured modding workspace identical to PRP archives
 pub fn unpack_omp_to_project_with_progress(
     omp_path: &Path,
     output_dir: &Path,
@@ -373,7 +423,7 @@ pub fn unpack_omp_to_project_with_progress(
         output_dir,
     );
 
-    // Export terrain GLB from Chunk 20 if present
+    // Export true terrain GLB from Master Chunk 20
     if let Ok((_, elements)) = parse_chunk_elements(&parsed.raw_payload)
         && let Some((_, terr_data)) = elements.iter().find(|(id, _)| *id == 20)
         && let Ok(geom) = parse_terrain_geometry(terr_data)
@@ -395,7 +445,6 @@ pub fn unpack_omp_to_project_with_progress(
         cb(0.65, "Writing level manifests and dependencies...");
     }
 
-    // Export readable JSON manifests
     fs::write(
         assets_dir.join("map_manifest.json"),
         serde_json::to_string_pretty(&parsed.manifest)?,
@@ -436,13 +485,14 @@ pub fn unpack_omp_to_project_with_progress(
     )?;
 
     let log = format!(
-        "Magic: 'OMP' | Level: '{}' | Header: {} bytes\n\
+        "Magic: 'OMP' | Map Grid: {}x{} | Level: '{}'\n\
          • Player Start Location: {:?}\n\
          • Placed Entities & Spawners: {}\n\
          • Mounted Dependencies: {} .rpk archives\n\
-         • Terrain 3D geometry exported to 'assets/terrain.glb'\n",
+         • 3D Terrain geometry exported to 'assets/terrain.glb'\n",
+        parsed.header.map_width,
+        parsed.header.map_height,
         parsed.manifest.map_name,
-        parsed.header.header_size,
         parsed.manifest.player_spawn,
         parsed.manifest.spawner_count,
         parsed.manifest.dependency_count
@@ -455,7 +505,6 @@ pub fn unpack_omp_to_project_with_progress(
     Ok((chunk_counter as usize, log))
 }
 
-/// Recompiles an unpacked map project workspace back into an exact .omp binary
 pub fn pack_omp_from_project_with_progress(
     project_dir: &Path,
     output_archive: &Path,
@@ -483,7 +532,7 @@ pub fn pack_omp_from_project_with_progress(
     )?;
 
     let header_bytes = if let Ok(h_raw) = hex::decode(&omp_hdr.raw_header_hex) {
-        if h_raw.len() == OMP_HEADER_SIZE {
+        if h_raw.len() == omp_hdr.header_size as usize {
             h_raw
         } else {
             rebuild_omp_header_bytes(omp_hdr)?
@@ -496,7 +545,7 @@ pub fn pack_omp_from_project_with_progress(
         cb(0.80, "Writing binary map package (.omp)...");
     }
 
-    let mut final_file = Vec::with_capacity(OMP_HEADER_SIZE + payload.len());
+    let mut final_file = Vec::with_capacity(header_bytes.len() + payload.len());
     final_file.extend_from_slice(&header_bytes);
     final_file.extend_from_slice(&payload);
 
@@ -510,17 +559,29 @@ pub fn pack_omp_from_project_with_progress(
 }
 
 fn rebuild_omp_header_bytes(hdr: &OmpHeaderJson) -> Result<Vec<u8>> {
-    let mut out = vec![0u8; OMP_HEADER_SIZE];
+    let size = hdr.header_size as usize;
+    let mut out = vec![0u8; size];
     out[0..4].copy_from_slice(OMP_MAGIC);
-    out[4..8].copy_from_slice(&hdr.header_size.to_le_bytes());
-    out[12..16].copy_from_slice(&hdr.root_chunk_id.to_le_bytes());
-    let type_id =
-        u32::from_str_radix(hdr.type_id_hex.trim_start_matches("0x"), 16).unwrap_or(0x00460003);
-    out[16..20].copy_from_slice(&type_id.to_le_bytes());
+    if size >= 8 {
+        out[4..8].copy_from_slice(&hdr.header_size.to_le_bytes());
+    }
+    if size >= 16 {
+        out[12..16].copy_from_slice(&hdr.root_chunk_id.to_le_bytes());
+    }
+    if size >= 20 {
+        let type_id =
+            u32::from_str_radix(hdr.type_id_hex.trim_start_matches("0x"), 16).unwrap_or(0x00460003);
+        out[16..20].copy_from_slice(&type_id.to_le_bytes());
+    }
+    if size >= 52 {
+        out[48..52].copy_from_slice(&hdr.map_width.to_le_bytes());
+    }
+    if size >= 56 {
+        out[52..56].copy_from_slice(&hdr.map_height.to_le_bytes());
+    }
     Ok(out)
 }
 
-/// Exports map terrain and entity locators directly to glTF 2.0 Binary (.glb)
 pub fn export_level_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>> {
     let parsed = parse_omp_package(chunk_data)?;
     let mut builder = GltfBuilder::new();
@@ -566,7 +627,6 @@ pub fn export_level_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>> {
     builder.build("Overlord Level Exporter")
 }
 
-/// Assembles complete level scene instancing 3D models with real PBR materials & PNG textures
 pub fn assemble_level_scene_glb(omp_data: &[u8], assets_dir: &Path) -> Result<Vec<u8>> {
     let map_info = parse_omp_map(omp_data)?;
     let mut builder = GltfBuilder::new();
@@ -614,11 +674,12 @@ pub fn assemble_level_scene_glb(omp_data: &[u8], assets_dir: &Path) -> Result<Ve
             Some(tex_idx)
         };
 
-    let payload = if omp_data.starts_with(b"OMP") && omp_data.len() > OMP_HEADER_SIZE {
-        &omp_data[OMP_HEADER_SIZE..]
+    let offset = if omp_data.starts_with(b"OMP") {
+        find_omp_master_table_offset(omp_data)
     } else {
-        omp_data
+        0
     };
+    let payload = &omp_data[offset..];
     let (_, elements) = parse_chunk_elements(payload)?;
 
     if let Some((_, terr_data)) = elements.iter().find(|(id, _)| *id == 20)

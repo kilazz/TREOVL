@@ -43,7 +43,7 @@ export component AppWindow inherits Window {
     in-out property <int> active_tab: 0;
     in-out property <length> sidebar_width: 440px;
 
-    // Toolbox Subcategory Tab
+    // Toolbox Subcategory Tab: 0 = Localization, 1 = Lighting & Env, 2 = 3D & Maps, 3 = Collision & Fonts, 4 = Textures & Audio
     in-out property <int> active_toolbox_tab: 0;
 
     // Async Progress Bar State
@@ -306,16 +306,16 @@ export component AppWindow inherits Window {
                     spacing: 6px;
                     alignment: center;
 
-                    // ROW 1: PROJECT & ARCHIVE WORKFLOW
+                    // ROW 1: PROJECT & ARCHIVE WORKFLOW (UNIVERSAL PRP / OMP)
                     HorizontalLayout {
                         spacing: 6px;
                         alignment: start;
 
                         CustomButton {
                             icon: "📦";
-                            text: "Unpack PRP...";
+                            text: "Unpack (PRP / OMP)...";
                             primary-color: #3e6a90;
-                            min-w: 125px;
+                            min-w: 160px;
                             enabled: !root.is_busy;
                             clicked => {
                                 let src = root.browse_file();
@@ -330,7 +330,7 @@ export component AppWindow inherits Window {
                             icon: "📂";
                             text: "Open Project...";
                             primary-color: #4e5058;
-                            min-w: 130px;
+                            min-w: 125px;
                             enabled: !root.is_busy;
                             clicked => {
                                 let path = root.browse_folder();
@@ -343,7 +343,7 @@ export component AppWindow inherits Window {
                             icon: "📁";
                             text: "Assets Folder";
                             primary-color: #d28e1b;
-                            min-w: 125px;
+                            min-w: 120px;
                             clicked => {
                                 if (root.active_project_dir != "") { root.open_assets_folder(root.active_project_dir); }
                                 else { let proj = root.browse_folder(); if (proj != "") { root.open_assets_folder(proj); } }
@@ -354,7 +354,7 @@ export component AppWindow inherits Window {
                             icon: "🧹";
                             text: "Clean Rebuild";
                             primary-color: #636773;
-                            min-w: 125px;
+                            min-w: 120px;
                             enabled: !root.is_busy;
                             clicked => {
                                 if (root.active_project_dir != "") { root.clean_rebuild(root.active_project_dir); }
@@ -364,7 +364,7 @@ export component AppWindow inherits Window {
 
                         CustomButton {
                             icon: "💾";
-                            text: "Pack to PRP";
+                            text: "Pack Project";
                             primary-color: #23a55a;
                             min-w: 120px;
                             enabled: !root.is_busy;
@@ -387,7 +387,7 @@ export component AppWindow inherits Window {
                             icon: "🩹";
                             text: "Create Patch...";
                             primary-color: #4e5058;
-                            min-w: 125px;
+                            min-w: 120px;
                             enabled: !root.is_busy;
                             clicked => {
                                 let base = root.browse_folder();
@@ -405,7 +405,7 @@ export component AppWindow inherits Window {
                             icon: "✨";
                             text: "Apply Patch...";
                             primary-color: #3e6a90;
-                            min-w: 120px;
+                            min-w: 115px;
                             enabled: !root.is_busy;
                             clicked => {
                                 let patch = root.browse_file();
@@ -488,7 +488,7 @@ export component AppWindow inherits Window {
                                 padding-left: 8px;
                                 padding-right: 8px;
                                 Text {
-                                    text: "🗿 3D & Maps";
+                                    text: "🗺️ 3D & Maps";
                                     font-size: 11px;
                                     font-weight: 700;
                                     color: root.active_toolbox_tab == 2 ? #ffffff : #c0c0c0;
@@ -549,7 +549,7 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    // ROW 3: CONTEXTUAL ACTIONS
+                    // ROW 3: CONTEXTUAL TOOLBOX ACTIONS
                     HorizontalLayout {
                         spacing: 6px;
                         alignment: start;
@@ -691,11 +691,65 @@ export component AppWindow inherits Window {
 
                         if root.active_toolbox_tab == 2: HorizontalLayout {
                             spacing: 6px;
+
+                            // LEVEL & MAP WORKFLOW
+                            CustomButton {
+                                icon: "🗺️";
+                                text: "Unpack Map (.omp)...";
+                                primary-color: #1c8849;
+                                min-w: 160px;
+                                enabled: !root.is_busy;
+                                clicked => {
+                                    let src = root.browse_file();
+                                    if (src != "") {
+                                        let dst = root.browse_folder();
+                                        if (dst != "") { root.unpack_prp(src, dst); }
+                                    }
+                                }
+                            }
+
+                            CustomButton {
+                                icon: "💾";
+                                text: "Pack Map (.omp)";
+                                primary-color: #23a55a;
+                                min-w: 145px;
+                                enabled: !root.is_busy;
+                                clicked => {
+                                    if (root.active_project_dir != "") { root.pack_prp(root.active_project_dir); }
+                                    else { let proj = root.browse_folder(); if (proj != "") { root.pack_prp(proj); } }
+                                }
+                            }
+
+                            CustomButton {
+                                icon: "🌐";
+                                text: "3D Scene (GLB)";
+                                primary-color: #d28e1b;
+                                min-w: 140px;
+                                enabled: !root.is_busy;
+                                clicked => {
+                                    let omp = root.browse_file();
+                                    if (omp != "") {
+                                        let assets = root.browse_folder();
+                                        if (assets != "") { let out = root.save_file(); if (out != "") { root.direct_assemble_level(omp, assets, out); } }
+                                    }
+                                }
+                            }
+
+                            VerticalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    width: 1px;
+                                    background: #3f4248;
+                                    height: 20px;
+                                }
+                            }
+
+                            // MESH & TERRAIN TOOLS
                             CustomButton {
                                 icon: "🗿";
                                 text: "Mesh -> GLB/OBJ";
                                 primary-color: #3e6a90;
-                                min-w: 145px;
+                                min-w: 135px;
                                 enabled: !root.is_busy;
                                 clicked => {
                                     let src = root.browse_file();
@@ -705,9 +759,9 @@ export component AppWindow inherits Window {
 
                             CustomButton {
                                 icon: "📥";
-                                text: "Inject 3D into Mesh";
-                                primary-color: #23a55a;
-                                min-w: 155px;
+                                text: "Inject 3D";
+                                primary-color: #4e5058;
+                                min-w: 110px;
                                 enabled: !root.is_busy;
                                 clicked => {
                                     let target_chunk = root.browse_file();
@@ -719,25 +773,10 @@ export component AppWindow inherits Window {
                             }
 
                             CustomButton {
-                                icon: "🗺️";
-                                text: "Assemble Level (OMP -> GLB)";
-                                primary-color: #d28e1b;
-                                min-w: 200px;
-                                enabled: !root.is_busy;
-                                clicked => {
-                                    let omp = root.browse_file();
-                                    if (omp != "") {
-                                        let assets = root.browse_folder();
-                                        if (assets != "") { let out = root.save_file(); if (out != "") { root.direct_assemble_level(omp, assets, out); } }
-                                    }
-                                }
-                            }
-
-                            CustomButton {
                                 icon: "⛰️";
                                 text: "Terrain 3D";
                                 primary-color: #4e5058;
-                                min-w: 135px;
+                                min-w: 110px;
                                 enabled: !root.is_busy;
                                 clicked => {
                                     let src = root.browse_file();
