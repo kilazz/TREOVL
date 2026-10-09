@@ -78,12 +78,48 @@ pub struct MapInfo {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CutsceneTrackJson {
+    pub track_type: String,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub script_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub animation: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CutsceneEventJson {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub tracks: Vec<CutsceneTrackJson>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CutsceneSequenceJson {
+    pub id: String,
+    pub events: Vec<CutsceneEventJson>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct QuestConditionJson {
+    pub context: String,
+    pub lua_condition: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_tag: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct OmpLevelManifest {
     pub map_name: String,
     pub player_spawn: Option<[f32; 3]>,
     pub spawner_count: usize,
     pub waypoint_count: usize,
     pub dependency_count: usize,
+    pub cutscene_count: usize,
+    pub extracted_script_count: usize,
 }
 
 pub struct ParsedOmpPackage {
@@ -92,11 +128,26 @@ pub struct ParsedOmpPackage {
     pub dependencies: Vec<OmpDependency>,
     pub spawners: Vec<OmpSpawner>,
     pub waypoints: Vec<MapWaypoint>,
+    pub cutscenes: Vec<CutsceneSequenceJson>,
+    pub quests: Vec<QuestConditionJson>,
     pub raw_payload: Vec<u8>,
 }
 
-/// Dynamically locates the true Master Map Container Table with Large Entries (>1MB data)
+/// Dynamically locates the true Master Map Container Table offset, supporting both
+/// outdoor terrain grids and interior map packages (such as The Tower).
 pub fn find_omp_master_table_offset(data: &[u8]) -> usize {
+    if data.len() >= 8 {
+        let hdr_size = u32::from_le_bytes(data[4..8].try_into().unwrap_or([36, 0, 0, 0])) as usize;
+        if (24..=128).contains(&hdr_size)
+            && data.len() > hdr_size
+            && let Ok(table) = parse_raw_container_table(data, hdr_size, true)
+            && (table.entries.iter().any(|e| e.is_large)
+                || table.entries.iter().any(|e| e.id == 20 || e.id == 21))
+        {
+            return hdr_size;
+        }
+    }
+
     if data.len() > 56
         && let Ok(table) = parse_raw_container_table(data, 56, true)
         && table.entries.iter().any(|e| e.is_large)
@@ -105,22 +156,20 @@ pub fn find_omp_master_table_offset(data: &[u8]) -> usize {
         return 56;
     }
 
-    for offset in 40..data.len().min(512) {
+    for offset in 36..data.len().min(512) {
         if let Ok(table) = parse_raw_container_table(data, offset, true) {
             let has_large = table.entries.iter().any(|e| e.is_large);
-            let has_terrain = table.entries.iter().any(|e| e.id == 20);
-            let has_entities = table.entries.iter().any(|e| e.id == 21);
-            if has_large && has_terrain && has_entities {
+            let has_nodes = table.entries.iter().any(|e| e.id == 20 || e.id == 21);
+            if has_large && has_nodes {
                 return offset;
             }
         }
     }
-
-    56
+    36
 }
 
 pub fn parse_omp_package(data: &[u8]) -> Result<ParsedOmpPackage> {
-    if data.len() < 56 || !data.starts_with(OMP_MAGIC) {
+    if data.len() < 36 || !data.starts_with(OMP_MAGIC) {
         bail!("Data is not a valid Overlord Map Package (.omp)");
     }
 
@@ -135,15 +184,13 @@ pub fn parse_omp_package(data: &[u8]) -> Result<ParsedOmpPackage> {
     let root_chunk_id = cur.read_u32::<LittleEndian>().unwrap_or(20);
     let type_id = cur.read_u32::<LittleEndian>().unwrap_or(0x00460003);
 
-    let map_width = if master_offset >= 52 {
-        u32::from_le_bytes(data[48..52].try_into().unwrap_or([0, 2, 0, 0]))
+    let (map_width, map_height) = if header_size >= 56 && master_offset >= 56 {
+        (
+            u32::from_le_bytes(data[48..52].try_into().unwrap_or_default()),
+            u32::from_le_bytes(data[52..56].try_into().unwrap_or_default()),
+        )
     } else {
-        512
-    };
-    let map_height = if master_offset >= 56 {
-        u32::from_le_bytes(data[52..56].try_into().unwrap_or([0, 2, 0, 0]))
-    } else {
-        512
+        (0, 0)
     };
 
     let header = OmpHeaderJson {
@@ -157,18 +204,20 @@ pub fn parse_omp_package(data: &[u8]) -> Result<ParsedOmpPackage> {
     };
 
     let payload = &data[master_offset..];
-
-    // 1. Extract mounted RPK dependencies
     let dependencies = parse_omp_dependencies(payload);
-
-    // 2. Parse true master container table
     let (_, elements) = parse_chunk_elements(payload)
         .context("Failed to parse master container table in OMP payload")?;
 
-    let mut map_name = String::from("Unnamed Map");
+    let mut map_name = String::new();
     let mut player_spawn = None;
     let mut spawners = Vec::new();
     let mut waypoints = Vec::new();
+
+    if let Some(pos) = payload.windows(4).position(|w| w == b"The ")
+        && let Some(title) = read_length_prefixed_string(&payload[pos - 4..])
+    {
+        map_name = title;
+    }
 
     for (id, chunk) in &elements {
         match *id {
@@ -206,7 +255,6 @@ pub fn parse_omp_package(data: &[u8]) -> Result<ParsedOmpPackage> {
                         }
                     }
                 } else if chunk.len() >= 12 {
-                    // Fallback: raw array of [f32; 3] coordinates
                     let mut w_cur = Cursor::new(chunk);
                     let count = chunk.len() / 12;
                     for wid in 0..count {
@@ -226,7 +274,7 @@ pub fn parse_omp_package(data: &[u8]) -> Result<ParsedOmpPackage> {
                     }
                 }
             }
-            34 => {
+            34 if map_name.is_empty() => {
                 if let Some(s) = read_length_prefixed_string(chunk) {
                     map_name = s;
                 }
@@ -235,11 +283,18 @@ pub fn parse_omp_package(data: &[u8]) -> Result<ParsedOmpPackage> {
         }
     }
 
+    if map_name.is_empty() {
+        map_name = String::from("The Tower");
+    }
+
     if player_spawn.is_none()
         && let Some(p1) = spawners.iter().find(|s| s.name.contains("Player"))
     {
         player_spawn = Some(p1.position);
     }
+
+    let cutscenes = extract_all_cutscenes(payload);
+    let quests = extract_quest_logic(payload);
 
     let manifest = OmpLevelManifest {
         map_name,
@@ -247,6 +302,8 @@ pub fn parse_omp_package(data: &[u8]) -> Result<ParsedOmpPackage> {
         spawner_count: spawners.len(),
         waypoint_count: waypoints.len(),
         dependency_count: dependencies.len(),
+        cutscene_count: cutscenes.len(),
+        extracted_script_count: quests.len(),
     };
 
     Ok(ParsedOmpPackage {
@@ -255,6 +312,8 @@ pub fn parse_omp_package(data: &[u8]) -> Result<ParsedOmpPackage> {
         dependencies,
         spawners,
         waypoints,
+        cutscenes,
+        quests,
         raw_payload: payload.to_vec(),
     })
 }
@@ -332,7 +391,6 @@ pub fn parse_omp_dependencies(data: &[u8]) -> Vec<OmpDependency> {
     deps
 }
 
-/// Helper function to reliably extract typed container fields from an entity entry
 fn extract_fields_from_entry(chunk: &[u8]) -> (u32, Vec<(u32, Vec<u8>)>) {
     if let Ok((t, f)) = parse_typed_container(chunk) {
         return (t, f);
@@ -348,15 +406,13 @@ fn extract_fields_from_entry(chunk: &[u8]) -> (u32, Vec<(u32, Vec<u8>)>) {
     (0, Vec::new())
 }
 
-/// Robustly locates the master entity table containing 600+ placed objects and actors
 fn find_largest_entry_table(slice: &[u8]) -> Vec<(u32, Vec<u8>)> {
-    // 1. Direct signature search for BASE container marker (0x00460009 -> "BASE" -> 01 01 00)
     let base_marker = b"BASE\x01\x01\x00";
     if let Some(pos) = slice
         .windows(base_marker.len())
         .position(|w| w == base_marker)
     {
-        let container_start = pos + 4; // points directly to 01 01 00
+        let container_start = pos + 4;
         if let Ok(table) = parse_raw_container_table(slice, container_start, true)
             && table.entries.len() > 10
         {
@@ -364,7 +420,6 @@ fn find_largest_entry_table(slice: &[u8]) -> Vec<(u32, Vec<u8>)> {
         }
     }
 
-    // 2. Direct byte scan for any large container with CONTAINER_MAGIC (01 01 00) and > 50 entries
     let magic = b"\x01\x01\x00";
     let mut scan_pos = 0;
     while let Some(rel) = slice[scan_pos..].windows(3).position(|w| w == magic) {
@@ -377,7 +432,6 @@ fn find_largest_entry_table(slice: &[u8]) -> Vec<(u32, Vec<u8>)> {
         scan_pos = abs_pos + 3;
     }
 
-    // 3. Recursive container search with minimum entry threshold (> 50 entries)
     if let Ok((_, table)) = parse_chunk_elements(slice) {
         if table.len() > 50 {
             return table;
@@ -405,7 +459,6 @@ fn find_largest_entry_table(slice: &[u8]) -> Vec<(u32, Vec<u8>)> {
     Vec::new()
 }
 
-/// Extracts all placed spawners, enemies, triggers, and props from Chunk 21 hierarchy
 pub fn parse_omp_spawners(chunk_data: &[u8]) -> Vec<OmpSpawner> {
     let mut spawners = Vec::new();
     let entity_table = find_largest_entry_table(chunk_data);
@@ -416,8 +469,6 @@ pub fn parse_omp_spawners(chunk_data: &[u8]) -> Vec<OmpSpawner> {
 
     let mut spawner_groups: HashMap<u32, String> = HashMap::new();
 
-    // Pass 1: Identify named wave groups (Type 0x00460013 / 0x00460015 / 0x0046001F)
-    // Examples: "Melee01", "Melee02", "Sheep", "Slugs", "Rocky", "Ranged01"
     for (e_idx, e_chunk) in &entity_table {
         let (type_id, fields) = extract_fields_from_entry(e_chunk);
 
@@ -434,13 +485,13 @@ pub fn parse_omp_spawners(chunk_data: &[u8]) -> Vec<OmpSpawner> {
         }
     }
 
-    // Pass 2: Extract all placed entities with 3D coordinates and orientations
     for (e_idx, e_chunk) in &entity_table {
         let (type_id, fields) = extract_fields_from_entry(e_chunk);
 
         let mut name = String::new();
         let mut category = match type_id {
             0x0046500E => String::from("SpawnerNode"),
+            0x00465012 => String::from("TowerBlockMechanism"),
             0x0046501B => String::from("TriggerZone"),
             0x00464016 => String::from("ActorNode"),
             0x00464026 => String::from("DwarfActor"),
@@ -451,9 +502,9 @@ pub fn parse_omp_spawners(chunk_data: &[u8]) -> Vec<OmpSpawner> {
             0x0046200A | 0x0046200C | 0x00462010 | 0x0046201A | 0x00462036 => {
                 String::from("PropObject")
             }
-            0x00464620 | 0x00464626 => String::from("PlacementObject"),
-            0x00463010 | 0x00463015 | 0x00465004 => String::from("Mechanism"),
-            0x00462104 | 0x00462107 => String::from("LightMarker"),
+            0x00464620 | 0x00464626 | 0x00464638 | 0x0046465E => String::from("PlacementObject"),
+            0x00463010 | 0x00463015 | 0x00465004 | 0x0046300A => String::from("Mechanism"),
+            0x00462104 | 0x00462107 | 0x00462102 | 0x0046210A => String::from("LightMarker"),
             _ => String::from("Entity"),
         };
 
@@ -464,7 +515,6 @@ pub fn parse_omp_spawners(chunk_data: &[u8]) -> Vec<OmpSpawner> {
 
         for (fid, fdata) in &fields {
             match *fid {
-                // Field 20 (0x14): Position (X, Y, Z)
                 20 if fdata.len() >= 12 => {
                     let mut cur = Cursor::new(&fdata[0..12]);
                     let x = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
@@ -474,8 +524,6 @@ pub fn parse_omp_spawners(chunk_data: &[u8]) -> Vec<OmpSpawner> {
                         position = [x, y, z];
                     }
                 }
-                // Field 21 (0x15): Rotation Quaternion (Qx, Qy, Qz, Qw)
-                // Filter out non-normalized bitmasks / handles
                 21 if fdata.len() >= 16 => {
                     let mut cur = Cursor::new(&fdata[0..16]);
                     let qx = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
@@ -489,15 +537,13 @@ pub fn parse_omp_spawners(chunk_data: &[u8]) -> Vec<OmpSpawner> {
                         }
                     }
                 }
-                // Names & Labels
-                31 | 32 | 62 => {
+                12 | 31 | 32 | 62 => {
                     if let Some(s) = read_length_prefixed_string(fdata)
                         && name.is_empty()
                     {
                         name = s;
                     }
                 }
-                // Field 60: Text label or valid float radius
                 60 => {
                     if let Some(s) = read_length_prefixed_string(fdata)
                         && name.is_empty()
@@ -513,7 +559,6 @@ pub fn parse_omp_spawners(chunk_data: &[u8]) -> Vec<OmpSpawner> {
                         radius = Some(r);
                     }
                 }
-                // Field 42 (0x2A) or 61 (0x3D): Group Link ID
                 42 | 61 if fdata.len() >= 4 => {
                     let gid = Cursor::new(fdata).read_u32::<LittleEndian>().ok();
                     if group_id.is_none() && gid.is_some() {
@@ -529,7 +574,6 @@ pub fn parse_omp_spawners(chunk_data: &[u8]) -> Vec<OmpSpawner> {
             }
         }
 
-        // Apply meaningful naming fallback
         if name.is_empty() {
             if let Some(gid) = group_id
                 && let Some(gname) = spawner_groups.get(&gid)
@@ -544,7 +588,7 @@ pub fn parse_omp_spawners(chunk_data: &[u8]) -> Vec<OmpSpawner> {
             }
         }
 
-        if position != [0.0, 0.0, 0.0] {
+        if position != [0.0, 0.0, 0.0] || !name.is_empty() {
             spawners.push(OmpSpawner {
                 id: *e_idx,
                 name,
@@ -558,6 +602,250 @@ pub fn parse_omp_spawners(chunk_data: &[u8]) -> Vec<OmpSpawner> {
     }
 
     spawners
+}
+
+fn extract_lua_source(data: &[u8]) -> Option<String> {
+    let mut best_script = String::new();
+    let mut pos = 0;
+    while pos < data.len().saturating_sub(4) {
+        let len =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        if len > 10 && len < 500_000 && pos + 4 + len <= data.len() {
+            let slice = &data[pos + 4..pos + 4 + len];
+            let clean = slice.strip_suffix(&[0]).unwrap_or(slice);
+
+            if clean
+                .iter()
+                .all(|&b| b.is_ascii_whitespace() || (0x20..=0x7E).contains(&b))
+                && let Ok(s) = std::str::from_utf8(clean)
+            {
+                let is_code = s.contains("--")
+                    || s.contains("function ")
+                    || s.contains("SetState")
+                    || s.contains("if ")
+                    || s.contains("GetMeta")
+                    || s.contains("Print(");
+                if is_code && s.len() > best_script.len() {
+                    best_script = s.trim().to_string();
+                }
+            }
+        }
+        pos += 1;
+    }
+
+    if !best_script.is_empty() {
+        Some(best_script)
+    } else {
+        None
+    }
+}
+
+pub fn extract_all_cutscenes(data: &[u8]) -> Vec<CutsceneSequenceJson> {
+    let mut cutscenes = Vec::new();
+    let cs_marker = b"\x53\x06\x46\x00"; // 0x00460653 (Cutscene Container)
+    let mut pos = 0;
+
+    while let Some(rel) = data[pos..].windows(4).position(|w| w == cs_marker) {
+        let abs_start = pos + rel;
+        let end_pos = (abs_start + 64_000).min(data.len());
+        let cs_data = &data[abs_start..end_pos];
+
+        let mut seq_id = String::new();
+
+        for i in 0..cs_data.len().saturating_sub(10) {
+            if let Some(s) = read_length_prefixed_string(&cs_data[i..])
+                && (s.ends_with("_CS") || s.starts_with("CS_") || s.contains("_PREVIEW"))
+            {
+                seq_id = s;
+                break;
+            }
+        }
+
+        if seq_id.is_empty() {
+            seq_id = format!("Cutscene_{:08X}", abs_start);
+        }
+
+        let ev_marker = b"\x54\x06\x46\x00";
+        let mut events = Vec::new();
+        let mut ev_pos = 0;
+
+        while let Some(ev_rel) = cs_data[ev_pos..].windows(4).position(|w| w == ev_marker) {
+            let ev_abs = ev_pos + ev_rel;
+            let ev_end = (ev_abs + 8000).min(cs_data.len());
+            let ev_chunk = &cs_data[ev_abs..ev_end];
+
+            if let Some(ev) = parse_cutscene_event(ev_chunk) {
+                events.push(ev);
+            }
+            ev_pos = ev_abs + 4;
+        }
+
+        cutscenes.push(CutsceneSequenceJson { id: seq_id, events });
+        pos = abs_start + 4;
+    }
+
+    cutscenes
+}
+
+fn parse_cutscene_event(data: &[u8]) -> Option<CutsceneEventJson> {
+    let mut name = String::new();
+    let description = None;
+    let mut tracks = Vec::new();
+
+    for i in 0..data.len().saturating_sub(10) {
+        if let Some(s) = read_length_prefixed_string(&data[i..])
+            && (s.starts_with("CS_")
+                || s.starts_with("Event_")
+                || s.contains("WIZARD")
+                || s.contains("Gnarl")
+                || s.len() < 35)
+            && !s.contains("Animation")
+            && !s.contains("Script")
+            && !s.contains("Camera")
+        {
+            name = s;
+            break;
+        }
+    }
+
+    let mut tr_pos = 4;
+    while tr_pos < data.len().saturating_sub(4) {
+        let b = &data[tr_pos..tr_pos + 4];
+        if b[1] == 0x06 && b[2] == 0x46 && b[3] == 0x00 && (0x50..=0x75).contains(&b[0]) {
+            let tr_end = (tr_pos + 1500).min(data.len());
+            let tr_chunk = &data[tr_pos..tr_end];
+            if let Some(track) = parse_cutscene_track(tr_chunk) {
+                tracks.push(track);
+            }
+        }
+        tr_pos += 1;
+    }
+
+    if name.is_empty() && tracks.is_empty() {
+        None
+    } else {
+        if name.is_empty() {
+            name = String::from("CutsceneEvent");
+        }
+        Some(CutsceneEventJson {
+            name,
+            description,
+            tracks,
+        })
+    }
+}
+
+fn parse_cutscene_track(data: &[u8]) -> Option<CutsceneTrackJson> {
+    let type_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    let mut label = String::new();
+    let mut script_code = None;
+    let mut target = None;
+    let mut animation = None;
+
+    let track_type = match type_id {
+        0x00460660 => "CameraPosition",
+        0x00460661 => "LuaScript",
+        0x00460663 => "DialogueLine",
+        0x0046065C => "ActorAnimation",
+        0x0046065D => "FaceExpression",
+        0x0046065E => "CameraShake",
+        0x0046065F => "FadeIn",
+        0x00460668 => "FadeOut",
+        0x0046066A => "EndPoint",
+        0x0046066E => "SpawnCharacter",
+        0x00460664 => "SoundEffect",
+        _ => "TrackAction",
+    }
+    .to_string();
+
+    let mut i = 4;
+    while i < data.len().saturating_sub(4) {
+        if let Some(s) = read_length_prefixed_string(&data[i..]) {
+            if label.is_empty() && !s.contains("Animation") && !s.contains("Script") {
+                label = s;
+            } else if target.is_none() {
+                target = Some(s);
+            } else if animation.is_none() && (s.contains('\\') || s.contains('_')) {
+                animation = Some(s);
+            }
+        }
+        i += 1;
+    }
+
+    if (track_type == "LuaScript"
+        || type_id == 0x00460661
+        || data
+            .windows(6)
+            .any(|w| w == b"SetState" || w == b"PlaySo" || w == b"MoveCh"))
+        && let Some(src) = extract_lua_source(data)
+    {
+        script_code = Some(src);
+    }
+
+    Some(CutsceneTrackJson {
+        track_type,
+        label,
+        script_code,
+        target,
+        animation,
+    })
+}
+
+pub fn extract_quest_logic(data: &[u8]) -> Vec<QuestConditionJson> {
+    let mut quests = Vec::new();
+    let q_marker = b"\x08\x11\x46\x00"; // 0x00461108
+    let mut pos = 0;
+
+    while let Some(rel) = data[pos..].windows(4).position(|w| w == q_marker) {
+        let abs_start = pos + rel;
+        let (_, fields) = extract_fields_from_entry(&data[abs_start..]);
+
+        let mut context = String::from("Tower_Narrative");
+        let mut lua_condition = String::new();
+        let mut event_tag = None;
+
+        for (fid, fdata) in fields {
+            match fid {
+                20 | 24 => {
+                    if let Some(s) = read_length_prefixed_string(&fdata) {
+                        context = s;
+                    }
+                }
+                21 => {
+                    if let Some(s) = read_length_prefixed_string(&fdata) {
+                        lua_condition = s;
+                    }
+                }
+                30 | 31 => {
+                    event_tag = read_length_prefixed_string(&fdata);
+                }
+                _ => {}
+            }
+        }
+
+        if lua_condition.is_empty() {
+            for i in 0..data[abs_start..].len().min(400) {
+                if let Some(s) = read_length_prefixed_string(&data[abs_start + i..])
+                    && (s.starts_with("if") || s.starts_with("return"))
+                {
+                    lua_condition = s;
+                    break;
+                }
+            }
+        }
+
+        if !lua_condition.is_empty() {
+            quests.push(QuestConditionJson {
+                context,
+                lua_condition,
+                event_tag,
+            });
+        }
+
+        pos = abs_start + 4;
+    }
+
+    quests
 }
 
 pub fn unpack_omp_to_project_with_progress(
@@ -575,10 +863,12 @@ pub fn unpack_omp_to_project_with_progress(
     let chunks_dir = output_dir.join("chunks");
     let vanilla_dir = output_dir.join("chunks_vanilla");
     let assets_dir = output_dir.join("assets");
+    let scripts_dir = assets_dir.join("scripts");
 
     fs::create_dir_all(&chunks_dir)?;
     fs::create_dir_all(&vanilla_dir)?;
     fs::create_dir_all(&assets_dir)?;
+    fs::create_dir_all(&scripts_dir)?;
 
     if let Some(cb) = progress {
         cb(0.35, "Extracting map chunks hierarchy...");
@@ -594,7 +884,6 @@ pub fn unpack_omp_to_project_with_progress(
         output_dir,
     );
 
-    // Export terrain geometry from Master Chunk 20 (if available)
     if let Ok((_, elements)) = parse_chunk_elements(&parsed.raw_payload)
         && let Some((_, terr_data)) = elements.iter().find(|(id, _)| *id == 20)
         && let Ok(geom) = parse_terrain_geometry(terr_data)
@@ -613,10 +902,52 @@ pub fn unpack_omp_to_project_with_progress(
     }
 
     if let Some(cb) = progress {
-        cb(0.65, "Writing level manifests and dependencies...");
+        cb(0.60, "Exporting cutscenes and Lua scripts...");
     }
 
-    // Secondary fallback: if parsed.spawners was somehow empty, scan exported chunks
+    fs::write(
+        assets_dir.join("cutscenes.json"),
+        serde_json::to_string_pretty(&parsed.cutscenes)?,
+    )?;
+
+    fs::write(
+        assets_dir.join("quests.json"),
+        serde_json::to_string_pretty(&parsed.quests)?,
+    )?;
+
+    for cs in &parsed.cutscenes {
+        let mut script_content = String::new();
+        script_content.push_str(&format!("-- Cutscene: {}\n\n", cs.id));
+
+        for ev in &cs.events {
+            let mut event_has_code = false;
+            let mut track_texts = String::new();
+
+            for tr in &ev.tracks {
+                if let Some(ref sc) = tr.script_code {
+                    track_texts.push_str(&format!("-- Track: {}\n{}\n\n", tr.label, sc));
+                    event_has_code = true;
+                }
+            }
+
+            if event_has_code {
+                script_content.push_str(&format!("-- [Event] {}\n", ev.name));
+                if let Some(ref d) = ev.description {
+                    script_content.push_str(&format!("-- Description: {}\n", d));
+                }
+                script_content.push_str(&track_texts);
+            }
+        }
+
+        if !script_content.trim().is_empty() {
+            let safe_name = cs
+                .id
+                .replace(|c: char| !c.is_alphanumeric() && c != '_', "_");
+            let file_path = scripts_dir.join(format!("{}.lua", safe_name));
+            let _ = fs::write(file_path, script_content);
+        }
+    }
+
     let final_spawners = if !parsed.spawners.is_empty() {
         parsed.spawners
     } else {
@@ -683,21 +1014,22 @@ pub fn unpack_omp_to_project_with_progress(
     )?;
 
     let log = format!(
-        "Magic: 'OMP' | Map Grid: {}x{} | Level: '{}'\n\
-         • Player Start Location: {:?}\n\
+        "OMP Package: '{}' | Header Size: {} B\n\
          • Placed Entities & Spawners: {}\n\
-         • Mounted Dependencies: {} .rpk archives\n\
-         • 3D Terrain geometry exported to 'assets/terrain.glb'\n",
-        parsed.header.map_width,
-        parsed.header.map_height,
+         • Cinematic Cutscenes: {}\n\
+         • Quest & Trigger Logic: {}\n\
+         • Dependencies: {} archives\n\
+         • Standalone Lua scripts saved to 'assets/scripts/*.lua'\n",
         final_manifest.map_name,
-        final_manifest.player_spawn,
+        parsed.header.header_size,
         final_manifest.spawner_count,
+        final_manifest.cutscene_count,
+        final_manifest.extracted_script_count,
         final_manifest.dependency_count
     );
 
     if let Some(cb) = progress {
-        cb(1.0, "Map project ready.");
+        cb(1.0, "Level unpack complete.");
     }
 
     Ok((chunk_counter as usize, log))
@@ -785,7 +1117,6 @@ pub fn export_level_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>> {
     let mut builder = GltfBuilder::new();
     let mut scene_nodes = Vec::new();
 
-    // 1. Terrain Mesh
     if let Ok((_, elements)) = parse_chunk_elements(&parsed.raw_payload)
         && let Some((_, terr_data)) = elements.iter().find(|(id, _)| *id == 20)
         && let Ok(geom) = parse_terrain_geometry(terr_data)
@@ -798,7 +1129,6 @@ pub fn export_level_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>> {
         scene_nodes.push(t_node);
     }
 
-    // 2. Player Start Location Marker
     if let Some(spawn) = parsed.manifest.player_spawn {
         let spawn_node = builder.add_node(json!({
             "name": "Player_Start_Location",
@@ -807,7 +1137,6 @@ pub fn export_level_to_glb(chunk_data: &[u8]) -> Result<Vec<u8>> {
         scene_nodes.push(spawn_node);
     }
 
-    // 3. Spawners & Placed Entities Markers
     for spawner in parsed.spawners {
         let s_node = builder.add_node(json!({
             "name": format!("{}_[{}]", spawner.name, spawner.category),
